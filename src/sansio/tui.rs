@@ -277,8 +277,11 @@ pub fn render(state: &RenderState, size: (usize, usize)) -> RenderedGrid {
         lines: vec![prompt_line],
     };
 
+    // Error banner sits at `rows - 2`, one row above the prompt. Skip
+    // it entirely when `rows < 3` to avoid colliding with the header
+    // at row 0.
     let (error, error_rows) = if let Some(message) = state.error_banner.as_deref() {
-        if rows >= 2 {
+        if rows >= 3 {
             let region = Region {
                 top: rows - 2,
                 lines: vec![build_error_line(message)],
