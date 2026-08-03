@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
 use attini::sansio::deepseek::{ChatMessage, ChatRequest, Role};
+use attini::tui::{self, TuiConfig};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -55,10 +56,39 @@ async fn run() -> Result<(), RunError> {
     noargs::HELP_FLAG.take_help(&mut args);
 
     try_run_chat(&mut args).await?;
+    try_run_tui(&mut args).await?;
 
     if let Some(help) = args.finish()? {
         print!("{help}");
     }
+    Ok(())
+}
+
+async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
+    if !noargs::cmd("tui")
+        .doc("Launch the interactive terminal UI")
+        .take(args)
+        .is_present()
+    {
+        return Ok(());
+    }
+
+    let model: String = noargs::opt("model")
+        .ty("NAME")
+        .doc("Model name")
+        .default(DEFAULT_MODEL)
+        .take(args)
+        .then(|o| o.value().parse())?;
+
+    if args.metadata().help_mode {
+        return Ok(());
+    }
+
+    let client = DeepSeekClient::from_env()?;
+    let config = TuiConfig { model };
+    tui::run(client, config)
+        .await
+        .map_err(|err| RunError::Runtime(err.to_string()))?;
     Ok(())
 }
 

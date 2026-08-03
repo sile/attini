@@ -8,3 +8,4 @@
 
 pub mod deepseek;
 pub mod sansio;
+pub mod tui;
