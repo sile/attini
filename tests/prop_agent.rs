@@ -122,6 +122,7 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
         let mut previous_conv_len: usize = 0;
         let mut previous_assistant: usize = 0;
         let mut successful_finishes: usize = 0;
+        let mut events_handled: u64 = 0;
 
         for _ in 0..STEPS {
             let previous_active = core.active_request();
@@ -132,6 +133,7 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
             );
 
             let actions = core.handle_event(event);
+            events_handled += 1;
 
             assert_getter_consistency(&core);
             assert!(
@@ -168,6 +170,30 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
                 start_requests <= 1,
                 "single handle emitted {start_requests} StartRequest actions",
             );
+
+            let m = core.metrics();
+            let total = m.user_messages_accepted
+                + m.user_messages_rejected_while_active
+                + m.cancels_applied
+                + m.cancels_ignored_when_idle
+                + m.content_deltas_appended
+                + m.content_deltas_dropped_as_stale
+                + m.reasoning_deltas_appended
+                + m.reasoning_deltas_dropped_as_stale
+                + m.finishes_committed
+                + m.finishes_dropped_as_stale
+                + m.transport_errors_recorded
+                + m.transport_errors_dropped_as_stale
+                + m.timeouts_applied
+                + m.timeouts_dropped_as_stale;
+            assert_eq!(
+                total, events_handled,
+                "metrics counter total {total} != events fed {events_handled}",
+            );
+            // Success-only counters must never exceed their event-total
+            // partners (accepted <= accepted + rejected, and so on).
+            assert!(m.finishes_committed <= events_handled);
+            assert!(m.user_messages_accepted <= events_handled);
 
             previous_conv_len = core.conversation().len();
             previous_assistant = count_assistant(&core);
