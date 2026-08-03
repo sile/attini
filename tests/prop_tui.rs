@@ -15,7 +15,7 @@
 //!   real state.
 
 use attini::sansio::agent::{AgentCore, Event, PendingResponse, RequestId, Status};
-use attini::sansio::deepseek::{ChatMessage, Role};
+use attini::sansio::deepseek::ChatMessage;
 use attini::sansio::tui::{
     AgentView, KeyCode, KeyEffect, KeyInput, RenderState, RenderedGrid, UiState,
     build_render_state, handle_key, render,
@@ -29,14 +29,6 @@ const SEED_ENV: &str = "ATTINI_PBT_SEED";
 // -----------------------------------------------------------------
 // Layout invariant PBT
 // -----------------------------------------------------------------
-
-fn sample_role(ctx: &mut noprop::TestCaseContext) -> Role {
-    match noprop::sample_choice(ctx, &["user", "assistant", "system"]) {
-        "user" => Role::User,
-        "assistant" => Role::Assistant,
-        _ => Role::System,
-    }
-}
 
 fn sample_text(ctx: &mut noprop::TestCaseContext, max_len: usize) -> String {
     let len = noprop::sample_usize_in(ctx, 0..=max_len);
@@ -53,9 +45,10 @@ fn sample_content(ctx: &mut noprop::TestCaseContext) -> String {
 }
 
 fn sample_message(ctx: &mut noprop::TestCaseContext) -> ChatMessage {
-    ChatMessage {
-        role: sample_role(ctx),
-        content: sample_content(ctx),
+    match noprop::sample_choice(ctx, &["user", "assistant", "system"]) {
+        "user" => ChatMessage::User(sample_content(ctx)),
+        "assistant" => ChatMessage::assistant_text(sample_content(ctx)),
+        _ => ChatMessage::System(sample_content(ctx)),
     }
 }
 

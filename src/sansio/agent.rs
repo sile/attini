@@ -15,7 +15,7 @@
 //! this issue; they land on top of these primitives in later work.
 
 use crate::metrics::Counter;
-use crate::sansio::deepseek::{ChatMessage, Role};
+use crate::sansio::deepseek::ChatMessage;
 use crate::sansio::tui::AgentView;
 
 /// Opaque identifier for a model request tracked by the core.
@@ -246,10 +246,7 @@ impl AgentCore {
             self.metrics.user_messages_rejected_while_active.inc();
             return Vec::new();
         }
-        self.conversation.push(ChatMessage {
-            role: Role::User,
-            content: text,
-        });
+        self.conversation.push(ChatMessage::User(text));
         let id = self.mint_id();
         self.pending = Some(Pending {
             id,
@@ -317,9 +314,15 @@ impl AgentCore {
         }
         let mut pending = self.pending.take().expect("checked above");
         pending.response.finish_reason = reason;
-        self.conversation.push(ChatMessage {
-            role: Role::Assistant,
+        let reasoning_content = if pending.response.reasoning.is_empty() {
+            None
+        } else {
+            Some(pending.response.reasoning)
+        };
+        self.conversation.push(ChatMessage::Assistant {
             content: pending.response.content,
+            reasoning_content,
+            tool_calls: Vec::new(),
         });
         self.status = Status::Idle;
         self.metrics.finishes_committed.inc();
@@ -393,7 +396,7 @@ mod tests {
         let actions = user(&mut core, "hello");
         assert_eq!(core.status(), Status::AwaitingModel);
         assert_eq!(core.conversation().len(), 1);
-        assert_eq!(core.conversation()[0].role, Role::User);
+        assert!(matches!(core.conversation()[0], ChatMessage::User(_)));
         assert!(matches!(actions[0], Action::StartRequest { .. }));
         assert!(actions.contains(&Action::Redraw));
         assert!(core.active_request().is_some());
@@ -456,8 +459,10 @@ mod tests {
         assert!(core.active_request().is_none());
         assert!(core.pending_response().is_none());
         assert_eq!(core.conversation().len(), 2);
-        assert_eq!(core.conversation()[1].role, Role::Assistant);
-        assert_eq!(core.conversation()[1].content, "hello");
+        match &core.conversation()[1] {
+            ChatMessage::Assistant { content, .. } => assert_eq!(content, "hello"),
+            other => panic!("expected assistant, got {other:?}"),
+        }
     }
 
     #[test]
@@ -588,10 +593,12 @@ mod tests {
         });
         let messages = messages.expect("StartRequest present");
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[1].role, Role::Assistant);
-        assert_eq!(messages[2].role, Role::User);
-        assert_eq!(messages[2].content, "second");
+        assert!(matches!(messages[0], ChatMessage::User(_)));
+        assert!(matches!(messages[1], ChatMessage::Assistant { .. }));
+        match &messages[2] {
+            ChatMessage::User(content) => assert_eq!(content, "second"),
+            other => panic!("expected user, got {other:?}"),
+        }
     }
 
     // -------------------------------------------------------------

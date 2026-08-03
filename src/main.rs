@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
-use attini::sansio::deepseek::{ChatMessage, ChatRequest, Role};
+use attini::sansio::deepseek::{ChatMessage, ChatRequest};
 use attini::tui::{self, TuiConfig};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -128,15 +128,9 @@ async fn try_run_chat(args: &mut noargs::RawArgs) -> Result<(), RunError> {
 
     let mut messages = Vec::new();
     if let Some(text) = system {
-        messages.push(ChatMessage {
-            role: Role::System,
-            content: text,
-        });
+        messages.push(ChatMessage::System(text));
     }
-    messages.push(ChatMessage {
-        role: Role::User,
-        content: prompt,
-    });
+    messages.push(ChatMessage::User(prompt));
     let request = ChatRequest::new(model, messages);
 
     let client = DeepSeekClient::from_env()?;

@@ -5,7 +5,7 @@
 //! (bypassing `AgentCore`) so each case is minimal and focused.
 
 use attini::sansio::agent::{AgentCore, Event, PendingResponse, Status};
-use attini::sansio::deepseek::{ChatMessage, Role};
+use attini::sansio::deepseek::ChatMessage;
 use attini::sansio::tui::{
     AgentView, Color, KeyCode, KeyEffect, KeyInput, RenderState, StyledLine, StyledSpan, UiState,
     build_render_state, handle_key, render,
@@ -24,17 +24,11 @@ fn empty_state(model: &str) -> RenderState {
 }
 
 fn user_msg(content: &str) -> ChatMessage {
-    ChatMessage {
-        role: Role::User,
-        content: content.to_string(),
-    }
+    ChatMessage::User(content.to_string())
 }
 
 fn assistant_msg(content: &str) -> ChatMessage {
-    ChatMessage {
-        role: Role::Assistant,
-        content: content.to_string(),
-    }
+    ChatMessage::assistant_text(content)
 }
 
 fn find_span(line: &StyledLine, needle: &str) -> Option<StyledSpan> {

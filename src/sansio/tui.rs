@@ -18,7 +18,7 @@
 //! bindings, and CJK-width behaviour without a real terminal.
 
 use crate::sansio::agent::{AgentCore, Event, PendingResponse, Status};
-use crate::sansio::deepseek::{ChatMessage, Role};
+use crate::sansio::deepseek::ChatMessage;
 
 /// Runtime UI state owned by the shell.
 ///
@@ -421,12 +421,24 @@ fn build_body_lines(state: &RenderState) -> Vec<StyledLine> {
 }
 
 fn push_labeled_message(lines: &mut Vec<StyledLine>, message: &ChatMessage) {
-    let (label, style) = match message.role {
-        Role::User => ("user", user_style()),
-        Role::Assistant => ("assistant", assistant_style()),
-        Role::System => ("system", dim_style()),
-    };
-    push_labeled_multiline(lines, label, style, &message.content);
+    match message {
+        ChatMessage::User(content) => {
+            push_labeled_multiline(lines, "user", user_style(), content);
+        }
+        ChatMessage::Assistant { content, .. } => {
+            push_labeled_multiline(lines, "assistant", assistant_style(), content);
+        }
+        ChatMessage::System(content) => {
+            push_labeled_multiline(lines, "system", dim_style(), content);
+        }
+        ChatMessage::Tool {
+            tool_call_id,
+            content,
+        } => {
+            let label = format!("tool[{tool_call_id}]");
+            push_labeled_multiline(lines, &label, dim_style(), content);
+        }
+    }
 }
 
 fn push_pending_assistant(lines: &mut Vec<StyledLine>, content: &str) {

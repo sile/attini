@@ -5,7 +5,7 @@
 //! contract holds after every step.
 
 use attini::sansio::agent::{Action, AgentCore, Event, RequestId, Status};
-use attini::sansio::deepseek::Role;
+use attini::sansio::deepseek::ChatMessage;
 
 const ITERATIONS: usize = 256;
 const SEED_ENV: &str = "ATTINI_PBT_SEED";
@@ -101,14 +101,14 @@ fn assert_getter_consistency(core: &AgentCore) {
 fn count_assistant(core: &AgentCore) -> usize {
     core.conversation()
         .iter()
-        .filter(|m| m.role == Role::Assistant)
+        .filter(|m| matches!(m, ChatMessage::Assistant { .. }))
         .count()
 }
 
 fn count_user(core: &AgentCore) -> usize {
     core.conversation()
         .iter()
-        .filter(|m| m.role == Role::User)
+        .filter(|m| matches!(m, ChatMessage::User(_)))
         .count()
 }
 
