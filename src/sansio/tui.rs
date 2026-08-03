@@ -17,7 +17,9 @@
 //! lets `tests/test_tui.rs` cover layout, styling, overflow, key
 //! bindings, and CJK-width behaviour without a real terminal.
 
-use crate::sansio::agent::{AgentCore, Event, PendingResponse, Status};
+use crate::sansio::agent::{
+    ActiveToolCall, AgentCore, Event, PendingResponse, Status, ToolOutcome,
+};
 use crate::sansio::deepseek::ChatMessage;
 
 /// Runtime UI state owned by the shell.
@@ -55,6 +57,7 @@ pub struct RenderState {
     pub draft: String,
     pub conversation: Vec<ChatMessage>,
     pub pending: Option<PendingResponse>,
+    pub active_tool_calls: Vec<ActiveToolCall>,
     pub error_banner: Option<String>,
 }
 
@@ -181,6 +184,7 @@ pub enum Color {
     Cyan,
     Green,
     Red,
+    Yellow,
     BrightBlack,
 }
 
@@ -197,6 +201,7 @@ pub fn build_render_state(
         draft: ui.draft.clone(),
         conversation: agent.conversation().to_vec(),
         pending: agent.pending_response().cloned(),
+        active_tool_calls: agent.active_tool_calls(),
         error_banner: error_banner.map(String::from),
     }
 }
@@ -418,7 +423,97 @@ fn build_body_lines(state: &RenderState) -> Vec<StyledLine> {
             push_pending_assistant(&mut lines, &pending.content);
         }
     }
+    for call in &state.active_tool_calls {
+        push_labeled_tool_call(&mut lines, call);
+    }
     lines
+}
+
+fn push_labeled_tool_call(lines: &mut Vec<StyledLine>, call: &ActiveToolCall) {
+    let label = format!(
+        "[tool: {} {}]",
+        if call.function_name.is_empty() {
+            "?"
+        } else {
+            call.function_name.as_str()
+        },
+        args_summary(&call.arguments_json),
+    );
+    let (state_word, state_style) = tool_call_state(call);
+    let mut spans = vec![
+        StyledSpan {
+            text: label,
+            style: tool_call_label_style(),
+        },
+        StyledSpan {
+            text: format!(" {state_word}"),
+            style: state_style,
+        },
+    ];
+    if let Some(summary) = tool_call_summary(call) {
+        spans.push(StyledSpan {
+            text: format!(" — {summary}"),
+            style: tool_call_summary_style(),
+        });
+    }
+    lines.push(StyledLine { spans });
+}
+
+fn tool_call_state(call: &ActiveToolCall) -> (&'static str, Style) {
+    if call.is_streaming {
+        return ("pending", tool_call_running_style());
+    }
+    match &call.outcome {
+        None => ("running", tool_call_running_style()),
+        Some(ToolOutcome::Ok(_)) => ("done", tool_call_summary_style()),
+        Some(ToolOutcome::Err(_)) => ("error", error_style()),
+    }
+}
+
+fn tool_call_summary(call: &ActiveToolCall) -> Option<String> {
+    let outcome = call.outcome.as_ref()?;
+    match outcome {
+        ToolOutcome::Ok(body) => Some(truncate_snippet(body, 60)),
+        ToolOutcome::Err(err) => Some(format!("{err:?}")),
+    }
+}
+
+fn args_summary(arguments_json: &str) -> String {
+    // The model streams arguments in fragments; a short, well-formed
+    // prefix is more useful in the TUI than the full JSON blob.
+    let trimmed = arguments_json.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    truncate_snippet(trimmed, 40)
+}
+
+fn truncate_snippet(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, c) in s.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            break;
+        }
+        if c == '\n' {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn tool_call_label_style() -> Style {
+    Style::new().bold().fg(Color::Yellow)
+}
+
+fn tool_call_running_style() -> Style {
+    Style::new().fg(Color::Yellow)
+}
+
+fn tool_call_summary_style() -> Style {
+    Style::new().fg(Color::BrightBlack)
 }
 
 fn push_labeled_message(lines: &mut Vec<StyledLine>, message: &ChatMessage) {

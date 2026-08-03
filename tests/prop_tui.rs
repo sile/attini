@@ -94,6 +94,7 @@ fn sample_state(ctx: &mut noprop::TestCaseContext) -> RenderState {
         draft,
         conversation,
         pending,
+        active_tool_calls: Vec::new(),
         error_banner,
     }
 }

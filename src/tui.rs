@@ -12,11 +12,14 @@
 //!   [`Terminal::draw`] never has to compete with a non-blocking
 //!   stdout (see tuinix issue on `set_nonblocking` propagation).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tuinix::{
     EstimateCharWidth, Terminal, TerminalColor, TerminalEvent, TerminalFrame, TerminalInput,
     TerminalPosition, TerminalSize, TerminalStyle,
@@ -24,12 +27,13 @@ use tuinix::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::deepseek::{DeepSeekClient, StreamEvent, TransportError};
-use crate::sansio::agent::{Action, AgentCore, Event, RequestId};
+use crate::sansio::agent::{Action, AgentCore, Event, RequestId, ToolOutcome};
 use crate::sansio::deepseek::ChatRequest;
 use crate::sansio::tui::{
     self, Color, KeyCode, KeyEffect, KeyInput, Region, RenderState, RenderedGrid, Style,
     StyledLine, UiState,
 };
+use crate::tools::ToolExecutor;
 
 /// Runtime configuration for the TUI.
 #[derive(Debug, Clone)]
@@ -44,21 +48,34 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TerminalUpdate>();
     let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderState>();
 
-    let terminal_handle = tokio::task::spawn_blocking(move || terminal_loop(event_tx, render_rx));
+    let terminal_tx = event_tx.clone();
+    let terminal_handle =
+        tokio::task::spawn_blocking(move || terminal_loop(terminal_tx, render_rx));
+
+    let workspace = std::env::current_dir()?;
+    let tool_executor = Arc::new(
+        ToolExecutor::new(&workspace)
+            .map_err(|e| io::Error::other(format!("workspace {workspace:?}: {e}")))?,
+    );
 
     let mut ui = UiState {
         model: config.model,
         draft: String::new(),
     };
     let mut agent = AgentCore::new();
-    let mut stream: Option<Stream> = None;
-    let mut error_banner: Option<String> = None;
+    let mut shell = Shell {
+        stream: None,
+        error_banner: None,
+        tool_handles: HashMap::new(),
+        tool_executor,
+        event_tx,
+    };
     let mut should_quit = false;
 
     let _ = render_tx.send(tui::build_render_state(
         &ui,
         &agent,
-        error_banner.as_deref(),
+        shell.error_banner.as_deref(),
     ));
 
     while !should_quit {
@@ -71,31 +88,40 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                         should_quit |= matches!(outcome.effect, KeyEffect::Quit);
                         for event in outcome.events {
                             let actions = agent.handle_event(event);
-                            apply_actions(&ui, actions, &client, &mut stream, &mut error_banner);
+                            apply_actions(&ui, actions, &client, &mut shell);
                         }
                     }
                     Some(TerminalUpdate::Resize) => {
                         // Blocking task tracks size internally; a fresh
                         // render snapshot below picks up the new size.
                     }
+                    Some(TerminalUpdate::ToolResult { request, call_id, outcome }) => {
+                        shell.tool_handles.remove(&(request, call_id.clone()));
+                        let actions = agent.handle_event(Event::ToolResult {
+                            request,
+                            call_id,
+                            outcome,
+                        });
+                        apply_actions(&ui, actions, &client, &mut shell);
+                    }
                     None => {
                         should_quit = true;
                     }
                 }
             }
-            recv = recv_stream(&mut stream) => {
-                let request = match stream.as_ref() {
+            recv = recv_stream(&mut shell.stream) => {
+                let request = match shell.stream.as_ref() {
                     Some(s) => s.id,
                     None => continue,
                 };
                 match recv {
                     None => {
-                        stream = None;
+                        shell.stream = None;
                     }
                     Some(Ok(event)) => {
                         for core_event in translate_stream_event(event, request) {
                             let actions = agent.handle_event(core_event);
-                            apply_actions(&ui, actions, &client, &mut stream, &mut error_banner);
+                            apply_actions(&ui, actions, &client, &mut shell);
                         }
                     }
                     Some(Err(err)) => {
@@ -103,8 +129,8 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                             request,
                             message: err.to_string(),
                         });
-                        apply_actions(&ui, actions, &client, &mut stream, &mut error_banner);
-                        stream = None;
+                        apply_actions(&ui, actions, &client, &mut shell);
+                        shell.stream = None;
                     }
                 }
             }
@@ -112,11 +138,14 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
         let _ = render_tx.send(tui::build_render_state(
             &ui,
             &agent,
-            error_banner.as_deref(),
+            shell.error_banner.as_deref(),
         ));
     }
 
     drop(render_tx);
+    for (_, handle) in shell.tool_handles.drain() {
+        handle.abort();
+    }
     match terminal_handle.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => Err(err),
@@ -124,10 +153,23 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
     }
 }
 
+struct Shell {
+    stream: Option<Stream>,
+    error_banner: Option<String>,
+    tool_handles: HashMap<(RequestId, String), JoinHandle<()>>,
+    tool_executor: Arc<ToolExecutor>,
+    event_tx: mpsc::UnboundedSender<TerminalUpdate>,
+}
+
 #[derive(Debug)]
 enum TerminalUpdate {
     Key(KeyInput),
     Resize,
+    ToolResult {
+        request: RequestId,
+        call_id: String,
+        outcome: ToolOutcome,
+    },
 }
 
 struct Stream {
@@ -142,36 +184,52 @@ async fn recv_stream(stream: &mut Option<Stream>) -> Option<Result<StreamEvent, 
     }
 }
 
-fn apply_actions(
-    ui: &UiState,
-    actions: Vec<Action>,
-    client: &DeepSeekClient,
-    stream: &mut Option<Stream>,
-    error_banner: &mut Option<String>,
-) {
+fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, shell: &mut Shell) {
     for action in actions {
         match action {
             Action::StartRequest { id, messages } => {
                 // Clearing the banner here (rather than inside handle_key)
                 // keeps handle_key pure and pins the reset to "a new
                 // request just started" instead of "Enter was pressed".
-                *error_banner = None;
-                let request = ChatRequest::new(ui.model.clone(), messages);
+                shell.error_banner = None;
+                let request = ChatRequest::new(ui.model.clone(), messages)
+                    .with_tools(crate::sansio::agent::ReadOnlyTool::definitions());
                 let rx = client.call(request);
-                *stream = Some(Stream { id, rx });
+                shell.stream = Some(Stream { id, rx });
             }
             Action::CancelRequest { .. } => {
-                *stream = None;
+                shell.stream = None;
             }
-            Action::ExecuteTool { .. } | Action::CancelToolExecution { .. } => {
-                // Tool executor wiring lands in a follow-up commit; for
-                // now these actions have no side effect in the shell,
-                // which effectively wedges any tool-loop turn until the
-                // wiring is complete. Guarded by the compile-time
-                // absence of code that emits StreamEvent::ToolCallDelta.
+            Action::ExecuteTool {
+                request,
+                call_id,
+                invocation,
+            } => {
+                let exec = shell.tool_executor.clone();
+                let tx = shell.event_tx.clone();
+                let key = (request, call_id.clone());
+                let handle = tokio::task::spawn_blocking(move || {
+                    let outcome = exec.execute(invocation);
+                    let _ = tx.send(TerminalUpdate::ToolResult {
+                        request,
+                        call_id,
+                        outcome,
+                    });
+                });
+                shell.tool_handles.insert(key, handle);
+            }
+            Action::CancelToolExecution { request } => {
+                shell.tool_handles.retain(|(req, _), h| {
+                    if *req == request {
+                        h.abort();
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
             Action::ReportError { message } => {
-                *error_banner = Some(message);
+                shell.error_banner = Some(message);
             }
             Action::Redraw => {}
         }
@@ -336,6 +394,7 @@ fn to_terminal_color(color: Color) -> TerminalColor {
         Color::Cyan => TerminalColor::CYAN,
         Color::Green => TerminalColor::GREEN,
         Color::Red => TerminalColor::RED,
+        Color::Yellow => TerminalColor::YELLOW,
         Color::BrightBlack => TerminalColor::BRIGHT_BLACK,
     }
 }

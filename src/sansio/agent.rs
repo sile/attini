@@ -526,9 +526,26 @@ struct ToolCallSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingToolResult {
     call_id: String,
+    function_name: String,
+    arguments_json: String,
     /// `None` while the shell is still executing the tool; `Some` once
     /// it has reported (or the core has synthesised) an outcome.
     outcome: Option<ToolOutcome>,
+}
+
+/// Read-only projection of a single tool call for TUI rendering.
+///
+/// Built from [`AgentCore::active_tool_calls`]; `is_streaming` is
+/// `true` while the model is still emitting fragments and `false`
+/// once the assistant turn has been committed and the shell is
+/// executing (or has already resolved) the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveToolCall {
+    pub call_id: String,
+    pub function_name: String,
+    pub arguments_json: String,
+    pub outcome: Option<ToolOutcome>,
+    pub is_streaming: bool,
 }
 
 /// Cumulative counters for the branches taken by
@@ -659,6 +676,41 @@ impl AgentCore {
     /// Coarse runtime status suitable for a status line.
     pub fn status(&self) -> Status {
         self.status
+    }
+
+    /// Tool calls associated with the in-flight request, ordered by
+    /// their streaming index so the TUI can render them stably.
+    pub fn active_tool_calls(&self) -> Vec<ActiveToolCall> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Vec::new();
+        };
+        match pending.phase {
+            PendingPhase::Streaming => pending
+                .tool_call_slots
+                .iter()
+                .map(|(index, slot)| ActiveToolCall {
+                    call_id: slot
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("__pending_{index}")),
+                    function_name: slot.function_name.clone().unwrap_or_default(),
+                    arguments_json: slot.arguments.clone(),
+                    outcome: None,
+                    is_streaming: true,
+                })
+                .collect(),
+            PendingPhase::ToolRunning => pending
+                .tool_results
+                .iter()
+                .map(|r| ActiveToolCall {
+                    call_id: r.call_id.clone(),
+                    function_name: r.function_name.clone(),
+                    arguments_json: r.arguments_json.clone(),
+                    outcome: r.outcome.clone(),
+                    is_streaming: false,
+                })
+                .collect(),
+        }
     }
 
     /// Cumulative metrics for the branches taken by
@@ -870,6 +922,8 @@ impl AgentCore {
             if over_limit_ids.contains(&call.id) {
                 pending_results.push(PendingToolResult {
                     call_id: call.id,
+                    function_name: call.function_name,
+                    arguments_json: call.arguments_json,
                     outcome: Some(ToolOutcome::Err(ToolExecutionError::ArgumentsTooLarge)),
                 });
                 self.metrics.tool_calls_rejected_by_arguments_limit.inc();
@@ -878,6 +932,8 @@ impl AgentCore {
             if self.tool_calls_this_turn >= TURN_TOOL_CALL_LIMIT {
                 pending_results.push(PendingToolResult {
                     call_id: call.id,
+                    function_name: call.function_name,
+                    arguments_json: call.arguments_json,
                     outcome: Some(ToolOutcome::Err(
                         ToolExecutionError::TurnToolCallLimitExceeded,
                     )),
@@ -894,6 +950,8 @@ impl AgentCore {
                     });
                     pending_results.push(PendingToolResult {
                         call_id: call.id,
+                        function_name: call.function_name,
+                        arguments_json: call.arguments_json,
                         outcome: None,
                     });
                     self.tool_calls_this_turn += 1;
@@ -902,6 +960,8 @@ impl AgentCore {
                 Err(err) => {
                     pending_results.push(PendingToolResult {
                         call_id: call.id,
+                        function_name: call.function_name,
+                        arguments_json: call.arguments_json,
                         outcome: Some(ToolOutcome::Err(err)),
                     });
                 }

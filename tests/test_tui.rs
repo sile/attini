@@ -19,6 +19,7 @@ fn empty_state(model: &str) -> RenderState {
         draft: String::new(),
         conversation: Vec::new(),
         pending: None,
+        active_tool_calls: Vec::new(),
         error_banner: None,
     }
 }
@@ -364,6 +365,7 @@ fn cjk_draft_survives_handle_key_and_render() {
         draft: ui.draft.clone(),
         conversation: Vec::new(),
         pending: None,
+        active_tool_calls: Vec::new(),
         error_banner: None,
     };
     let grid = render(&state, (10, 40));
@@ -420,4 +422,91 @@ fn agent_view_reflects_active_request() {
     assert!(!agent.view().has_active_request);
     let _ = agent.handle_event(Event::UserMessage("hi".to_string()));
     assert!(agent.view().has_active_request);
+}
+
+// -----------------------------------------------------------------
+// active_tool_calls rendering
+// -----------------------------------------------------------------
+
+#[test]
+fn active_tool_call_appears_in_body_with_yellow_label_and_state_word() {
+    let mut state = empty_state("m");
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "call_1".to_string(),
+            function_name: "list".to_string(),
+            arguments_json: r#"{"path":"src"}"#.to_string(),
+            outcome: None,
+            is_streaming: false,
+        });
+    state.status = Status::ToolRunning;
+    state.active = true;
+    let grid = render(&state, (10, 60));
+    let joined: String = grid
+        .body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(joined.contains("[tool: list"), "body: {joined}");
+    assert!(joined.contains("running"), "body: {joined}");
+
+    let label_span = grid.body.lines[0]
+        .spans
+        .iter()
+        .find(|s| s.text.starts_with("[tool:"))
+        .expect("label span");
+    assert_eq!(label_span.style.fg, Some(Color::Yellow));
+    assert!(label_span.style.bold);
+}
+
+#[test]
+fn completed_ok_tool_call_shows_done_and_summary() {
+    let mut state = empty_state("m");
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "c".to_string(),
+            function_name: "read".to_string(),
+            arguments_json: r#"{"path":"a"}"#.to_string(),
+            outcome: Some(attini::sansio::agent::ToolOutcome::Ok(
+                r#"{"content":"hi","truncated":false}"#.to_string(),
+            )),
+            is_streaming: false,
+        });
+    let grid = render(&state, (10, 60));
+    let joined: String = grid
+        .body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(joined.contains("done"), "body: {joined}");
+    assert!(joined.contains("content"), "body: {joined}");
+}
+
+#[test]
+fn errored_tool_call_shows_error_state_in_red() {
+    let mut state = empty_state("m");
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "c".to_string(),
+            function_name: "read".to_string(),
+            arguments_json: r#"{"path":"a"}"#.to_string(),
+            outcome: Some(attini::sansio::agent::ToolOutcome::Err(
+                attini::sansio::agent::ToolExecutionError::OutsideWorkspace,
+            )),
+            is_streaming: false,
+        });
+    let grid = render(&state, (10, 60));
+    let error_span = grid.body.lines[0]
+        .spans
+        .iter()
+        .find(|s| s.text.contains("error"))
+        .expect("error span");
+    assert_eq!(error_span.style.fg, Some(Color::Red));
 }
