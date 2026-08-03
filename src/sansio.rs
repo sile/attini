@@ -11,5 +11,6 @@
 //! modules for I/O — makes accidental dependency creep easy to spot in
 //! code review.
 
+pub mod agent;
 pub mod deepseek;
 pub mod sse;
