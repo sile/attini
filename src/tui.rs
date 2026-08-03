@@ -163,6 +163,13 @@ fn apply_actions(
             Action::CancelRequest { .. } => {
                 *stream = None;
             }
+            Action::ExecuteTool { .. } | Action::CancelToolExecution { .. } => {
+                // Tool executor wiring lands in a follow-up commit; for
+                // now these actions have no side effect in the shell,
+                // which effectively wedges any tool-loop turn until the
+                // wiring is complete. Guarded by the compile-time
+                // absence of code that emits StreamEvent::ToolCallDelta.
+            }
             Action::ReportError { message } => {
                 *error_banner = Some(message);
             }

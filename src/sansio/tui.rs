@@ -350,6 +350,7 @@ fn build_header_line(state: &RenderState) -> StyledLine {
         Status::Idle => "idle",
         Status::AwaitingModel => "waiting",
         Status::Streaming => "streaming",
+        Status::ToolRunning => "tool",
     };
     StyledLine {
         spans: vec![

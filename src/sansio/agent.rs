@@ -10,13 +10,337 @@
 //! dropped, which lets the shell forward late arrivals from a
 //! cancelled or completed request without corrupting state.
 //!
-//! Tool calls, reasoning-content carry-over across turns, automatic
-//! retry, and side-effect approvals are intentionally out of scope for
-//! this issue; they land on top of these primitives in later work.
+//! Read-only tool calls are supported through an explicit tool loop
+//! (see [`ReadOnlyTool`], `ToolRunning` phase,
+//! [`Event::ToolCallDelta`], [`Event::ToolResult`]). File-editing and
+//! command-execution tools, automatic retry, side-effect approvals,
+//! and cross-turn reasoning carry-over remain out of scope.
+
+use std::collections::BTreeMap;
+
+use nojson::{Json, RawJsonValue};
 
 use crate::metrics::Counter;
-use crate::sansio::deepseek::ChatMessage;
+use crate::sansio::deepseek::{ChatMessage, ToolCall, ToolDef};
 use crate::sansio::tui::AgentView;
+
+/// Maximum bytes of tool-call arguments (accumulated across streaming
+/// fragments) the core will accept for a single tool call. See issue
+/// 0006 §resource limit の具体数値.
+pub const ARGUMENTS_MAX_BYTES: usize = 64 * 1024;
+
+/// Maximum number of tool calls the core will emit per user turn.
+/// A "turn" spans [`Event::UserMessage`] acceptance to a return to
+/// [`Status::Idle`], across any number of tool-loop iterations.
+pub const TURN_TOOL_CALL_LIMIT: usize = 20;
+
+/// Default upper bound on entries returned by [`ReadOnlyTool::List`].
+pub const DEFAULT_LIST_MAX_ENTRIES: usize = 200;
+
+/// Default upper bound on results returned by [`ReadOnlyTool::Search`].
+pub const DEFAULT_SEARCH_MAX_RESULTS: usize = 50;
+
+/// Maximum bytes read from a single file by [`ReadOnlyTool::Read`].
+pub const READ_MAX_BYTES: usize = 1024 * 1024;
+
+/// A read-only tool the model can invoke while the agent is running.
+///
+/// Semantics and per-tool limits are defined in `src/tools.rs`; this
+/// enum is only the Sans I/O contract that pairs a serialised
+/// invocation (from the model) with an executor-supplied outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadOnlyTool {
+    List {
+        path: String,
+        recursive: bool,
+        max_entries: usize,
+        include_hidden: bool,
+    },
+    Read {
+        path: String,
+        line_range: Option<(usize, usize)>,
+    },
+    Search {
+        pattern: String,
+        path_prefix: Option<String>,
+        case_sensitive: bool,
+        max_results: usize,
+    },
+}
+
+impl ReadOnlyTool {
+    /// OpenAI-compatible tool schemas advertised to the model as part
+    /// of every [`crate::sansio::deepseek::ChatRequest`]. The enum is
+    /// the source of truth; these definitions describe the wire shape
+    /// the model must produce for a valid [`ToolCall`].
+    pub fn definitions() -> Vec<ToolDef> {
+        vec![
+            ToolDef {
+                name: "list".to_string(),
+                description: "List files and directories under a workspace-relative path. \
+                     Returns a JSON array of {path, kind, size} entries; the \
+                     result includes truncated:true when max_entries is hit."
+                    .to_string(),
+                parameters_json: LIST_PARAMS_SCHEMA.to_string(),
+            },
+            ToolDef {
+                name: "read".to_string(),
+                description: "Read a UTF-8 text file at a workspace-relative path. \
+                     Optionally restrict to a 1-indexed inclusive [start, end] \
+                     line range. Content is truncated to the first 1 MiB."
+                    .to_string(),
+                parameters_json: READ_PARAMS_SCHEMA.to_string(),
+            },
+            ToolDef {
+                name: "search".to_string(),
+                description: "Literal substring search across text files under an \
+                     optional workspace-relative prefix. Returns \
+                     {path, line, snippet} hits; binary or non-UTF-8 files \
+                     are silently skipped."
+                    .to_string(),
+                parameters_json: SEARCH_PARAMS_SCHEMA.to_string(),
+            },
+        ]
+    }
+
+    /// Deserialise a model-supplied `function_name` + `arguments_json`
+    /// pair into a concrete invocation.
+    pub fn parse(function_name: &str, arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        match function_name {
+            "list" => parse_list(arguments_json),
+            "read" => parse_read(arguments_json),
+            "search" => parse_search(arguments_json),
+            _ => Err(ToolExecutionError::UnknownTool),
+        }
+    }
+}
+
+const LIST_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"path":{"type":"string","description":"Workspace-relative directory path (e.g. \".\" or \"src\")."},
+"recursive":{"type":"boolean","default":false},
+"max_entries":{"type":"integer","default":200,"minimum":1},
+"include_hidden":{"type":"boolean","default":false}
+},
+"required":["path"]
+}"#;
+
+const READ_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"path":{"type":"string","description":"Workspace-relative file path."},
+"line_range":{"type":"array","items":{"type":"integer","minimum":1},"minItems":2,"maxItems":2,"description":"1-indexed inclusive [start, end] range."}
+},
+"required":["path"]
+}"#;
+
+const SEARCH_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"pattern":{"type":"string","description":"Literal substring to match (no regex)."},
+"path_prefix":{"type":"string","description":"Restrict to a workspace-relative subtree."},
+"case_sensitive":{"type":"boolean","default":false},
+"max_results":{"type":"integer","default":50,"minimum":1}
+},
+"required":["pattern"]
+}"#;
+
+fn parse_list(arguments_json: &str) -> Result<ReadOnlyTool, ToolExecutionError> {
+    let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+    let root = json.value();
+    let path = required_string(root, "path")?;
+    let recursive = optional_bool(root, "recursive")?.unwrap_or(false);
+    let max_entries = optional_usize(root, "max_entries")?.unwrap_or(DEFAULT_LIST_MAX_ENTRIES);
+    let include_hidden = optional_bool(root, "include_hidden")?.unwrap_or(false);
+    Ok(ReadOnlyTool::List {
+        path,
+        recursive,
+        max_entries,
+        include_hidden,
+    })
+}
+
+fn parse_read(arguments_json: &str) -> Result<ReadOnlyTool, ToolExecutionError> {
+    let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+    let root = json.value();
+    let path = required_string(root, "path")?;
+    let line_range = match root
+        .to_member("line_range")
+        .map_err(map_parse_err)?
+        .optional()
+    {
+        None => None,
+        Some(value) => {
+            let mut iter = value.to_array().map_err(map_parse_err)?;
+            let start = next_usize(&mut iter, "line_range")?;
+            let end = next_usize(&mut iter, "line_range")?;
+            if iter.next().is_some() {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "line_range must have exactly 2 elements".to_string(),
+                ));
+            }
+            Some((start, end))
+        }
+    };
+    Ok(ReadOnlyTool::Read { path, line_range })
+}
+
+fn parse_search(arguments_json: &str) -> Result<ReadOnlyTool, ToolExecutionError> {
+    let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+    let root = json.value();
+    let pattern = required_string(root, "pattern")?;
+    let path_prefix = optional_string(root, "path_prefix")?;
+    let case_sensitive = optional_bool(root, "case_sensitive")?.unwrap_or(false);
+    let max_results = optional_usize(root, "max_results")?.unwrap_or(DEFAULT_SEARCH_MAX_RESULTS);
+    Ok(ReadOnlyTool::Search {
+        pattern,
+        path_prefix,
+        case_sensitive,
+        max_results,
+    })
+}
+
+fn map_parse_err(err: nojson::JsonParseError) -> ToolExecutionError {
+    ToolExecutionError::ArgumentsParseFailed(err.to_string())
+}
+
+fn next_usize<'text, 'raw, I>(iter: &mut I, field: &str) -> Result<usize, ToolExecutionError>
+where
+    I: Iterator<Item = RawJsonValue<'text, 'raw>>,
+{
+    iter.next()
+        .ok_or_else(|| {
+            ToolExecutionError::ArgumentsParseFailed(format!(
+                "{field} must have exactly 2 elements"
+            ))
+        })?
+        .try_into()
+        .map_err(map_parse_err)
+}
+
+fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
+    let value = root
+        .to_member(name)
+        .map_err(map_parse_err)?
+        .required()
+        .map_err(map_parse_err)?;
+    value.try_into().map_err(map_parse_err)
+}
+
+fn optional_string(
+    root: RawJsonValue<'_, '_>,
+    name: &str,
+) -> Result<Option<String>, ToolExecutionError> {
+    match root.to_member(name).map_err(map_parse_err)?.optional() {
+        None => Ok(None),
+        Some(value) => value.try_into().map_err(map_parse_err),
+    }
+}
+
+fn optional_bool(
+    root: RawJsonValue<'_, '_>,
+    name: &str,
+) -> Result<Option<bool>, ToolExecutionError> {
+    match root.to_member(name).map_err(map_parse_err)?.optional() {
+        None => Ok(None),
+        Some(value) => Ok(Some(value.try_into().map_err(map_parse_err)?)),
+    }
+}
+
+fn optional_usize(
+    root: RawJsonValue<'_, '_>,
+    name: &str,
+) -> Result<Option<usize>, ToolExecutionError> {
+    match root.to_member(name).map_err(map_parse_err)?.optional() {
+        None => Ok(None),
+        Some(value) => Ok(Some(value.try_into().map_err(map_parse_err)?)),
+    }
+}
+
+/// Result of executing a [`ReadOnlyTool`] on behalf of the model.
+///
+/// See the issue-0006 discipline: partial-success outcomes (truncated
+/// output, silently-skipped binary files) are `Ok` with a JSON payload
+/// that includes `truncated: true` or `skipped_binary: N`. Only
+/// impossible-to-proceed situations become [`Err`](ToolExecutionError).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Ok(String),
+    Err(ToolExecutionError),
+}
+
+/// Reasons a [`ReadOnlyTool`] invocation could not succeed. Rendered
+/// into `Tool` role message content for the model to reason about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionError {
+    OutsideWorkspace,
+    NotUtf8,
+    Binary,
+    IoError(String),
+    ArgumentsParseFailed(String),
+    ArgumentsTooLarge,
+    UnknownTool,
+    TurnToolCallLimitExceeded,
+}
+
+impl ToolExecutionError {
+    /// Compact JSON representation suitable for a `Tool` role message
+    /// body: `{"error":"CODE","message":"..."}`. Fields are stable
+    /// enough for the model to key on.
+    pub fn to_json_string(&self) -> String {
+        let (code, message): (&str, String) = match self {
+            Self::OutsideWorkspace => (
+                "outside_workspace",
+                "path escapes the workspace root".to_string(),
+            ),
+            Self::NotUtf8 => ("not_utf8", "file is not valid UTF-8".to_string()),
+            Self::Binary => (
+                "binary",
+                "file contains binary data and cannot be read as text".to_string(),
+            ),
+            Self::IoError(msg) => ("io_error", msg.clone()),
+            Self::ArgumentsParseFailed(msg) => ("arguments_parse_failed", msg.clone()),
+            Self::ArgumentsTooLarge => (
+                "arguments_too_large",
+                format!(
+                    "tool call arguments exceeded the {} byte limit",
+                    ARGUMENTS_MAX_BYTES
+                ),
+            ),
+            Self::UnknownTool => (
+                "unknown_tool",
+                "function_name does not match a known read-only tool".to_string(),
+            ),
+            Self::TurnToolCallLimitExceeded => (
+                "turn_tool_call_limit_exceeded",
+                format!(
+                    "this user turn exceeded the {} tool call limit",
+                    TURN_TOOL_CALL_LIMIT
+                ),
+            ),
+        };
+        Json(ToolErrorJson {
+            code,
+            message: &message,
+        })
+        .to_string()
+    }
+}
+
+struct ToolErrorJson<'a> {
+    code: &'a str,
+    message: &'a str,
+}
+
+impl nojson::DisplayJson for ToolErrorJson<'_> {
+    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("error", self.code)?;
+            f.member("message", self.message)
+        })
+    }
+}
 
 /// Opaque identifier for a model request tracked by the core.
 ///
@@ -47,6 +371,11 @@ pub enum Status {
     AwaitingModel,
     /// The current request has begun streaming content or reasoning.
     Streaming,
+    /// The model finished with `finish_reason == "tool_calls"` and the
+    /// shell is executing the requested tools; the core is awaiting
+    /// [`Event::ToolResult`] for every outstanding call before
+    /// auto-emitting the follow-up [`Action::StartRequest`].
+    ToolRunning,
 }
 
 /// Buffered pieces of the assistant response for the in-flight request.
@@ -75,10 +404,29 @@ pub enum Event {
     ContentDelta { request: RequestId, text: String },
     /// A reasoning-content delta arrived from the transport.
     ReasoningDelta { request: RequestId, text: String },
+    /// A tool-call streaming fragment arrived. The core assembles
+    /// fragments across chunks by matching on `index`; the first
+    /// non-null `id` / `function_name` win, and `arguments_fragment`
+    /// is concatenated in arrival order.
+    ToolCallDelta {
+        request: RequestId,
+        index: u64,
+        id: Option<String>,
+        function_name: Option<String>,
+        arguments_fragment: Option<String>,
+    },
     /// The transport observed the terminating `[DONE]` or finish reason.
     Finish {
         request: RequestId,
         reason: Option<String>,
+    },
+    /// A tool execution completed (successfully or with an error).
+    /// Only accepted while the core is in the [`Status::ToolRunning`]
+    /// phase for the matching request.
+    ToolResult {
+        request: RequestId,
+        call_id: String,
+        outcome: ToolOutcome,
     },
     /// The transport reported an unrecoverable error for this request.
     TransportError { request: RequestId, message: String },
@@ -103,6 +451,20 @@ pub enum Action {
     /// shell may still receive late events for this ID; they will be
     /// dropped when forwarded back to the core.
     CancelRequest { id: RequestId },
+    /// Run `invocation` on behalf of the model in the surrounding
+    /// shell (typically on a blocking thread) and deliver the
+    /// outcome back as [`Event::ToolResult`] tagged with the same
+    /// `request` and `call_id`.
+    ExecuteTool {
+        request: RequestId,
+        call_id: String,
+        invocation: ReadOnlyTool,
+    },
+    /// Abort any tool executions that were dispatched for `request`
+    /// but have not yet reported an outcome. Emitted when the user
+    /// cancels or the request times out while in
+    /// [`Status::ToolRunning`].
+    CancelToolExecution { request: RequestId },
     /// A diagnostic message the shell should surface to the user
     /// (transport failure, timeout, etc.). The core does not retain
     /// it; the shell owns any "sticky until dismissed" behaviour.
@@ -118,13 +480,55 @@ pub struct AgentCore {
     pending: Option<Pending>,
     status: Status,
     next_id: u64,
+    /// Number of [`Action::ExecuteTool`] emitted since the current
+    /// user turn began. Reset to 0 on every transition to
+    /// [`Status::Idle`], including cancels, errors, and timeouts.
+    tool_calls_this_turn: usize,
     metrics: AgentMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     id: RequestId,
+    phase: PendingPhase,
     response: PendingResponse,
+    /// Partial tool calls being assembled from streaming fragments.
+    /// The `u64` key is the `choices[0].delta.tool_calls[].index`.
+    tool_call_slots: BTreeMap<u64, ToolCallSlot>,
+    /// Tool results awaited before advancing to the next request.
+    /// Populated on transition to `ToolRunning` phase; some
+    /// entries may already carry a synthetic `Err` outcome for calls
+    /// that hit the arguments-size or turn-tool-count limit.
+    tool_results: Vec<PendingToolResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPhase {
+    /// Receiving deltas from the model's SSE stream.
+    Streaming,
+    /// Model finished with `finish_reason == "tool_calls"`; waiting on
+    /// the shell to deliver [`Event::ToolResult`] for every call.
+    ToolRunning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolCallSlot {
+    id: Option<String>,
+    function_name: Option<String>,
+    arguments: String,
+    /// Set once `arguments.len()` (after appending the current
+    /// fragment) would exceed [`ARGUMENTS_MAX_BYTES`]; subsequent
+    /// fragments for this index are dropped and the finalised call is
+    /// resolved to `Err(ArgumentsTooLarge)` instead of being executed.
+    over_limit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingToolResult {
+    call_id: String,
+    /// `None` while the shell is still executing the tool; `Some` once
+    /// it has reported (or the core has synthesised) an outcome.
+    outcome: Option<ToolOutcome>,
 }
 
 /// Cumulative counters for the branches taken by
@@ -187,6 +591,41 @@ pub struct AgentMetrics {
     /// [`Event::Timeout`] dropped because no request was active or
     /// the `request` id did not match the active one.
     pub timeouts_dropped_as_stale: Counter,
+    /// [`Event::ToolCallDelta`] whose `request` matched the active
+    /// [`RequestId`] and phase; the fragment was merged into the
+    /// per-index tool-call slot.
+    pub tool_call_deltas_appended: Counter,
+    /// [`Event::ToolCallDelta`] dropped because no request was
+    /// active, the id did not match, or the phase was not
+    /// `Streaming` phase.
+    pub tool_call_deltas_dropped_as_stale: Counter,
+    /// A fragment was dropped because appending it would push the
+    /// slot's accumulated `arguments` past [`ARGUMENTS_MAX_BYTES`].
+    /// Counts every dropped fragment, not just the first one that
+    /// tripped the limit.
+    pub tool_call_arguments_fragments_dropped_over_limit: Counter,
+    /// [`Event::ToolResult`] whose `request` matched the active
+    /// [`RequestId`], phase was `ToolRunning` phase, and
+    /// `call_id` matched an outstanding slot; the outcome was
+    /// recorded.
+    pub tool_results_committed: Counter,
+    /// [`Event::ToolResult`] dropped because no request was active,
+    /// the id did not match, the phase was not
+    /// `ToolRunning` phase, or no outstanding call had the
+    /// matching `call_id`.
+    pub tool_results_dropped_as_stale: Counter,
+    /// [`Action::ExecuteTool`] was emitted for a tool call (parsed
+    /// invocation, within both the arguments-size and turn-count
+    /// limits).
+    pub tool_calls_executed: Counter,
+    /// A tool call was resolved to a synthetic
+    /// `Err(TurnToolCallLimitExceeded)` because the current user turn
+    /// had already emitted [`TURN_TOOL_CALL_LIMIT`] executions.
+    pub tool_calls_rejected_by_turn_limit: Counter,
+    /// A tool call was resolved to a synthetic
+    /// `Err(ArgumentsTooLarge)` because its accumulated arguments
+    /// exceeded [`ARGUMENTS_MAX_BYTES`].
+    pub tool_calls_rejected_by_arguments_limit: Counter,
 }
 
 impl AgentCore {
@@ -235,7 +674,19 @@ impl AgentCore {
             Event::Cancel => self.on_cancel(),
             Event::ContentDelta { request, text } => self.on_content_delta(request, text),
             Event::ReasoningDelta { request, text } => self.on_reasoning_delta(request, text),
+            Event::ToolCallDelta {
+                request,
+                index,
+                id,
+                function_name,
+                arguments_fragment,
+            } => self.on_tool_call_delta(request, index, id, function_name, arguments_fragment),
             Event::Finish { request, reason } => self.on_finish(request, reason),
+            Event::ToolResult {
+                request,
+                call_id,
+                outcome,
+            } => self.on_tool_result(request, call_id, outcome),
             Event::TransportError { request, message } => self.on_transport_error(request, message),
             Event::Timeout { request } => self.on_timeout(request),
         }
@@ -250,9 +701,13 @@ impl AgentCore {
         let id = self.mint_id();
         self.pending = Some(Pending {
             id,
+            phase: PendingPhase::Streaming,
             response: PendingResponse::default(),
+            tool_call_slots: BTreeMap::new(),
+            tool_results: Vec::new(),
         });
         self.status = Status::AwaitingModel;
+        self.tool_calls_this_turn = 0;
         self.metrics.user_messages_accepted.inc();
         vec![
             Action::StartRequest {
@@ -268,9 +723,16 @@ impl AgentCore {
             self.metrics.cancels_ignored_when_idle.inc();
             return Vec::new();
         };
+        let cancel_action = match pending.phase {
+            PendingPhase::Streaming => Action::CancelRequest { id: pending.id },
+            PendingPhase::ToolRunning => Action::CancelToolExecution {
+                request: pending.id,
+            },
+        };
         self.status = Status::Idle;
+        self.tool_calls_this_turn = 0;
         self.metrics.cancels_applied.inc();
-        vec![Action::CancelRequest { id: pending.id }, Action::Redraw]
+        vec![cancel_action, Action::Redraw]
     }
 
     fn on_content_delta(&mut self, request: RequestId, text: String) -> Vec<Action> {
@@ -278,7 +740,7 @@ impl AgentCore {
             self.metrics.content_deltas_dropped_as_stale.inc();
             return Vec::new();
         };
-        if pending.id != request {
+        if pending.id != request || pending.phase != PendingPhase::Streaming {
             self.metrics.content_deltas_dropped_as_stale.inc();
             return Vec::new();
         }
@@ -293,7 +755,7 @@ impl AgentCore {
             self.metrics.reasoning_deltas_dropped_as_stale.inc();
             return Vec::new();
         };
-        if pending.id != request {
+        if pending.id != request || pending.phase != PendingPhase::Streaming {
             self.metrics.reasoning_deltas_dropped_as_stale.inc();
             return Vec::new();
         }
@@ -303,30 +765,194 @@ impl AgentCore {
         vec![Action::Redraw]
     }
 
+    fn on_tool_call_delta(
+        &mut self,
+        request: RequestId,
+        index: u64,
+        id: Option<String>,
+        function_name: Option<String>,
+        arguments_fragment: Option<String>,
+    ) -> Vec<Action> {
+        let Some(pending) = self.pending.as_mut() else {
+            self.metrics.tool_call_deltas_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        if pending.id != request || pending.phase != PendingPhase::Streaming {
+            self.metrics.tool_call_deltas_dropped_as_stale.inc();
+            return Vec::new();
+        }
+        let slot = pending
+            .tool_call_slots
+            .entry(index)
+            .or_insert_with(|| ToolCallSlot {
+                id: None,
+                function_name: None,
+                arguments: String::new(),
+                over_limit: false,
+            });
+        if slot.id.is_none()
+            && let Some(new_id) = id
+        {
+            slot.id = Some(new_id);
+        }
+        if slot.function_name.is_none()
+            && let Some(new_name) = function_name
+        {
+            slot.function_name = Some(new_name);
+        }
+        if let Some(fragment) = arguments_fragment {
+            if slot.over_limit {
+                self.metrics
+                    .tool_call_arguments_fragments_dropped_over_limit
+                    .inc();
+            } else if slot.arguments.len().saturating_add(fragment.len()) > ARGUMENTS_MAX_BYTES {
+                slot.over_limit = true;
+                self.metrics
+                    .tool_call_arguments_fragments_dropped_over_limit
+                    .inc();
+            } else {
+                slot.arguments.push_str(&fragment);
+            }
+        }
+        self.status = Status::Streaming;
+        self.metrics.tool_call_deltas_appended.inc();
+        vec![Action::Redraw]
+    }
+
     fn on_finish(&mut self, request: RequestId, reason: Option<String>) -> Vec<Action> {
         let Some(pending_ref) = self.pending.as_ref() else {
             self.metrics.finishes_dropped_as_stale.inc();
             return Vec::new();
         };
-        if pending_ref.id != request {
+        if pending_ref.id != request || pending_ref.phase != PendingPhase::Streaming {
             self.metrics.finishes_dropped_as_stale.inc();
             return Vec::new();
         }
         let mut pending = self.pending.take().expect("checked above");
-        pending.response.finish_reason = reason;
+        pending.response.finish_reason = reason.clone();
         let reasoning_content = if pending.response.reasoning.is_empty() {
             None
         } else {
-            Some(pending.response.reasoning)
+            Some(std::mem::take(&mut pending.response.reasoning))
         };
+        let content = std::mem::take(&mut pending.response.content);
+        let is_tool_calls_reason = reason.as_deref() == Some("tool_calls");
+        let has_slots = !pending.tool_call_slots.is_empty();
+
+        if !is_tool_calls_reason || !has_slots {
+            self.conversation.push(ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls: Vec::new(),
+            });
+            self.status = Status::Idle;
+            self.tool_calls_this_turn = 0;
+            self.metrics.finishes_committed.inc();
+            return vec![Action::Redraw];
+        }
+
+        // Tool-calls finish: finalise slots, commit assistant with
+        // tool_calls, and dispatch (or synthetically reject) each call.
+        let request_id = pending.id;
+        let (tool_calls, over_limit_ids) =
+            finalize_tool_call_slots(std::mem::take(&mut pending.tool_call_slots));
+
         self.conversation.push(ChatMessage::Assistant {
-            content: pending.response.content,
+            content,
             reasoning_content,
-            tool_calls: Vec::new(),
+            tool_calls: tool_calls.clone(),
         });
-        self.status = Status::Idle;
         self.metrics.finishes_committed.inc();
-        vec![Action::Redraw]
+
+        let mut actions = Vec::new();
+        let mut pending_results: Vec<PendingToolResult> = Vec::with_capacity(tool_calls.len());
+        for call in tool_calls.into_iter() {
+            if over_limit_ids.contains(&call.id) {
+                pending_results.push(PendingToolResult {
+                    call_id: call.id,
+                    outcome: Some(ToolOutcome::Err(ToolExecutionError::ArgumentsTooLarge)),
+                });
+                self.metrics.tool_calls_rejected_by_arguments_limit.inc();
+                continue;
+            }
+            if self.tool_calls_this_turn >= TURN_TOOL_CALL_LIMIT {
+                pending_results.push(PendingToolResult {
+                    call_id: call.id,
+                    outcome: Some(ToolOutcome::Err(
+                        ToolExecutionError::TurnToolCallLimitExceeded,
+                    )),
+                });
+                self.metrics.tool_calls_rejected_by_turn_limit.inc();
+                continue;
+            }
+            match ReadOnlyTool::parse(&call.function_name, &call.arguments_json) {
+                Ok(invocation) => {
+                    actions.push(Action::ExecuteTool {
+                        request: request_id,
+                        call_id: call.id.clone(),
+                        invocation,
+                    });
+                    pending_results.push(PendingToolResult {
+                        call_id: call.id,
+                        outcome: None,
+                    });
+                    self.tool_calls_this_turn += 1;
+                    self.metrics.tool_calls_executed.inc();
+                }
+                Err(err) => {
+                    pending_results.push(PendingToolResult {
+                        call_id: call.id,
+                        outcome: Some(ToolOutcome::Err(err)),
+                    });
+                }
+            }
+        }
+
+        let all_resolved = pending_results.iter().all(|r| r.outcome.is_some());
+        if all_resolved {
+            actions.extend(self.advance_to_next_request(pending_results));
+            return actions;
+        }
+
+        pending.phase = PendingPhase::ToolRunning;
+        pending.tool_results = pending_results;
+        self.pending = Some(pending);
+        self.status = Status::ToolRunning;
+        actions.push(Action::Redraw);
+        actions
+    }
+
+    fn on_tool_result(
+        &mut self,
+        request: RequestId,
+        call_id: String,
+        outcome: ToolOutcome,
+    ) -> Vec<Action> {
+        let Some(pending) = self.pending.as_mut() else {
+            self.metrics.tool_results_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        if pending.id != request || pending.phase != PendingPhase::ToolRunning {
+            self.metrics.tool_results_dropped_as_stale.inc();
+            return Vec::new();
+        }
+        let Some(entry) = pending
+            .tool_results
+            .iter_mut()
+            .find(|r| r.call_id == call_id && r.outcome.is_none())
+        else {
+            self.metrics.tool_results_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        entry.outcome = Some(outcome);
+        self.metrics.tool_results_committed.inc();
+
+        if pending.tool_results.iter().all(|r| r.outcome.is_some()) {
+            let pending = self.pending.take().expect("checked above");
+            self.advance_to_next_request(pending.tool_results)
+        } else {
+            vec![Action::Redraw]
+        }
     }
 
     fn on_transport_error(&mut self, request: RequestId, message: String) -> Vec<Action> {
@@ -334,12 +960,13 @@ impl AgentCore {
             self.metrics.transport_errors_dropped_as_stale.inc();
             return Vec::new();
         };
-        if pending_ref.id != request {
+        if pending_ref.id != request || pending_ref.phase != PendingPhase::Streaming {
             self.metrics.transport_errors_dropped_as_stale.inc();
             return Vec::new();
         }
         self.pending = None;
         self.status = Status::Idle;
+        self.tool_calls_this_turn = 0;
         self.metrics.transport_errors_recorded.inc();
         vec![Action::ReportError { message }, Action::Redraw]
     }
@@ -349,13 +976,14 @@ impl AgentCore {
             self.metrics.timeouts_dropped_as_stale.inc();
             return Vec::new();
         };
-        if pending_ref.id != request {
+        if pending_ref.id != request || pending_ref.phase != PendingPhase::Streaming {
             self.metrics.timeouts_dropped_as_stale.inc();
             return Vec::new();
         }
         let id = pending_ref.id;
         self.pending = None;
         self.status = Status::Idle;
+        self.tool_calls_this_turn = 0;
         self.metrics.timeouts_applied.inc();
         vec![
             Action::CancelRequest { id },
@@ -371,6 +999,66 @@ impl AgentCore {
         self.next_id = self.next_id.wrapping_add(1);
         id
     }
+
+    /// All tool results in the just-finished turn's tool loop are in;
+    /// commit them as `Tool` role messages and issue a fresh
+    /// [`Action::StartRequest`] under a new [`RequestId`] so the model
+    /// can consume them.
+    fn advance_to_next_request(&mut self, results: Vec<PendingToolResult>) -> Vec<Action> {
+        for result in results {
+            let outcome = result
+                .outcome
+                .expect("advance_to_next_request called with unresolved tool result");
+            let content = match outcome {
+                ToolOutcome::Ok(s) => s,
+                ToolOutcome::Err(err) => err.to_json_string(),
+            };
+            self.conversation.push(ChatMessage::Tool {
+                tool_call_id: result.call_id,
+                content,
+            });
+        }
+        let id = self.mint_id();
+        self.pending = Some(Pending {
+            id,
+            phase: PendingPhase::Streaming,
+            response: PendingResponse::default(),
+            tool_call_slots: BTreeMap::new(),
+            tool_results: Vec::new(),
+        });
+        self.status = Status::AwaitingModel;
+        vec![
+            Action::StartRequest {
+                id,
+                messages: self.conversation.clone(),
+            },
+            Action::Redraw,
+        ]
+    }
+}
+
+/// Convert per-index streaming slots into the ordered [`ToolCall`] list
+/// committed to the assistant turn. Returns the calls plus the set of
+/// `id`s that were flagged `over_limit` during streaming and should be
+/// resolved to `Err(ArgumentsTooLarge)` instead of being executed.
+fn finalize_tool_call_slots(
+    slots: BTreeMap<u64, ToolCallSlot>,
+) -> (Vec<ToolCall>, std::collections::HashSet<String>) {
+    let mut calls = Vec::with_capacity(slots.len());
+    let mut over_limit = std::collections::HashSet::new();
+    for (index, slot) in slots.into_iter() {
+        let id = slot.id.unwrap_or_else(|| format!("__missing_id__{index}"));
+        let function_name = slot.function_name.unwrap_or_default();
+        if slot.over_limit {
+            over_limit.insert(id.clone());
+        }
+        calls.push(ToolCall {
+            id,
+            function_name,
+            arguments_json: slot.arguments,
+        });
+    }
+    (calls, over_limit)
 }
 
 #[cfg(test)]
@@ -734,5 +1422,437 @@ mod tests {
         assert_eq!(m.transport_errors_dropped_as_stale.get(), 0);
         assert_eq!(m.timeouts_applied.get(), 0);
         assert_eq!(m.timeouts_dropped_as_stale.get(), 0);
+        assert_eq!(m.tool_call_deltas_appended.get(), 0);
+        assert_eq!(m.tool_call_deltas_dropped_as_stale.get(), 0);
+        assert_eq!(m.tool_call_arguments_fragments_dropped_over_limit.get(), 0);
+        assert_eq!(m.tool_results_committed.get(), 0);
+        assert_eq!(m.tool_results_dropped_as_stale.get(), 0);
+        assert_eq!(m.tool_calls_executed.get(), 0);
+        assert_eq!(m.tool_calls_rejected_by_turn_limit.get(), 0);
+        assert_eq!(m.tool_calls_rejected_by_arguments_limit.get(), 0);
+    }
+
+    // -------------------------------------------------------------
+    // tool loop
+    // -------------------------------------------------------------
+
+    fn tool_call_delta(
+        request: RequestId,
+        index: u64,
+        id: Option<&str>,
+        function_name: Option<&str>,
+        arguments_fragment: Option<&str>,
+    ) -> Event {
+        Event::ToolCallDelta {
+            request,
+            index,
+            id: id.map(str::to_string),
+            function_name: function_name.map(str::to_string),
+            arguments_fragment: arguments_fragment.map(str::to_string),
+        }
+    }
+
+    fn drive_single_tool_call(
+        core: &mut AgentCore,
+        request: RequestId,
+        call_id: &str,
+        function_name: &str,
+        arguments_json: &str,
+    ) -> Vec<Action> {
+        let _ = core.handle_event(tool_call_delta(
+            request,
+            0,
+            Some(call_id),
+            Some(function_name),
+            Some(arguments_json),
+        ));
+        core.handle_event(Event::Finish {
+            request,
+            reason: Some("tool_calls".to_string()),
+        })
+    }
+
+    #[test]
+    fn tool_call_delta_merges_fragments_and_emits_execute_tool_on_finish() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            0,
+            Some("call_1"),
+            Some("read"),
+            Some(r#"{"path":""#),
+        ));
+        let _ = core.handle_event(tool_call_delta(id, 0, None, None, Some(r#"src/main.rs"}"#)));
+        assert_eq!(core.metrics().tool_call_deltas_appended.get(), 2);
+        let actions = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        assert_eq!(core.status(), Status::ToolRunning);
+        assert_eq!(core.metrics().tool_calls_executed.get(), 1);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::ExecuteTool {
+                call_id, invocation: ReadOnlyTool::Read { path, .. }, ..
+            } if call_id == "call_1" && path == "src/main.rs"
+        )));
+        // Assistant turn was committed with the tool_calls attached.
+        match &core.conversation()[1] {
+            ChatMessage::Assistant { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].function_name, "read");
+            }
+            other => panic!("expected assistant with tool_calls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_parallel_tool_calls_are_ordered_by_index() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        // Arrive out of order.
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            1,
+            Some("b"),
+            Some("list"),
+            Some(r#"{"path":"src"}"#),
+        ));
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            0,
+            Some("a"),
+            Some("read"),
+            Some(r#"{"path":"README.md"}"#),
+        ));
+        let actions = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        let execute_ids: Vec<String> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ExecuteTool { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(execute_ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn tool_result_completes_slot_and_advances_to_next_request() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_tool_call(&mut core, id, "call_1", "list", r#"{"path":"."}"#);
+        assert_eq!(core.status(), Status::ToolRunning);
+        let actions = core.handle_event(Event::ToolResult {
+            request: id,
+            call_id: "call_1".to_string(),
+            outcome: ToolOutcome::Ok(r#"[{"path":"a"}]"#.to_string()),
+        });
+        assert_eq!(core.metrics().tool_results_committed.get(), 1);
+        // New request started with a fresh id, conversation now has
+        // user + assistant(tool_calls) + tool + <no assistant yet>.
+        let start = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::StartRequest { id, messages } => Some((*id, messages.clone())),
+                _ => None,
+            })
+            .expect("StartRequest emitted");
+        assert_ne!(start.0, id);
+        assert_eq!(start.1.len(), 3);
+        assert!(matches!(start.1[2], ChatMessage::Tool { .. }));
+        assert_eq!(core.status(), Status::AwaitingModel);
+    }
+
+    #[test]
+    fn tool_result_before_all_arrive_stays_in_tool_running() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            0,
+            Some("a"),
+            Some("read"),
+            Some(r#"{"path":"a"}"#),
+        ));
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            1,
+            Some("b"),
+            Some("read"),
+            Some(r#"{"path":"b"}"#),
+        ));
+        let _ = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        let actions = core.handle_event(Event::ToolResult {
+            request: id,
+            call_id: "a".to_string(),
+            outcome: ToolOutcome::Ok("ok".to_string()),
+        });
+        assert_eq!(core.status(), Status::ToolRunning);
+        assert_eq!(actions, vec![Action::Redraw]);
+    }
+
+    #[test]
+    fn tool_result_with_unknown_call_id_is_dropped_as_stale() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_tool_call(&mut core, id, "call_1", "list", r#"{"path":"."}"#);
+        let actions = core.handle_event(Event::ToolResult {
+            request: id,
+            call_id: "does_not_exist".to_string(),
+            outcome: ToolOutcome::Ok("ok".to_string()),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(core.metrics().tool_results_dropped_as_stale.get(), 1);
+    }
+
+    #[test]
+    fn arguments_over_limit_yields_synthetic_arguments_too_large_err() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            0,
+            Some("call_big"),
+            Some("read"),
+            Some(&"x".repeat(ARGUMENTS_MAX_BYTES + 1)),
+        ));
+        assert_eq!(
+            core.metrics()
+                .tool_call_arguments_fragments_dropped_over_limit
+                .get(),
+            1
+        );
+        let actions = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        assert_eq!(
+            core.metrics().tool_calls_rejected_by_arguments_limit.get(),
+            1
+        );
+        assert_eq!(core.metrics().tool_calls_executed.get(), 0);
+        // The synthetic Err resolves all results immediately; a new
+        // StartRequest must have been emitted with the Tool message
+        // carrying the arguments_too_large payload.
+        let messages = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::StartRequest { messages, .. } => Some(messages.clone()),
+                _ => None,
+            })
+            .expect("StartRequest emitted");
+        let tool_msg = messages
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("Tool message present");
+        assert!(tool_msg.contains("arguments_too_large"));
+    }
+
+    #[test]
+    fn turn_tool_call_limit_forces_synthetic_err_for_extras() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        // 21 tool calls, indices 0..=20. Limit is 20.
+        for i in 0..=TURN_TOOL_CALL_LIMIT as u64 {
+            let call_id = format!("c{i}");
+            let _ = core.handle_event(tool_call_delta(
+                id,
+                i,
+                Some(&call_id),
+                Some("list"),
+                Some(r#"{"path":"."}"#),
+            ));
+        }
+        let _ = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        assert_eq!(
+            core.metrics().tool_calls_executed.get(),
+            TURN_TOOL_CALL_LIMIT as u64
+        );
+        assert_eq!(core.metrics().tool_calls_rejected_by_turn_limit.get(), 1);
+    }
+
+    #[test]
+    fn unknown_function_name_yields_synthetic_unknown_tool_err() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let actions = drive_single_tool_call(&mut core, id, "call_1", "bogus", r#"{}"#);
+        // Since it's synthetic Err (all resolved), next StartRequest is emitted.
+        let messages = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::StartRequest { messages, .. } => Some(messages.clone()),
+                _ => None,
+            })
+            .expect("StartRequest emitted");
+        let tool_content = messages
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("Tool message present");
+        assert!(tool_content.contains("unknown_tool"));
+        assert_eq!(core.metrics().tool_calls_executed.get(), 0);
+    }
+
+    #[test]
+    fn cancel_in_tool_running_emits_cancel_tool_execution() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_tool_call(&mut core, id, "call_1", "list", r#"{"path":"."}"#);
+        assert_eq!(core.status(), Status::ToolRunning);
+        let actions = core.handle_event(Event::Cancel);
+        assert!(actions.contains(&Action::CancelToolExecution { request: id }));
+        assert_eq!(core.status(), Status::Idle);
+        assert!(core.pending_response().is_none());
+    }
+
+    #[test]
+    fn transport_error_dropped_in_tool_running_phase() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_tool_call(&mut core, id, "call_1", "list", r#"{"path":"."}"#);
+        let actions = core.handle_event(Event::TransportError {
+            request: id,
+            message: "should be ignored".to_string(),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(core.metrics().transport_errors_dropped_as_stale.get(), 1);
+        assert_eq!(core.status(), Status::ToolRunning);
+    }
+
+    #[test]
+    fn tool_result_dropped_in_streaming_phase() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        // We are still in Streaming phase — no tool_calls finish yet.
+        let actions = core.handle_event(Event::ToolResult {
+            request: id,
+            call_id: "call_1".to_string(),
+            outcome: ToolOutcome::Ok("x".to_string()),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(core.metrics().tool_results_dropped_as_stale.get(), 1);
+    }
+
+    #[test]
+    fn tool_calls_this_turn_resets_between_user_turns() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_tool_call(&mut core, id, "call_1", "list", r#"{"path":"."}"#);
+        // Provide result to advance out of tool loop; also emit a
+        // final stop-finish so we return to Idle.
+        let next_id = {
+            let actions = core.handle_event(Event::ToolResult {
+                request: id,
+                call_id: "call_1".to_string(),
+                outcome: ToolOutcome::Ok("ok".to_string()),
+            });
+            last_start_id(&actions)
+        };
+        let _ = core.handle_event(Event::Finish {
+            request: next_id,
+            reason: Some("stop".to_string()),
+        });
+        assert_eq!(core.status(), Status::Idle);
+        // A brand-new user turn should reset the counter and be able
+        // to emit up to TURN_TOOL_CALL_LIMIT executions again.
+        let id2 = last_start_id(&user(&mut core, "second"));
+        let _ = drive_single_tool_call(&mut core, id2, "c2", "list", r#"{"path":"."}"#);
+        assert_eq!(core.metrics().tool_calls_executed.get(), 2);
+        assert_eq!(core.metrics().tool_calls_rejected_by_turn_limit.get(), 0);
+    }
+
+    #[test]
+    fn finish_with_tool_calls_reason_but_no_slots_falls_through_to_idle() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let actions = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        assert_eq!(actions, vec![Action::Redraw]);
+        assert_eq!(core.status(), Status::Idle);
+        assert_eq!(core.conversation().len(), 2);
+    }
+
+    #[test]
+    fn readonly_tool_definitions_expose_the_three_tools() {
+        let defs = ReadOnlyTool::definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["list", "read", "search"]);
+    }
+
+    #[test]
+    fn readonly_tool_parse_list_defaults() {
+        let tool = ReadOnlyTool::parse("list", r#"{"path":"src"}"#).expect("parses");
+        assert_eq!(
+            tool,
+            ReadOnlyTool::List {
+                path: "src".to_string(),
+                recursive: false,
+                max_entries: DEFAULT_LIST_MAX_ENTRIES,
+                include_hidden: false,
+            }
+        );
+    }
+
+    #[test]
+    fn readonly_tool_parse_read_with_line_range() {
+        let tool = ReadOnlyTool::parse("read", r#"{"path":"src/main.rs","line_range":[10,20]}"#)
+            .expect("parses");
+        assert_eq!(
+            tool,
+            ReadOnlyTool::Read {
+                path: "src/main.rs".to_string(),
+                line_range: Some((10, 20)),
+            }
+        );
+    }
+
+    #[test]
+    fn readonly_tool_parse_search_with_defaults() {
+        let tool = ReadOnlyTool::parse("search", r#"{"pattern":"TODO"}"#).expect("parses");
+        assert_eq!(
+            tool,
+            ReadOnlyTool::Search {
+                pattern: "TODO".to_string(),
+                path_prefix: None,
+                case_sensitive: false,
+                max_results: DEFAULT_SEARCH_MAX_RESULTS,
+            }
+        );
+    }
+
+    #[test]
+    fn readonly_tool_parse_unknown_function_name() {
+        let err = ReadOnlyTool::parse("foo", "{}").expect_err("unknown");
+        assert_eq!(err, ToolExecutionError::UnknownTool);
+    }
+
+    #[test]
+    fn readonly_tool_parse_invalid_json_is_reported() {
+        let err = ReadOnlyTool::parse("list", "not-json").expect_err("invalid");
+        assert!(matches!(err, ToolExecutionError::ArgumentsParseFailed(_)));
+    }
+
+    #[test]
+    fn tool_execution_error_to_json_includes_code_and_message() {
+        let s = ToolExecutionError::OutsideWorkspace.to_json_string();
+        assert!(s.contains(r#""error":"outside_workspace""#));
+        assert!(s.contains(r#""message""#));
     }
 }
