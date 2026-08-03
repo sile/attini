@@ -9,6 +9,7 @@
 pub mod deepseek;
 pub mod metrics;
 pub mod sansio;
+pub mod tools;
 pub mod tui;
 
 pub use metrics::Counter;
