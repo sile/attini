@@ -3,26 +3,30 @@
 //! Rendering, input decoding, and per-key state transitions live in
 //! [`crate::sansio::tui`]. This module keeps only the I/O side:
 //!
-//! - Reading terminal events with [`Terminal::poll_event`]
+//! - Reading terminal input asynchronously via
+//!   [`Terminal::set_input_nonblocking`] + [`tokio::io::unix::AsyncFd`]
+//!   so the tokio runtime can wait on it alongside the transport
+//!   stream and tool-executor feedback
+//! - Reading resize signals via the same async pattern on
+//!   [`Terminal::signal_fd`]
 //! - Turning [`RenderedGrid`] snapshots into
 //!   [`tuinix::TerminalFrame`]s and drawing them
-//! - Running the transport `tokio::spawn` for a request and forwarding
-//!   its [`StreamEvent`]s through the async loop
-//! - Splitting the terminal loop into a `spawn_blocking` task so
-//!   [`Terminal::draw`] never has to compete with a non-blocking
-//!   stdout (see tuinix issue on `set_nonblocking` propagation).
+//! - Spawning transport / tool-executor tasks and merging their output
+//!   into the [`AgentCore`] state machine
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::time::Duration;
 
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tuinix::{
-    EstimateCharWidth, Terminal, TerminalColor, TerminalEvent, TerminalFrame, TerminalInput,
-    TerminalPosition, TerminalSize, TerminalStyle,
+    EstimateCharWidth, Terminal, TerminalColor, TerminalFrame, TerminalInput, TerminalPosition,
+    TerminalSize, TerminalStyle, try_nonblocking,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -30,8 +34,7 @@ use crate::deepseek::{DeepSeekClient, StreamEvent, TransportError};
 use crate::sansio::agent::{Action, AgentCore, Event, RequestId, ToolOutcome};
 use crate::sansio::deepseek::ChatRequest;
 use crate::sansio::tui::{
-    self, Color, KeyCode, KeyEffect, KeyInput, Region, RenderState, RenderedGrid, Style,
-    StyledLine, UiState,
+    self, Color, KeyCode, KeyEffect, KeyInput, Region, RenderedGrid, Style, StyledLine, UiState,
 };
 use crate::tools::ToolExecutor;
 
@@ -41,16 +44,24 @@ pub struct TuiConfig {
     pub model: String,
 }
 
-const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
 /// Run the TUI event loop until the user quits.
 pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TerminalUpdate>();
-    let (render_tx, render_rx) = mpsc::unbounded_channel::<RenderState>();
+    let mut terminal = Terminal::new()?;
+    // `set_input_nonblocking` opens a fresh fd on the tty device and
+    // returns that; O_NONBLOCK on the new fd does NOT propagate to the
+    // stdout fd, which was the original bug behind the earlier
+    // spawn_blocking workaround. See tuinix issue 0001.
+    let input_fd = terminal.set_input_nonblocking()?;
+    let signal_fd = terminal.signal_fd();
+    tuinix::set_nonblocking(signal_fd)?;
 
-    let terminal_tx = event_tx.clone();
-    let terminal_handle =
-        tokio::task::spawn_blocking(move || terminal_loop(terminal_tx, render_rx));
+    // Terminal owns both fds and outlives the AsyncFd wrappers (the
+    // whole function is one scope), so a bare RawFd newtype that does
+    // not close on drop is what we want.
+    let input_async = AsyncFd::with_interest(BorrowedFd(input_fd), Interest::READABLE)?;
+    let signal_async = AsyncFd::with_interest(BorrowedFd(signal_fd), Interest::READABLE)?;
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ToolFeedback>();
 
     let workspace = std::env::current_dir()?;
     let tool_executor = Arc::new(
@@ -70,32 +81,29 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
         tool_executor,
         event_tx,
     };
+    let mut size = terminal.size();
     let mut should_quit = false;
 
-    let _ = render_tx.send(tui::build_render_state(
-        &ui,
-        &agent,
-        shell.error_banner.as_deref(),
-    ));
+    draw(&mut terminal, size, &ui, &agent, &shell)?;
 
     while !should_quit {
         tokio::select! {
             biased;
-            update = event_rx.recv() => {
-                match update {
-                    Some(TerminalUpdate::Key(key)) => {
-                        let outcome = tui::handle_key(key, &mut ui, agent.view());
-                        should_quit |= matches!(outcome.effect, KeyEffect::Quit);
-                        for event in outcome.events {
-                            let actions = agent.handle_event(event);
-                            apply_actions(&ui, actions, &client, &mut shell);
-                        }
-                    }
-                    Some(TerminalUpdate::Resize) => {
-                        // Blocking task tracks size internally; a fresh
-                        // render snapshot below picks up the new size.
-                    }
-                    Some(TerminalUpdate::ToolResult { request, call_id, outcome }) => {
+            input_ready = input_async.readable() => {
+                let mut guard = input_ready?;
+                drain_input(&mut terminal, &mut ui, &mut agent, &client, &mut shell, &mut should_quit)?;
+                guard.clear_ready();
+            }
+            signal_ready = signal_async.readable() => {
+                let mut guard = signal_ready?;
+                if let Some(new_size) = try_nonblocking(terminal.wait_for_resize())? {
+                    size = new_size;
+                }
+                guard.clear_ready();
+            }
+            feedback = event_rx.recv() => {
+                match feedback {
+                    Some(ToolFeedback::Result { request, call_id, outcome }) => {
                         shell.tool_handles.remove(&(request, call_id.clone()));
                         let actions = agent.handle_event(Event::ToolResult {
                             request,
@@ -105,6 +113,10 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                         apply_actions(&ui, actions, &client, &mut shell);
                     }
                     None => {
+                        // All senders (only the tool executor tasks) dropped
+                        // without the user quitting. In practice this cannot
+                        // happen because `shell` still owns a sender; treat
+                        // it as a safety net.
                         should_quit = true;
                     }
                 }
@@ -135,21 +147,66 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                 }
             }
         }
-        let _ = render_tx.send(tui::build_render_state(
-            &ui,
-            &agent,
-            shell.error_banner.as_deref(),
-        ));
+        draw(&mut terminal, size, &ui, &agent, &shell)?;
     }
 
-    drop(render_tx);
     for (_, handle) in shell.tool_handles.drain() {
         handle.abort();
     }
-    match terminal_handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(join_err) => Err(io::Error::other(join_err.to_string())),
+    Ok(())
+}
+
+fn drain_input(
+    terminal: &mut Terminal,
+    ui: &mut UiState,
+    agent: &mut AgentCore,
+    client: &DeepSeekClient,
+    shell: &mut Shell,
+    should_quit: &mut bool,
+) -> io::Result<()> {
+    // `read_input` returns `Ok(None)` when its internal buffer is
+    // empty; `try_nonblocking` maps the outer `EWOULDBLOCK` I/O error
+    // to `Ok(None)`. Either outer-`None` or inner-`None` means "no
+    // more input right now".
+    while let Some(Some(input)) = try_nonblocking(terminal.read_input())? {
+        match input {
+            TerminalInput::Key(key) => {
+                let outcome = tui::handle_key(to_sansio_key(key), ui, agent.view());
+                *should_quit |= matches!(outcome.effect, KeyEffect::Quit);
+                for event in outcome.events {
+                    let actions = agent.handle_event(event);
+                    apply_actions(ui, actions, client, shell);
+                }
+            }
+            TerminalInput::Mouse(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn draw(
+    terminal: &mut Terminal,
+    size: TerminalSize,
+    ui: &UiState,
+    agent: &AgentCore,
+    shell: &Shell,
+) -> io::Result<()> {
+    let state = tui::build_render_state(ui, agent, shell.error_banner.as_deref());
+    let grid = tui::render(&state, (size.rows, size.cols));
+    let frame = render_grid_to_frame(size, &grid);
+    terminal.draw(frame)
+}
+
+/// Non-owning wrapper: `AsyncFd::new` requires `T: AsRawFd`, and we
+/// need to make sure `Drop` does not close the fd (the [`Terminal`]
+/// keeps ownership). A bare `RawFd` newtype without a custom `Drop`
+/// satisfies both.
+#[derive(Debug, Clone, Copy)]
+struct BorrowedFd(RawFd);
+
+impl AsRawFd for BorrowedFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
     }
 }
 
@@ -158,14 +215,12 @@ struct Shell {
     error_banner: Option<String>,
     tool_handles: HashMap<(RequestId, String), JoinHandle<()>>,
     tool_executor: Arc<ToolExecutor>,
-    event_tx: mpsc::UnboundedSender<TerminalUpdate>,
+    event_tx: mpsc::UnboundedSender<ToolFeedback>,
 }
 
 #[derive(Debug)]
-enum TerminalUpdate {
-    Key(KeyInput),
-    Resize,
-    ToolResult {
+enum ToolFeedback {
+    Result {
         request: RequestId,
         call_id: String,
         outcome: ToolOutcome,
@@ -210,7 +265,7 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                 let key = (request, call_id.clone());
                 let handle = tokio::task::spawn_blocking(move || {
                     let outcome = exec.execute(invocation);
-                    let _ = tx.send(TerminalUpdate::ToolResult {
+                    let _ = tx.send(ToolFeedback::Result {
                         request,
                         call_id,
                         outcome,
@@ -278,58 +333,6 @@ impl EstimateCharWidth for UnicodeCharWidth {
     fn estimate_char_width(&self, c: char) -> usize {
         UnicodeWidthChar::width(c).unwrap_or(0)
     }
-}
-
-fn terminal_loop(
-    event_tx: mpsc::UnboundedSender<TerminalUpdate>,
-    mut render_rx: mpsc::UnboundedReceiver<RenderState>,
-) -> io::Result<()> {
-    let mut terminal = Terminal::new()?;
-    let mut size = terminal.size();
-
-    loop {
-        let mut latest = None;
-        let mut render_closed = false;
-        loop {
-            match render_rx.try_recv() {
-                Ok(data) => latest = Some(data),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    render_closed = true;
-                    break;
-                }
-            }
-        }
-        if let Some(state) = latest {
-            let grid = tui::render(&state, (size.rows, size.cols));
-            let frame = render_grid_to_frame(size, &grid);
-            terminal.draw(frame)?;
-        }
-        if render_closed {
-            break;
-        }
-
-        match terminal.poll_event(&[], &[], Some(TERMINAL_POLL_INTERVAL))? {
-            Some(TerminalEvent::Input(TerminalInput::Key(key))) => {
-                if event_tx
-                    .send(TerminalUpdate::Key(to_sansio_key(key)))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Some(TerminalEvent::Input(TerminalInput::Mouse(_))) => {}
-            Some(TerminalEvent::Resize(new_size)) => {
-                size = new_size;
-                if event_tx.send(TerminalUpdate::Resize).is_err() {
-                    break;
-                }
-            }
-            Some(TerminalEvent::FdReady { .. }) => {}
-            None => {}
-        }
-    }
-    Ok(())
 }
 
 fn render_grid_to_frame(
