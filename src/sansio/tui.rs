@@ -38,9 +38,16 @@ pub struct UiState {
 /// Passing the whole `AgentCore` would give the pure function too much
 /// authority; this projection contains only the flags [`handle_key`]
 /// actually branches on. Constructed via [`AgentCore::view`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentView {
     pub has_active_request: bool,
+    /// call_id of the first patch tool call currently awaiting user
+    /// approval. `None` when no approval is pending. `handle_key`
+    /// switches to the approval-mode key bindings while this is
+    /// `Some` and uses this call_id when emitting
+    /// [`crate::sansio::agent::Event::ApprovePatch`] /
+    /// [`crate::sansio::agent::Event::RejectPatch`].
+    pub pending_approval_call_id: Option<String>,
 }
 
 /// Snapshot of everything [`render`] needs to draw the UI.

@@ -353,6 +353,7 @@ fn pipeline_invariants_hold_across_random_sessions() -> noprop::Result<()> {
             // `active` in the snapshot must reflect the agent view.
             let view = AgentView {
                 has_active_request: agent.active_request().is_some(),
+                pending_approval_call_id: None,
             };
             assert_eq!(
                 state.active, view.has_active_request,

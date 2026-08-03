@@ -724,13 +724,30 @@ pub enum Event {
         reason: Option<String>,
     },
     /// A tool execution completed (successfully or with an error).
-    /// Only accepted while the core is in the [`Status::ToolRunning`]
-    /// phase for the matching request.
+    /// Accepted while the core is in either the [`Status::ToolRunning`]
+    /// or [`Status::AwaitingApproval`] phase for the matching request.
     ToolResult {
         request: RequestId,
         call_id: String,
         outcome: ToolOutcome,
     },
+    /// Shell has computed the target file hashes and diff summary for
+    /// a patch call and is waiting for user approval. Transitions the
+    /// core to [`Status::AwaitingApproval`].
+    PatchPreviewReady {
+        request: RequestId,
+        call_id: String,
+        preview_hashes: Vec<PreviewHash>,
+        preview: PatchPreview,
+    },
+    /// User approved the patch preview for `call_id`. The core emits
+    /// [`Action::ApplyPatch`] with the previously-stored
+    /// `preview_hashes`.
+    ApprovePatch { call_id: String },
+    /// User rejected the patch preview for `call_id`. The core
+    /// synthesises `ToolOutcome::Err(Patch(Rejected))` for the call
+    /// and continues the tool loop.
+    RejectPatch { call_id: String },
     /// The transport reported an unrecoverable error for this request.
     TransportError { request: RequestId, message: String },
     /// The request exceeded its allotted time.
@@ -763,10 +780,27 @@ pub enum Action {
         call_id: String,
         invocation: ReadOnlyTool,
     },
+    /// Compute the target file SHA-256 hashes and diff summary for
+    /// `invocation` and deliver them back as
+    /// [`Event::PatchPreviewReady`] so the core can enter approval
+    /// mode. The shell must not touch the filesystem yet.
+    PreviewPatch {
+        request: RequestId,
+        call_id: String,
+        invocation: PatchInvocation,
+    },
+    /// User approved the patch preview; apply the 2-phase writeback
+    /// using `preview_hashes` to detect concurrent modifications
+    /// between preview and apply.
+    ApplyPatch {
+        request: RequestId,
+        call_id: String,
+        preview_hashes: Vec<PreviewHash>,
+    },
     /// Abort any tool executions that were dispatched for `request`
     /// but have not yet reported an outcome. Emitted when the user
     /// cancels or the request times out while in
-    /// [`Status::ToolRunning`].
+    /// [`Status::ToolRunning`] or [`Status::AwaitingApproval`].
     CancelToolExecution { request: RequestId },
     /// A diagnostic message the shell should surface to the user
     /// (transport failure, timeout, etc.). The core does not retain
@@ -815,10 +849,6 @@ enum PendingPhase {
     /// At least one patch call is waiting for user approval. Read-only
     /// tool results still land in this phase; `on_tool_result`'s gate
     /// accepts both `ToolRunning` and `AwaitingApproval`.
-    #[expect(
-        dead_code,
-        reason = "constructed once the patch-loop state transitions land in the next commit"
-    )]
     AwaitingApproval,
 }
 
@@ -839,6 +869,19 @@ struct PendingToolResult {
     call_id: String,
     function_name: String,
     arguments_json: String,
+    /// Approval state. Read-only tools are always
+    /// [`ApprovalState::NotRequired`]. Patch tools start as
+    /// [`ApprovalState::Pending`] once
+    /// [`Event::PatchPreviewReady`] lands.
+    approval: ApprovalState,
+    /// Populated when [`Event::PatchPreviewReady`] arrives so the TUI
+    /// can render the diff summary. `None` for read-only tools and
+    /// for patch tools before the shell has produced a preview.
+    patch_preview: Option<PatchPreview>,
+    /// Populated together with `patch_preview`. Retained here so
+    /// [`Event::ApprovePatch`] can hand the same hashes back to the
+    /// shell as [`Action::ApplyPatch`] without a round trip.
+    preview_hashes: Vec<PreviewHash>,
     /// `None` while the shell is still executing the tool; `Some` once
     /// it has reported (or the core has synthesised) an outcome.
     outcome: Option<ToolOutcome>,
@@ -857,6 +900,17 @@ pub struct ActiveToolCall {
     pub arguments_json: String,
     pub outcome: Option<ToolOutcome>,
     pub is_streaming: bool,
+    /// Approval status. [`ApprovalState::NotRequired`] for read-only
+    /// tools; otherwise reflects the patch approval flow state.
+    pub approval: ApprovalState,
+    /// Diff summary from [`Event::PatchPreviewReady`]. `None` for
+    /// read-only tools or patch tools whose preview has not yet
+    /// arrived.
+    pub patch_preview: Option<PatchPreview>,
+    /// SHA-256 hashes captured at preview time. Empty for read-only
+    /// tools; the TUI does not display them (they exist only so the
+    /// core can hand them to [`Action::ApplyPatch`] on approval).
+    pub preview_hashes: Vec<PreviewHash>,
 }
 
 /// Cumulative counters for the branches taken by
@@ -954,6 +1008,32 @@ pub struct AgentMetrics {
     /// `Err(ArgumentsTooLarge)` because its accumulated arguments
     /// exceeded [`ARGUMENTS_MAX_BYTES`].
     pub tool_calls_rejected_by_arguments_limit: Counter,
+    /// [`Action::PreviewPatch`] was emitted for a patch tool call
+    /// (parsed successfully, within the shared turn/arguments limits).
+    pub patch_calls_previewed: Counter,
+    /// [`Event::PatchPreviewReady`] whose `call_id` matched an
+    /// outstanding patch call; the diff summary and hashes were
+    /// stored on the pending tool result and the phase transitioned
+    /// to `AwaitingApproval`.
+    pub patch_previews_committed: Counter,
+    /// [`Event::PatchPreviewReady`] dropped because no request was
+    /// active, the id did not match, no outstanding patch call had
+    /// the matching `call_id`, or the call was already resolved.
+    pub patch_previews_dropped_as_stale: Counter,
+    /// [`Event::ApprovePatch`] whose `call_id` matched an
+    /// approval-pending patch call; [`Action::ApplyPatch`] was
+    /// emitted.
+    pub patch_approvals_committed: Counter,
+    /// [`Event::ApprovePatch`] dropped because no approval-pending
+    /// patch call had the matching `call_id`.
+    pub patch_approvals_dropped_as_stale: Counter,
+    /// [`Event::RejectPatch`] whose `call_id` matched an
+    /// approval-pending patch call; a synthetic
+    /// `Err(Patch(Rejected))` outcome was recorded.
+    pub patch_rejections_committed: Counter,
+    /// [`Event::RejectPatch`] dropped because no approval-pending
+    /// patch call had the matching `call_id`.
+    pub patch_rejections_dropped_as_stale: Counter,
 }
 
 impl AgentCore {
@@ -981,7 +1061,17 @@ impl AgentCore {
     pub fn view(&self) -> AgentView {
         AgentView {
             has_active_request: self.pending.is_some(),
+            pending_approval_call_id: self.first_pending_approval_call_id(),
         }
+    }
+
+    fn first_pending_approval_call_id(&self) -> Option<String> {
+        self.pending
+            .as_ref()?
+            .tool_results
+            .iter()
+            .find(|r| r.approval == ApprovalState::Pending && r.patch_preview.is_some())
+            .map(|r| r.call_id.clone())
     }
 
     /// Coarse runtime status suitable for a status line.
@@ -1008,6 +1098,9 @@ impl AgentCore {
                     arguments_json: slot.arguments.clone(),
                     outcome: None,
                     is_streaming: true,
+                    approval: ApprovalState::NotRequired,
+                    patch_preview: None,
+                    preview_hashes: Vec::new(),
                 })
                 .collect(),
             PendingPhase::ToolRunning | PendingPhase::AwaitingApproval => pending
@@ -1019,6 +1112,9 @@ impl AgentCore {
                     arguments_json: r.arguments_json.clone(),
                     outcome: r.outcome.clone(),
                     is_streaming: false,
+                    approval: r.approval,
+                    patch_preview: r.patch_preview.clone(),
+                    preview_hashes: r.preview_hashes.clone(),
                 })
                 .collect(),
         }
@@ -1050,6 +1146,14 @@ impl AgentCore {
                 call_id,
                 outcome,
             } => self.on_tool_result(request, call_id, outcome),
+            Event::PatchPreviewReady {
+                request,
+                call_id,
+                preview_hashes,
+                preview,
+            } => self.on_patch_preview_ready(request, call_id, preview_hashes, preview),
+            Event::ApprovePatch { call_id } => self.on_approve_patch(call_id),
+            Event::RejectPatch { call_id } => self.on_reject_patch(call_id),
             Event::TransportError { request, message } => self.on_transport_error(request, message),
             Event::Timeout { request } => self.on_timeout(request),
         }
@@ -1237,6 +1341,9 @@ impl AgentCore {
                     call_id: call.id,
                     function_name: call.function_name,
                     arguments_json: call.arguments_json,
+                    approval: ApprovalState::NotRequired,
+                    patch_preview: None,
+                    preview_hashes: Vec::new(),
                     outcome: Some(ToolOutcome::Err(ToolExecutionError::ArgumentsTooLarge)),
                 });
                 self.metrics.tool_calls_rejected_by_arguments_limit.inc();
@@ -1247,6 +1354,9 @@ impl AgentCore {
                     call_id: call.id,
                     function_name: call.function_name,
                     arguments_json: call.arguments_json,
+                    approval: ApprovalState::NotRequired,
+                    patch_preview: None,
+                    preview_hashes: Vec::new(),
                     outcome: Some(ToolOutcome::Err(
                         ToolExecutionError::TurnToolCallLimitExceeded,
                     )),
@@ -1254,29 +1364,69 @@ impl AgentCore {
                 self.metrics.tool_calls_rejected_by_turn_limit.inc();
                 continue;
             }
-            match ReadOnlyTool::parse(&call.function_name, &call.arguments_json) {
-                Ok(invocation) => {
-                    actions.push(Action::ExecuteTool {
-                        request: request_id,
-                        call_id: call.id.clone(),
-                        invocation,
-                    });
-                    pending_results.push(PendingToolResult {
-                        call_id: call.id,
-                        function_name: call.function_name,
-                        arguments_json: call.arguments_json,
-                        outcome: None,
-                    });
-                    self.tool_calls_this_turn += 1;
-                    self.metrics.tool_calls_executed.inc();
+            if call.function_name == "patch" {
+                match PatchInvocation::parse(&call.arguments_json) {
+                    Ok(invocation) => {
+                        actions.push(Action::PreviewPatch {
+                            request: request_id,
+                            call_id: call.id.clone(),
+                            invocation,
+                        });
+                        pending_results.push(PendingToolResult {
+                            call_id: call.id,
+                            function_name: call.function_name,
+                            arguments_json: call.arguments_json,
+                            approval: ApprovalState::Pending,
+                            patch_preview: None,
+                            preview_hashes: Vec::new(),
+                            outcome: None,
+                        });
+                        self.tool_calls_this_turn += 1;
+                        self.metrics.patch_calls_previewed.inc();
+                    }
+                    Err(err) => {
+                        pending_results.push(PendingToolResult {
+                            call_id: call.id,
+                            function_name: call.function_name,
+                            arguments_json: call.arguments_json,
+                            approval: ApprovalState::NotRequired,
+                            patch_preview: None,
+                            preview_hashes: Vec::new(),
+                            outcome: Some(ToolOutcome::Err(err)),
+                        });
+                    }
                 }
-                Err(err) => {
-                    pending_results.push(PendingToolResult {
-                        call_id: call.id,
-                        function_name: call.function_name,
-                        arguments_json: call.arguments_json,
-                        outcome: Some(ToolOutcome::Err(err)),
-                    });
+            } else {
+                match ReadOnlyTool::parse(&call.function_name, &call.arguments_json) {
+                    Ok(invocation) => {
+                        actions.push(Action::ExecuteTool {
+                            request: request_id,
+                            call_id: call.id.clone(),
+                            invocation,
+                        });
+                        pending_results.push(PendingToolResult {
+                            call_id: call.id,
+                            function_name: call.function_name,
+                            arguments_json: call.arguments_json,
+                            approval: ApprovalState::NotRequired,
+                            patch_preview: None,
+                            preview_hashes: Vec::new(),
+                            outcome: None,
+                        });
+                        self.tool_calls_this_turn += 1;
+                        self.metrics.tool_calls_executed.inc();
+                    }
+                    Err(err) => {
+                        pending_results.push(PendingToolResult {
+                            call_id: call.id,
+                            function_name: call.function_name,
+                            arguments_json: call.arguments_json,
+                            approval: ApprovalState::NotRequired,
+                            patch_preview: None,
+                            preview_hashes: Vec::new(),
+                            outcome: Some(ToolOutcome::Err(err)),
+                        });
+                    }
                 }
             }
         }
@@ -1305,7 +1455,10 @@ impl AgentCore {
             self.metrics.tool_results_dropped_as_stale.inc();
             return Vec::new();
         };
-        if pending.id != request || pending.phase != PendingPhase::ToolRunning {
+        // Accept in both ToolRunning and AwaitingApproval phases so
+        // read-only results can still land while a patch is waiting
+        // for user approval.
+        if pending.id != request || matches!(pending.phase, PendingPhase::Streaming) {
             self.metrics.tool_results_dropped_as_stale.inc();
             return Vec::new();
         }
@@ -1319,7 +1472,123 @@ impl AgentCore {
         };
         entry.outcome = Some(outcome);
         self.metrics.tool_results_committed.inc();
+        self.recompute_phase_and_status();
 
+        self.maybe_advance_to_next_request()
+    }
+
+    fn on_patch_preview_ready(
+        &mut self,
+        request: RequestId,
+        call_id: String,
+        preview_hashes: Vec<PreviewHash>,
+        preview: PatchPreview,
+    ) -> Vec<Action> {
+        let Some(pending) = self.pending.as_mut() else {
+            self.metrics.patch_previews_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        if pending.id != request || matches!(pending.phase, PendingPhase::Streaming) {
+            self.metrics.patch_previews_dropped_as_stale.inc();
+            return Vec::new();
+        }
+        let Some(entry) = pending.tool_results.iter_mut().find(|r| {
+            r.call_id == call_id
+                && r.approval == ApprovalState::Pending
+                && r.outcome.is_none()
+                && r.patch_preview.is_none()
+        }) else {
+            self.metrics.patch_previews_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        entry.patch_preview = Some(preview);
+        entry.preview_hashes = preview_hashes;
+        self.metrics.patch_previews_committed.inc();
+        self.recompute_phase_and_status();
+        vec![Action::Redraw]
+    }
+
+    fn on_approve_patch(&mut self, call_id: String) -> Vec<Action> {
+        let Some(pending) = self.pending.as_mut() else {
+            self.metrics.patch_approvals_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        let request_id = pending.id;
+        let Some(entry) = pending.tool_results.iter_mut().find(|r| {
+            r.call_id == call_id
+                && r.approval == ApprovalState::Pending
+                && r.patch_preview.is_some()
+        }) else {
+            self.metrics.patch_approvals_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        entry.approval = ApprovalState::Approved;
+        let preview_hashes = entry.preview_hashes.clone();
+        self.metrics.patch_approvals_committed.inc();
+        self.recompute_phase_and_status();
+        vec![
+            Action::ApplyPatch {
+                request: request_id,
+                call_id,
+                preview_hashes,
+            },
+            Action::Redraw,
+        ]
+    }
+
+    fn on_reject_patch(&mut self, call_id: String) -> Vec<Action> {
+        let Some(pending) = self.pending.as_mut() else {
+            self.metrics.patch_rejections_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        let Some(entry) = pending.tool_results.iter_mut().find(|r| {
+            r.call_id == call_id
+                && r.approval == ApprovalState::Pending
+                && r.patch_preview.is_some()
+        }) else {
+            self.metrics.patch_rejections_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        entry.approval = ApprovalState::Rejected;
+        entry.outcome = Some(ToolOutcome::Err(ToolExecutionError::Patch(
+            PatchError::Rejected,
+        )));
+        self.metrics.patch_rejections_committed.inc();
+        self.recompute_phase_and_status();
+        self.maybe_advance_to_next_request()
+    }
+
+    /// After any state change to `tool_results`, adjust `pending.phase`
+    /// and `self.status` to match: any Pending patch keeps us in
+    /// `AwaitingApproval`, otherwise back to `ToolRunning`.
+    fn recompute_phase_and_status(&mut self) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let has_pending_approval = pending
+            .tool_results
+            .iter()
+            .any(|r| r.approval == ApprovalState::Pending);
+        match (pending.phase, has_pending_approval) {
+            (PendingPhase::Streaming, _) => {}
+            (_, true) => {
+                pending.phase = PendingPhase::AwaitingApproval;
+                self.status = Status::AwaitingApproval;
+            }
+            (_, false) => {
+                pending.phase = PendingPhase::ToolRunning;
+                self.status = Status::ToolRunning;
+            }
+        }
+    }
+
+    /// If every tool result is resolved, commit them and start the
+    /// follow-up request; otherwise emit a redraw so the TUI reflects
+    /// the state change.
+    fn maybe_advance_to_next_request(&mut self) -> Vec<Action> {
+        let Some(pending) = self.pending.as_ref() else {
+            return Vec::new();
+        };
         if pending.tool_results.iter().all(|r| r.outcome.is_some()) {
             let pending = self.pending.take().expect("checked above");
             self.advance_to_next_request(pending.tool_results)
@@ -1803,6 +2072,13 @@ mod tests {
         assert_eq!(m.tool_calls_executed.get(), 0);
         assert_eq!(m.tool_calls_rejected_by_turn_limit.get(), 0);
         assert_eq!(m.tool_calls_rejected_by_arguments_limit.get(), 0);
+        assert_eq!(m.patch_calls_previewed.get(), 0);
+        assert_eq!(m.patch_previews_committed.get(), 0);
+        assert_eq!(m.patch_previews_dropped_as_stale.get(), 0);
+        assert_eq!(m.patch_approvals_committed.get(), 0);
+        assert_eq!(m.patch_approvals_dropped_as_stale.get(), 0);
+        assert_eq!(m.patch_rejections_committed.get(), 0);
+        assert_eq!(m.patch_rejections_dropped_as_stale.get(), 0);
     }
 
     // -------------------------------------------------------------
@@ -2338,5 +2614,224 @@ mod tests {
         let s = e.to_json_string();
         assert!(s.contains(r#""error":"patch_no_match""#), "got {s}");
         assert!(s.contains("a.txt"));
+    }
+
+    // -------------------------------------------------------------
+    // patch approval loop
+    // -------------------------------------------------------------
+
+    fn drive_single_patch_call(
+        core: &mut AgentCore,
+        request: RequestId,
+        call_id: &str,
+        arguments_json: &str,
+    ) -> Vec<Action> {
+        let _ = core.handle_event(tool_call_delta(
+            request,
+            0,
+            Some(call_id),
+            Some("patch"),
+            Some(arguments_json),
+        ));
+        core.handle_event(Event::Finish {
+            request,
+            reason: Some("tool_calls".to_string()),
+        })
+    }
+
+    fn valid_add_patch_json() -> &'static str {
+        r#"{"edits":[{"kind":"add","path":"new.txt","content":"hi"}]}"#
+    }
+
+    #[test]
+    fn patch_finish_emits_preview_patch_and_stays_in_tool_running() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let actions = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
+
+        assert_eq!(core.status(), Status::ToolRunning);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::PreviewPatch { call_id, .. } if call_id == "p1"
+        )));
+        assert_eq!(core.metrics().patch_calls_previewed.get(), 1);
+        // no approval-visible call_id yet — preview not received
+        assert_eq!(core.view().pending_approval_call_id, None);
+    }
+
+    #[test]
+    fn patch_preview_ready_transitions_to_awaiting_approval_and_publishes_call_id() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
+
+        let hash = PreviewHash {
+            path: "new.txt".to_string(),
+            sha256: None,
+        };
+        let preview = PatchPreview {
+            target_paths: vec!["new.txt".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            edit_count: 1,
+        };
+        let actions = core.handle_event(Event::PatchPreviewReady {
+            request: id,
+            call_id: "p1".to_string(),
+            preview_hashes: vec![hash],
+            preview,
+        });
+
+        assert_eq!(actions, vec![Action::Redraw]);
+        assert_eq!(core.status(), Status::AwaitingApproval);
+        assert_eq!(core.view().pending_approval_call_id, Some("p1".to_string()));
+        assert_eq!(core.metrics().patch_previews_committed.get(), 1);
+
+        let active = core.active_tool_calls();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].approval, ApprovalState::Pending);
+        assert!(active[0].patch_preview.is_some());
+    }
+
+    #[test]
+    fn patch_approve_emits_apply_patch_with_stored_hashes() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
+        let hash = PreviewHash {
+            path: "new.txt".to_string(),
+            sha256: Some([7u8; 32]),
+        };
+        let _ = core.handle_event(Event::PatchPreviewReady {
+            request: id,
+            call_id: "p1".to_string(),
+            preview_hashes: vec![hash.clone()],
+            preview: PatchPreview::default(),
+        });
+
+        let actions = core.handle_event(Event::ApprovePatch {
+            call_id: "p1".to_string(),
+        });
+
+        let apply = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::ApplyPatch {
+                    call_id,
+                    preview_hashes,
+                    ..
+                } => Some((call_id.clone(), preview_hashes.clone())),
+                _ => None,
+            })
+            .expect("ApplyPatch emitted");
+        assert_eq!(apply.0, "p1");
+        assert_eq!(apply.1, vec![hash]);
+        assert_eq!(core.metrics().patch_approvals_committed.get(), 1);
+        // Approved but not yet resolved — approval left, phase now ToolRunning.
+        assert_eq!(core.status(), Status::ToolRunning);
+        assert!(core.view().pending_approval_call_id.is_none());
+    }
+
+    #[test]
+    fn patch_reject_synthesizes_err_and_advances_when_last() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
+        let _ = core.handle_event(Event::PatchPreviewReady {
+            request: id,
+            call_id: "p1".to_string(),
+            preview_hashes: Vec::new(),
+            preview: PatchPreview::default(),
+        });
+
+        let actions = core.handle_event(Event::RejectPatch {
+            call_id: "p1".to_string(),
+        });
+
+        // Rejection is the only outstanding result → advance emits StartRequest.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartRequest { .. }))
+        );
+        assert_eq!(core.metrics().patch_rejections_committed.get(), 1);
+        // The synthetic Tool message contains the patch_rejected code.
+        let last = core.conversation().last().expect("has tool message");
+        match last {
+            ChatMessage::Tool { content, .. } => {
+                assert!(content.contains("patch_rejected"), "content={content}");
+            }
+            other => panic!("expected Tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn patch_approve_dropped_if_no_pending_call() {
+        let mut core = AgentCore::new();
+        let _ = user(&mut core, "hi");
+        let actions = core.handle_event(Event::ApprovePatch {
+            call_id: "nope".to_string(),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(core.metrics().patch_approvals_dropped_as_stale.get(), 1);
+    }
+
+    #[test]
+    fn patch_preview_ready_dropped_if_call_id_unknown() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
+        let actions = core.handle_event(Event::PatchPreviewReady {
+            request: id,
+            call_id: "does_not_exist".to_string(),
+            preview_hashes: Vec::new(),
+            preview: PatchPreview::default(),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(core.metrics().patch_previews_dropped_as_stale.get(), 1);
+    }
+
+    #[test]
+    fn read_only_result_lands_in_awaiting_approval_phase() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        // Two tool calls: one read-only, one patch. Patch first sets
+        // approval pending after preview → phase AwaitingApproval;
+        // read-only ToolResult must still land in that phase.
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            0,
+            Some("r1"),
+            Some("list"),
+            Some(r#"{"path":"."}"#),
+        ));
+        let _ = core.handle_event(tool_call_delta(
+            id,
+            1,
+            Some("p1"),
+            Some("patch"),
+            Some(valid_add_patch_json()),
+        ));
+        let _ = core.handle_event(Event::Finish {
+            request: id,
+            reason: Some("tool_calls".to_string()),
+        });
+        let _ = core.handle_event(Event::PatchPreviewReady {
+            request: id,
+            call_id: "p1".to_string(),
+            preview_hashes: Vec::new(),
+            preview: PatchPreview::default(),
+        });
+        assert_eq!(core.status(), Status::AwaitingApproval);
+
+        let actions = core.handle_event(Event::ToolResult {
+            request: id,
+            call_id: "r1".to_string(),
+            outcome: ToolOutcome::Ok("ok".to_string()),
+        });
+        assert_eq!(core.metrics().tool_results_committed.get(), 1);
+        assert_eq!(actions, vec![Action::Redraw]);
+        // Still in approval phase because patch is not yet resolved.
+        assert_eq!(core.status(), Status::AwaitingApproval);
     }
 }

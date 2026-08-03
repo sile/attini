@@ -210,12 +210,14 @@ fn ctrl(code: KeyCode) -> KeyInput {
 fn idle_view() -> AgentView {
     AgentView {
         has_active_request: false,
+        pending_approval_call_id: None,
     }
 }
 
 fn active_view() -> AgentView {
     AgentView {
         has_active_request: true,
+        pending_approval_call_id: None,
     }
 }
 
@@ -439,6 +441,9 @@ fn active_tool_call_appears_in_body_with_yellow_label_and_state_word() {
             arguments_json: r#"{"path":"src"}"#.to_string(),
             outcome: None,
             is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::NotRequired,
+            patch_preview: None,
+            preview_hashes: Vec::new(),
         });
     state.status = Status::ToolRunning;
     state.active = true;
@@ -475,6 +480,9 @@ fn completed_ok_tool_call_shows_done_and_summary() {
                 r#"{"content":"hi","truncated":false}"#.to_string(),
             )),
             is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::NotRequired,
+            patch_preview: None,
+            preview_hashes: Vec::new(),
         });
     let grid = render(&state, (10, 60));
     let joined: String = grid
@@ -501,6 +509,9 @@ fn errored_tool_call_shows_error_state_in_red() {
                 attini::sansio::agent::ToolExecutionError::OutsideWorkspace,
             )),
             is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::NotRequired,
+            patch_preview: None,
+            preview_hashes: Vec::new(),
         });
     let grid = render(&state, (10, 60));
     let error_span = grid.body.lines[0]

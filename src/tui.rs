@@ -285,6 +285,14 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                     }
                 });
             }
+            Action::PreviewPatch { .. } | Action::ApplyPatch { .. } => {
+                // Patch executor wiring lands in a follow-up commit;
+                // without it, a turn containing a patch call stays
+                // parked in `AwaitingApproval` forever. Guarded by
+                // the fact that PatchInvocation::definition() is not
+                // yet advertised on the wire, so the model cannot
+                // produce a patch tool call in the meantime.
+            }
             Action::ReportError { message } => {
                 shell.error_banner = Some(message);
             }
