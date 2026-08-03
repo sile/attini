@@ -6,4 +6,5 @@
 //! subprocess integration live in sibling modules that drive the
 //! Sans I/O types with concrete inputs.
 
+pub mod deepseek;
 pub mod sansio;

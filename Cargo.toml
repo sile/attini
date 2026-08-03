@@ -7,6 +7,11 @@ rust-version = "1.93"
 [dependencies]
 nojson = "0.3"
 noargs = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-platform-verifier = "0.7"
+shiguredo_http11 = "2026.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
