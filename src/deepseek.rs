@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::{self, ClientConfig, pki_types::ServerName};
 
+use crate::metrics::Counter;
 use crate::sansio::deepseek::{ChatRequest, StreamPayload, decode_stream_payload};
 use crate::sansio::sse::{SseDecoder, SseError, SseEvent};
 
@@ -113,6 +114,10 @@ impl std::fmt::Debug for SecretString {
 
 /// Client that speaks the streaming Chat Completions API against
 /// `api.deepseek.com`.
+///
+/// `Clone` shares the underlying config and metrics through an
+/// [`Arc`], so every clone contributes to the same
+/// [`TransportMetrics`] counters observable via [`Self::metrics`].
 #[derive(Clone, Debug)]
 pub struct DeepSeekClient {
     api_key: SecretString,
@@ -121,6 +126,61 @@ pub struct DeepSeekClient {
     path: String,
     tls_config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
+    metrics: Arc<TransportMetrics>,
+}
+
+/// Cumulative counters for [`DeepSeekClient`] request lifecycle and
+/// byte throughput.
+///
+/// Fields use the shared [`Counter`] wrapper. Read via
+/// [`DeepSeekClient::metrics`] (returns `&TransportMetrics` through
+/// the client's internal [`Arc`]) and call `.clone()` on the
+/// reference to capture an independent snapshot for before/after
+/// diffs.
+///
+/// `requests_started` is bumped in [`DeepSeekClient::call`] before
+/// the transport task is spawned; the task then bumps exactly one of
+/// `requests_completed_ok` or one of the `errors_*` counters when
+/// the stream ends. Bytes flow through `bytes_written` /
+/// `bytes_read` while the stream is live.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportMetrics {
+    pub requests_started: Counter,
+    pub requests_completed_ok: Counter,
+    pub errors_io: Counter,
+    pub errors_tls: Counter,
+    pub errors_http_encode: Counter,
+    pub errors_http_decode: Counter,
+    pub errors_http_status: Counter,
+    pub errors_sse: Counter,
+    pub errors_payload: Counter,
+    pub errors_channel_closed: Counter,
+    pub errors_server_closed_before_done: Counter,
+    pub bytes_written: Counter,
+    pub bytes_read: Counter,
+}
+
+impl TransportMetrics {
+    fn record_error(&self, err: &TransportError) {
+        let counter = match err {
+            TransportError::Io(_) => &self.errors_io,
+            TransportError::Tls(_) => &self.errors_tls,
+            TransportError::HttpEncode(_) => &self.errors_http_encode,
+            TransportError::HttpDecode(_) => &self.errors_http_decode,
+            TransportError::UnexpectedStatus { .. } => &self.errors_http_status,
+            TransportError::Sse(_) => &self.errors_sse,
+            TransportError::Payload(_) => &self.errors_payload,
+            TransportError::ChannelClosed => &self.errors_channel_closed,
+            TransportError::ServerClosedBeforeDone => &self.errors_server_closed_before_done,
+            // Setup-time errors (never emitted from run_stream). Do
+            // not count them; if a future refactor routes one of
+            // them here, silently no-op rather than misattribute it.
+            TransportError::MissingApiKey
+            | TransportError::Config(_)
+            | TransportError::InvalidHost(_) => return,
+        };
+        counter.inc();
+    }
 }
 
 impl DeepSeekClient {
@@ -146,7 +206,20 @@ impl DeepSeekClient {
             path: DEEPSEEK_PATH.to_string(),
             tls_config: Arc::new(tls_config),
             server_name,
+            metrics: Arc::new(TransportMetrics::default()),
         })
+    }
+
+    /// Borrow the shared transport counters.
+    ///
+    /// The counters accumulate across every [`Self::call`]
+    /// invocation and every [`Clone`] of this client because they
+    /// live in a shared [`Arc<TransportMetrics>`]. Call `.clone()`
+    /// on the returned reference to capture an independent snapshot
+    /// (`let before = client.metrics().clone();`) for computing
+    /// deltas around a block of work.
+    pub fn metrics(&self) -> &TransportMetrics {
+        &self.metrics
     }
 
     /// Send the request and return a channel that yields events until
@@ -162,9 +235,14 @@ impl DeepSeekClient {
     ) -> mpsc::Receiver<Result<StreamEvent, TransportError>> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let client = self.clone();
+        client.metrics.requests_started.inc();
         tokio::spawn(async move {
-            if let Err(err) = run_stream(client, request, &tx).await {
-                let _ = tx.send(Err(err)).await;
+            match run_stream(&client, request, &tx).await {
+                Ok(()) => client.metrics.requests_completed_ok.inc(),
+                Err(err) => {
+                    client.metrics.record_error(&err);
+                    let _ = tx.send(Err(err)).await;
+                }
             }
         });
         rx
@@ -182,7 +260,7 @@ fn build_client_config() -> Result<ClientConfig, TransportError> {
 }
 
 async fn run_stream(
-    client: DeepSeekClient,
+    client: &DeepSeekClient,
     request: ChatRequest,
     tx: &mpsc::Sender<Result<StreamEvent, TransportError>>,
 ) -> Result<(), TransportError> {
@@ -218,6 +296,7 @@ async fn run_stream(
         .await
         .map_err(TransportError::Io)?;
     tls.flush().await.map_err(TransportError::Io)?;
+    client.metrics.bytes_written.add(request_bytes.len() as u64);
 
     let mut http_decoder = ResponseDecoder::new();
     let mut sse = SseDecoder::new();
@@ -237,6 +316,7 @@ async fn run_stream(
             }
             break;
         }
+        client.metrics.bytes_read.add(n as u64);
         http_decoder
             .feed(&read_buf[..n])
             .map_err(|err| TransportError::HttpDecode(err.to_string()))?;
@@ -417,6 +497,86 @@ mod tests {
         let out = translate_sse_event(SseEvent::Comment("ping".to_string()), &mut done)
             .expect("translate");
         assert_eq!(out, vec![StreamEvent::Comment("ping".to_string())]);
+    }
+
+    #[test]
+    fn transport_metrics_default_is_all_zero() {
+        let m = TransportMetrics::default();
+        assert_eq!(m.requests_started.get(), 0);
+        assert_eq!(m.requests_completed_ok.get(), 0);
+        assert_eq!(m.errors_io.get(), 0);
+        assert_eq!(m.errors_tls.get(), 0);
+        assert_eq!(m.errors_http_encode.get(), 0);
+        assert_eq!(m.errors_http_decode.get(), 0);
+        assert_eq!(m.errors_http_status.get(), 0);
+        assert_eq!(m.errors_sse.get(), 0);
+        assert_eq!(m.errors_payload.get(), 0);
+        assert_eq!(m.errors_channel_closed.get(), 0);
+        assert_eq!(m.errors_server_closed_before_done.get(), 0);
+        assert_eq!(m.bytes_written.get(), 0);
+        assert_eq!(m.bytes_read.get(), 0);
+    }
+
+    #[test]
+    fn transport_metrics_record_error_maps_each_runtime_variant() {
+        use crate::sansio::sse::SseError;
+
+        let m = TransportMetrics::default();
+        m.record_error(&TransportError::Io(std::io::Error::other("x")));
+        m.record_error(&TransportError::Tls("x".to_string()));
+        m.record_error(&TransportError::HttpEncode("x".to_string()));
+        m.record_error(&TransportError::HttpDecode("x".to_string()));
+        m.record_error(&TransportError::UnexpectedStatus { status: 500 });
+        m.record_error(&TransportError::Sse(SseError::InvalidUtf8));
+        m.record_error(&TransportError::Payload(
+            "bad".parse::<nojson::Json<u32>>().unwrap_err(),
+        ));
+        m.record_error(&TransportError::ChannelClosed);
+        m.record_error(&TransportError::ServerClosedBeforeDone);
+        assert_eq!(m.errors_io.get(), 1);
+        assert_eq!(m.errors_tls.get(), 1);
+        assert_eq!(m.errors_http_encode.get(), 1);
+        assert_eq!(m.errors_http_decode.get(), 1);
+        assert_eq!(m.errors_http_status.get(), 1);
+        assert_eq!(m.errors_sse.get(), 1);
+        assert_eq!(m.errors_payload.get(), 1);
+        assert_eq!(m.errors_channel_closed.get(), 1);
+        assert_eq!(m.errors_server_closed_before_done.get(), 1);
+    }
+
+    #[test]
+    fn transport_metrics_record_error_ignores_setup_variants() {
+        let m = TransportMetrics::default();
+        m.record_error(&TransportError::MissingApiKey);
+        m.record_error(&TransportError::Config("x".to_string()));
+        m.record_error(&TransportError::InvalidHost("x".to_string()));
+        // All runtime error counters must still be 0.
+        assert_eq!(m.errors_io.get(), 0);
+        assert_eq!(m.errors_tls.get(), 0);
+        assert_eq!(m.errors_http_encode.get(), 0);
+        assert_eq!(m.errors_http_decode.get(), 0);
+        assert_eq!(m.errors_http_status.get(), 0);
+        assert_eq!(m.errors_sse.get(), 0);
+        assert_eq!(m.errors_payload.get(), 0);
+        assert_eq!(m.errors_channel_closed.get(), 0);
+        assert_eq!(m.errors_server_closed_before_done.get(), 0);
+    }
+
+    #[test]
+    fn arc_wrapped_transport_metrics_are_shared_across_clones() {
+        // Simulate what `DeepSeekClient::clone` does: shared Arc.
+        let shared: Arc<TransportMetrics> = Arc::new(TransportMetrics::default());
+        let cloned = shared.clone();
+        cloned.requests_started.inc();
+        cloned.bytes_written.add(1024);
+        // Original Arc sees the same counters.
+        assert_eq!(shared.requests_started.get(), 1);
+        assert_eq!(shared.bytes_written.get(), 1024);
+        // Explicit deep snapshot detaches from the Arc.
+        let snapshot = (*shared).clone();
+        cloned.requests_started.inc();
+        assert_eq!(shared.requests_started.get(), 2);
+        assert_eq!(snapshot.requests_started.get(), 1);
     }
 
     #[test]

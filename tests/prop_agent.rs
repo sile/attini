@@ -172,28 +172,28 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
             );
 
             let m = core.metrics();
-            let total = m.user_messages_accepted
-                + m.user_messages_rejected_while_active
-                + m.cancels_applied
-                + m.cancels_ignored_when_idle
-                + m.content_deltas_appended
-                + m.content_deltas_dropped_as_stale
-                + m.reasoning_deltas_appended
-                + m.reasoning_deltas_dropped_as_stale
-                + m.finishes_committed
-                + m.finishes_dropped_as_stale
-                + m.transport_errors_recorded
-                + m.transport_errors_dropped_as_stale
-                + m.timeouts_applied
-                + m.timeouts_dropped_as_stale;
+            let total = m.user_messages_accepted.get()
+                + m.user_messages_rejected_while_active.get()
+                + m.cancels_applied.get()
+                + m.cancels_ignored_when_idle.get()
+                + m.content_deltas_appended.get()
+                + m.content_deltas_dropped_as_stale.get()
+                + m.reasoning_deltas_appended.get()
+                + m.reasoning_deltas_dropped_as_stale.get()
+                + m.finishes_committed.get()
+                + m.finishes_dropped_as_stale.get()
+                + m.transport_errors_recorded.get()
+                + m.transport_errors_dropped_as_stale.get()
+                + m.timeouts_applied.get()
+                + m.timeouts_dropped_as_stale.get();
             assert_eq!(
                 total, events_handled,
                 "metrics counter total {total} != events fed {events_handled}",
             );
             // Success-only counters must never exceed their event-total
             // partners (accepted <= accepted + rejected, and so on).
-            assert!(m.finishes_committed <= events_handled);
-            assert!(m.user_messages_accepted <= events_handled);
+            assert!(m.finishes_committed.get() <= events_handled);
+            assert!(m.user_messages_accepted.get() <= events_handled);
 
             previous_conv_len = core.conversation().len();
             previous_assistant = count_assistant(&core);

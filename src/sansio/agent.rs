@@ -14,6 +14,7 @@
 //! retry, and side-effect approvals are intentionally out of scope for
 //! this issue; they land on top of these primitives in later work.
 
+use crate::metrics::Counter;
 use crate::sansio::deepseek::{ChatMessage, Role};
 use crate::sansio::tui::AgentView;
 
@@ -134,63 +135,58 @@ struct Pending {
 /// while idle, etc.) also increment their own counter so the sum of a
 /// pair (`*_accepted` + `*_rejected` / `*_appended` + `*_dropped_as_stale`)
 /// tells you how many events of a given kind the core has seen.
-/// All counters use [`u64::saturating_add`] so overflow saturates at
-/// [`u64::MAX`] rather than wrapping.
 ///
-/// Read via [`AgentCore::metrics`]. There is no reset API; take
-/// snapshots by cloning if you need to compute deltas.
+/// Read via [`AgentCore::metrics`]. Fields use the shared
+/// [`Counter`] wrapper so `let a = agent.metrics().clone();`
+/// captures an independent snapshot for before/after diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentMetrics {
     /// [`Event::UserMessage`] received while idle: the message was
     /// appended to the conversation and an [`Action::StartRequest`]
     /// was emitted.
-    pub user_messages_accepted: u64,
+    pub user_messages_accepted: Counter,
     /// [`Event::UserMessage`] received while another request was
     /// still in flight; the message was dropped.
-    pub user_messages_rejected_while_active: u64,
+    pub user_messages_rejected_while_active: Counter,
     /// [`Event::Cancel`] received while a request was in flight; the
     /// pending response was dropped and [`Action::CancelRequest`] was
     /// emitted.
-    pub cancels_applied: u64,
+    pub cancels_applied: Counter,
     /// [`Event::Cancel`] received while idle; no state changed.
-    pub cancels_ignored_when_idle: u64,
+    pub cancels_ignored_when_idle: Counter,
     /// [`Event::ContentDelta`] whose `request` matched the active
     /// [`RequestId`]; the text was appended to the pending response.
-    pub content_deltas_appended: u64,
+    pub content_deltas_appended: Counter,
     /// [`Event::ContentDelta`] dropped because no request was active
     /// or the `request` id did not match the active one.
-    pub content_deltas_dropped_as_stale: u64,
+    pub content_deltas_dropped_as_stale: Counter,
     /// [`Event::ReasoningDelta`] whose `request` matched the active
     /// [`RequestId`]; the text was appended to the pending reasoning
     /// buffer.
-    pub reasoning_deltas_appended: u64,
+    pub reasoning_deltas_appended: Counter,
     /// [`Event::ReasoningDelta`] dropped because no request was
     /// active or the `request` id did not match the active one.
-    pub reasoning_deltas_dropped_as_stale: u64,
+    pub reasoning_deltas_dropped_as_stale: Counter,
     /// [`Event::Finish`] whose `request` matched the active
     /// [`RequestId`]; the assistant message was committed to the
     /// conversation.
-    pub finishes_committed: u64,
+    pub finishes_committed: Counter,
     /// [`Event::Finish`] dropped because no request was active or the
     /// `request` id did not match the active one.
-    pub finishes_dropped_as_stale: u64,
+    pub finishes_dropped_as_stale: Counter,
     /// [`Event::TransportError`] whose `request` matched the active
     /// [`RequestId`]; an [`Action::ReportError`] was emitted.
-    pub transport_errors_recorded: u64,
+    pub transport_errors_recorded: Counter,
     /// [`Event::TransportError`] dropped because no request was
     /// active or the `request` id did not match the active one.
-    pub transport_errors_dropped_as_stale: u64,
+    pub transport_errors_dropped_as_stale: Counter,
     /// [`Event::Timeout`] whose `request` matched the active
     /// [`RequestId`]; the request was cancelled and an
     /// [`Action::ReportError`] was emitted.
-    pub timeouts_applied: u64,
+    pub timeouts_applied: Counter,
     /// [`Event::Timeout`] dropped because no request was active or
     /// the `request` id did not match the active one.
-    pub timeouts_dropped_as_stale: u64,
-}
-
-fn inc(counter: &mut u64) {
-    *counter = counter.saturating_add(1);
+    pub timeouts_dropped_as_stale: Counter,
 }
 
 impl AgentCore {
@@ -247,7 +243,7 @@ impl AgentCore {
 
     fn on_user_message(&mut self, text: String) -> Vec<Action> {
         if self.pending.is_some() {
-            inc(&mut self.metrics.user_messages_rejected_while_active);
+            self.metrics.user_messages_rejected_while_active.inc();
             return Vec::new();
         }
         self.conversation.push(ChatMessage {
@@ -260,7 +256,7 @@ impl AgentCore {
             response: PendingResponse::default(),
         });
         self.status = Status::AwaitingModel;
-        inc(&mut self.metrics.user_messages_accepted);
+        self.metrics.user_messages_accepted.inc();
         vec![
             Action::StartRequest {
                 id,
@@ -272,51 +268,51 @@ impl AgentCore {
 
     fn on_cancel(&mut self) -> Vec<Action> {
         let Some(pending) = self.pending.take() else {
-            inc(&mut self.metrics.cancels_ignored_when_idle);
+            self.metrics.cancels_ignored_when_idle.inc();
             return Vec::new();
         };
         self.status = Status::Idle;
-        inc(&mut self.metrics.cancels_applied);
+        self.metrics.cancels_applied.inc();
         vec![Action::CancelRequest { id: pending.id }, Action::Redraw]
     }
 
     fn on_content_delta(&mut self, request: RequestId, text: String) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
-            inc(&mut self.metrics.content_deltas_dropped_as_stale);
+            self.metrics.content_deltas_dropped_as_stale.inc();
             return Vec::new();
         };
         if pending.id != request {
-            inc(&mut self.metrics.content_deltas_dropped_as_stale);
+            self.metrics.content_deltas_dropped_as_stale.inc();
             return Vec::new();
         }
         pending.response.content.push_str(&text);
         self.status = Status::Streaming;
-        inc(&mut self.metrics.content_deltas_appended);
+        self.metrics.content_deltas_appended.inc();
         vec![Action::Redraw]
     }
 
     fn on_reasoning_delta(&mut self, request: RequestId, text: String) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
-            inc(&mut self.metrics.reasoning_deltas_dropped_as_stale);
+            self.metrics.reasoning_deltas_dropped_as_stale.inc();
             return Vec::new();
         };
         if pending.id != request {
-            inc(&mut self.metrics.reasoning_deltas_dropped_as_stale);
+            self.metrics.reasoning_deltas_dropped_as_stale.inc();
             return Vec::new();
         }
         pending.response.reasoning.push_str(&text);
         self.status = Status::Streaming;
-        inc(&mut self.metrics.reasoning_deltas_appended);
+        self.metrics.reasoning_deltas_appended.inc();
         vec![Action::Redraw]
     }
 
     fn on_finish(&mut self, request: RequestId, reason: Option<String>) -> Vec<Action> {
         let Some(pending_ref) = self.pending.as_ref() else {
-            inc(&mut self.metrics.finishes_dropped_as_stale);
+            self.metrics.finishes_dropped_as_stale.inc();
             return Vec::new();
         };
         if pending_ref.id != request {
-            inc(&mut self.metrics.finishes_dropped_as_stale);
+            self.metrics.finishes_dropped_as_stale.inc();
             return Vec::new();
         }
         let mut pending = self.pending.take().expect("checked above");
@@ -326,38 +322,38 @@ impl AgentCore {
             content: pending.response.content,
         });
         self.status = Status::Idle;
-        inc(&mut self.metrics.finishes_committed);
+        self.metrics.finishes_committed.inc();
         vec![Action::Redraw]
     }
 
     fn on_transport_error(&mut self, request: RequestId, message: String) -> Vec<Action> {
         let Some(pending_ref) = self.pending.as_ref() else {
-            inc(&mut self.metrics.transport_errors_dropped_as_stale);
+            self.metrics.transport_errors_dropped_as_stale.inc();
             return Vec::new();
         };
         if pending_ref.id != request {
-            inc(&mut self.metrics.transport_errors_dropped_as_stale);
+            self.metrics.transport_errors_dropped_as_stale.inc();
             return Vec::new();
         }
         self.pending = None;
         self.status = Status::Idle;
-        inc(&mut self.metrics.transport_errors_recorded);
+        self.metrics.transport_errors_recorded.inc();
         vec![Action::ReportError { message }, Action::Redraw]
     }
 
     fn on_timeout(&mut self, request: RequestId) -> Vec<Action> {
         let Some(pending_ref) = self.pending.as_ref() else {
-            inc(&mut self.metrics.timeouts_dropped_as_stale);
+            self.metrics.timeouts_dropped_as_stale.inc();
             return Vec::new();
         };
         if pending_ref.id != request {
-            inc(&mut self.metrics.timeouts_dropped_as_stale);
+            self.metrics.timeouts_dropped_as_stale.inc();
             return Vec::new();
         }
         let id = pending_ref.id;
         self.pending = None;
         self.status = Status::Idle;
-        inc(&mut self.metrics.timeouts_applied);
+        self.metrics.timeouts_applied.inc();
         vec![
             Action::CancelRequest { id },
             Action::ReportError {
@@ -612,24 +608,24 @@ mod tests {
     fn user_message_accepted_and_rejected_counters() {
         let mut core = AgentCore::new();
         let _ = user(&mut core, "first");
-        assert_eq!(core.metrics().user_messages_accepted, 1);
-        assert_eq!(core.metrics().user_messages_rejected_while_active, 0);
+        assert_eq!(core.metrics().user_messages_accepted.get(), 1);
+        assert_eq!(core.metrics().user_messages_rejected_while_active.get(), 0);
         // Second user message while first is still active is rejected.
         let _ = user(&mut core, "second");
-        assert_eq!(core.metrics().user_messages_accepted, 1);
-        assert_eq!(core.metrics().user_messages_rejected_while_active, 1);
+        assert_eq!(core.metrics().user_messages_accepted.get(), 1);
+        assert_eq!(core.metrics().user_messages_rejected_while_active.get(), 1);
     }
 
     #[test]
     fn cancel_applied_and_ignored_counters() {
         let mut core = AgentCore::new();
         let _ = core.handle_event(Event::Cancel);
-        assert_eq!(core.metrics().cancels_applied, 0);
-        assert_eq!(core.metrics().cancels_ignored_when_idle, 1);
+        assert_eq!(core.metrics().cancels_applied.get(), 0);
+        assert_eq!(core.metrics().cancels_ignored_when_idle.get(), 1);
         let _ = user(&mut core, "hi");
         let _ = core.handle_event(Event::Cancel);
-        assert_eq!(core.metrics().cancels_applied, 1);
-        assert_eq!(core.metrics().cancels_ignored_when_idle, 1);
+        assert_eq!(core.metrics().cancels_applied.get(), 1);
+        assert_eq!(core.metrics().cancels_ignored_when_idle.get(), 1);
     }
 
     #[test]
@@ -644,8 +640,8 @@ mod tests {
             request: RequestId::new(u64::MAX),
             text: "b".to_string(),
         });
-        assert_eq!(core.metrics().content_deltas_appended, 1);
-        assert_eq!(core.metrics().content_deltas_dropped_as_stale, 1);
+        assert_eq!(core.metrics().content_deltas_appended.get(), 1);
+        assert_eq!(core.metrics().content_deltas_dropped_as_stale.get(), 1);
     }
 
     #[test]
@@ -662,8 +658,8 @@ mod tests {
             request: id,
             text: "late".to_string(),
         });
-        assert_eq!(core.metrics().reasoning_deltas_appended, 1);
-        assert_eq!(core.metrics().reasoning_deltas_dropped_as_stale, 1);
+        assert_eq!(core.metrics().reasoning_deltas_appended.get(), 1);
+        assert_eq!(core.metrics().reasoning_deltas_dropped_as_stale.get(), 1);
     }
 
     #[test]
@@ -679,8 +675,8 @@ mod tests {
             request: id,
             reason: None,
         });
-        assert_eq!(core.metrics().finishes_committed, 1);
-        assert_eq!(core.metrics().finishes_dropped_as_stale, 1);
+        assert_eq!(core.metrics().finishes_committed.get(), 1);
+        assert_eq!(core.metrics().finishes_dropped_as_stale.get(), 1);
     }
 
     #[test]
@@ -696,8 +692,8 @@ mod tests {
             request: id,
             message: "late".to_string(),
         });
-        assert_eq!(core.metrics().transport_errors_recorded, 1);
-        assert_eq!(core.metrics().transport_errors_dropped_as_stale, 1);
+        assert_eq!(core.metrics().transport_errors_recorded.get(), 1);
+        assert_eq!(core.metrics().transport_errors_dropped_as_stale.get(), 1);
     }
 
     #[test]
@@ -707,8 +703,8 @@ mod tests {
         let _ = core.handle_event(Event::Timeout { request: id });
         // No pending: dropped
         let _ = core.handle_event(Event::Timeout { request: id });
-        assert_eq!(core.metrics().timeouts_applied, 1);
-        assert_eq!(core.metrics().timeouts_dropped_as_stale, 1);
+        assert_eq!(core.metrics().timeouts_applied.get(), 1);
+        assert_eq!(core.metrics().timeouts_dropped_as_stale.get(), 1);
     }
 
     #[test]
@@ -716,27 +712,20 @@ mod tests {
         let mut core = AgentCore::new();
         let _ = user(&mut core, "hi");
         let m = core.metrics();
-        assert_eq!(m.user_messages_accepted, 1);
+        assert_eq!(m.user_messages_accepted.get(), 1);
         // Every other counter is zero.
-        assert_eq!(m.user_messages_rejected_while_active, 0);
-        assert_eq!(m.cancels_applied, 0);
-        assert_eq!(m.cancels_ignored_when_idle, 0);
-        assert_eq!(m.content_deltas_appended, 0);
-        assert_eq!(m.content_deltas_dropped_as_stale, 0);
-        assert_eq!(m.reasoning_deltas_appended, 0);
-        assert_eq!(m.reasoning_deltas_dropped_as_stale, 0);
-        assert_eq!(m.finishes_committed, 0);
-        assert_eq!(m.finishes_dropped_as_stale, 0);
-        assert_eq!(m.transport_errors_recorded, 0);
-        assert_eq!(m.transport_errors_dropped_as_stale, 0);
-        assert_eq!(m.timeouts_applied, 0);
-        assert_eq!(m.timeouts_dropped_as_stale, 0);
-    }
-
-    #[test]
-    fn counters_saturate_at_u64_max() {
-        let mut counter: u64 = u64::MAX;
-        inc(&mut counter);
-        assert_eq!(counter, u64::MAX);
+        assert_eq!(m.user_messages_rejected_while_active.get(), 0);
+        assert_eq!(m.cancels_applied.get(), 0);
+        assert_eq!(m.cancels_ignored_when_idle.get(), 0);
+        assert_eq!(m.content_deltas_appended.get(), 0);
+        assert_eq!(m.content_deltas_dropped_as_stale.get(), 0);
+        assert_eq!(m.reasoning_deltas_appended.get(), 0);
+        assert_eq!(m.reasoning_deltas_dropped_as_stale.get(), 0);
+        assert_eq!(m.finishes_committed.get(), 0);
+        assert_eq!(m.finishes_dropped_as_stale.get(), 0);
+        assert_eq!(m.transport_errors_recorded.get(), 0);
+        assert_eq!(m.transport_errors_dropped_as_stale.get(), 0);
+        assert_eq!(m.timeouts_applied.get(), 0);
+        assert_eq!(m.timeouts_dropped_as_stale.get(), 0);
     }
 }

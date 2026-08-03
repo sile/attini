@@ -7,5 +7,8 @@
 //! Sans I/O types with concrete inputs.
 
 pub mod deepseek;
+pub mod metrics;
 pub mod sansio;
 pub mod tui;
+
+pub use metrics::Counter;
