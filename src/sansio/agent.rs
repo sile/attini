@@ -44,6 +44,18 @@ pub const DEFAULT_SEARCH_MAX_RESULTS: usize = 50;
 /// Maximum bytes read from a single file by [`ReadOnlyTool::Read`].
 pub const READ_MAX_BYTES: usize = 1024 * 1024;
 
+/// Maximum edits allowed in a single [`PatchInvocation`]. The 2-phase
+/// applier assumes each edit maps to a unique target path, so the
+/// upper bound doubles as an implicit cap on distinct target files
+/// per call.
+pub const PATCH_MAX_EDITS: usize = 20;
+
+/// Maximum bytes for either the `content` of a [`PatchTool::Add`] or
+/// the file targeted by a [`PatchTool::Update`]. Aligned with
+/// [`READ_MAX_BYTES`] so the model cannot patch a file it cannot
+/// read.
+pub const PATCH_MAX_FILE_BYTES: usize = READ_MAX_BYTES;
+
 /// A read-only tool the model can invoke while the agent is running.
 ///
 /// Semantics and per-tool limits are defined in `src/tools.rs`; this
@@ -220,6 +232,147 @@ where
         .map_err(map_parse_err)
 }
 
+/// A single edit within a [`PatchInvocation`]. The 2-phase applier
+/// requires each edit's target `path` to be unique inside the
+/// containing invocation (see [`PatchInvocation::parse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchTool {
+    /// Create a new file. Rejected if the target path already exists
+    /// at apply time.
+    Add { path: String, content: String },
+    /// Replace the unique byte-for-byte occurrence of `before` inside
+    /// the target file with `after`. Rejected if `before` matches
+    /// zero times or more than once.
+    Update {
+        path: String,
+        before: String,
+        after: String,
+    },
+}
+
+impl PatchTool {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Add { path, .. } | Self::Update { path, .. } => path,
+        }
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Add { .. } => "add",
+            Self::Update { .. } => "update",
+        }
+    }
+}
+
+/// A batch of [`PatchTool`] edits produced from a single `patch`
+/// tool call. Parsed from the model-supplied JSON `arguments`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchInvocation {
+    pub edits: Vec<PatchTool>,
+}
+
+impl PatchInvocation {
+    /// Wire-format definition advertised to the model as one of the
+    /// tools available to it in every [`crate::sansio::deepseek::ChatRequest`].
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "patch".to_string(),
+            description: "Apply a batch of file edits to the workspace. \
+                          Each edit is either an add (create a new file) or \
+                          an update (replace a unique substring). All edits \
+                          in one call must target distinct paths. Every \
+                          patch requires user approval before it touches \
+                          the filesystem."
+                .to_string(),
+            parameters_json: PATCH_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    /// Parse the JSON `arguments` supplied by the model. Enforces the
+    /// per-call limits declared in [`PATCH_MAX_EDITS`] /
+    /// [`PATCH_MAX_FILE_BYTES`] and the unique-target-path invariant
+    /// that the 2-phase applier depends on.
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+        let root = json.value();
+        let edits_value = root
+            .to_member("edits")
+            .map_err(map_parse_err)?
+            .required()
+            .map_err(map_parse_err)?;
+
+        let mut edits: Vec<PatchTool> = Vec::new();
+        let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in edits_value.to_array().map_err(map_parse_err)? {
+            let kind = required_string(item, "kind")?;
+            let path = required_string(item, "path")?;
+            if !seen_paths.insert(path.clone()) {
+                return Err(ToolExecutionError::Patch(
+                    PatchError::MultipleEditsSamePath { path },
+                ));
+            }
+            let tool = match kind.as_str() {
+                "add" => {
+                    let content = required_string(item, "content")?;
+                    if content.len() > PATCH_MAX_FILE_BYTES {
+                        return Err(ToolExecutionError::Patch(PatchError::FileTooLarge { path }));
+                    }
+                    PatchTool::Add { path, content }
+                }
+                "update" => {
+                    let before = required_string(item, "before")?;
+                    let after = required_string(item, "after")?;
+                    if after.len() > PATCH_MAX_FILE_BYTES {
+                        return Err(ToolExecutionError::Patch(PatchError::FileTooLarge { path }));
+                    }
+                    PatchTool::Update {
+                        path,
+                        before,
+                        after,
+                    }
+                }
+                other => {
+                    return Err(ToolExecutionError::ArgumentsParseFailed(format!(
+                        "unknown edit kind: {other}"
+                    )));
+                }
+            };
+            edits.push(tool);
+        }
+
+        if edits.is_empty() {
+            return Err(ToolExecutionError::ArgumentsParseFailed(
+                "edits must not be empty".to_string(),
+            ));
+        }
+        if edits.len() > PATCH_MAX_EDITS {
+            return Err(ToolExecutionError::Patch(PatchError::TooManyEdits {
+                count: edits.len() as u64,
+            }));
+        }
+        Ok(Self { edits })
+    }
+}
+
+const PATCH_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"edits":{"type":"array","minItems":1,"items":{
+"type":"object",
+"properties":{
+"kind":{"type":"string","enum":["add","update"]},
+"path":{"type":"string","description":"Workspace-relative target path. Must be unique across edits in one call."},
+"content":{"type":"string","description":"Full contents for add."},
+"before":{"type":"string","description":"For update: byte-exact substring to replace. Must match exactly once."},
+"after":{"type":"string","description":"For update: replacement text."}
+},
+"required":["kind","path"]
+}}
+},
+"required":["edits"]
+}"#;
+
 fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
     let value = root
         .to_member(name)
@@ -272,8 +425,8 @@ pub enum ToolOutcome {
     Err(ToolExecutionError),
 }
 
-/// Reasons a [`ReadOnlyTool`] invocation could not succeed. Rendered
-/// into `Tool` role message content for the model to reason about.
+/// Reasons a tool invocation could not succeed. Rendered into `Tool`
+/// role message content for the model to reason about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolExecutionError {
     OutsideWorkspace,
@@ -284,6 +437,148 @@ pub enum ToolExecutionError {
     ArgumentsTooLarge,
     UnknownTool,
     TurnToolCallLimitExceeded,
+    /// Failure of a [`PatchTool`] invocation. Isolated in its own
+    /// enum to keep the read-only error variants intact while
+    /// letting patch introduce approval- and filesystem-write-
+    /// specific failure modes.
+    Patch(PatchError),
+}
+
+/// Failure modes specific to [`PatchTool`] invocations. See the
+/// polished `0007` design for the discipline: any failure that
+/// prevents the workspace from being updated is surfaced here so
+/// the model can decide whether to retry, split the batch, or
+/// abandon the edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchError {
+    /// The user actively rejected the preview.
+    Rejected,
+    /// The target file's SHA-256 changed between preview and apply.
+    Conflict { path: String },
+    /// `Update.before` matched zero times in the target file.
+    NoMatch { path: String },
+    /// `Update.before` matched more than once in the target file.
+    AmbiguousMatch { path: String, match_count: u64 },
+    /// `Add` target already exists at apply time.
+    AddOnExistingFile { path: String },
+    /// The parent directory of an `Add` target does not exist and is
+    /// not auto-created.
+    ParentDirMissing { path: String },
+    /// `Update` target does not exist at apply time.
+    UpdateOnMissingFile { path: String },
+    /// The resolved canonical path escapes the workspace root.
+    OutsideWorkspace { path: String },
+    /// `edits.len()` exceeded [`PATCH_MAX_EDITS`].
+    TooManyEdits { count: u64 },
+    /// Two edits within the same call named the same target path.
+    MultipleEditsSamePath { path: String },
+    /// The affected file (either new `content` on add, existing
+    /// target on update, or the produced `after` on update) exceeds
+    /// [`PATCH_MAX_FILE_BYTES`].
+    FileTooLarge { path: String },
+    /// Underlying filesystem I/O failed during preview or apply.
+    IoError { path: String, message: String },
+    /// `rename(2)` returned `EXDEV`. Not handled by fallback in the
+    /// prototype scope.
+    CrossDeviceRename { path: String },
+}
+
+impl PatchError {
+    /// Machine-readable code paired with a human-readable message.
+    /// The code is stable enough for the model to key on retry logic.
+    pub fn to_code_and_message(&self) -> (&'static str, String) {
+        match self {
+            Self::Rejected => (
+                "patch_rejected",
+                "user rejected the patch preview".to_string(),
+            ),
+            Self::Conflict { path } => (
+                "patch_conflict",
+                format!("target file changed between preview and apply: {path}"),
+            ),
+            Self::NoMatch { path } => (
+                "patch_no_match",
+                format!("`before` did not match any content in {path}"),
+            ),
+            Self::AmbiguousMatch { path, match_count } => (
+                "patch_ambiguous_match",
+                format!("`before` matched {match_count} places in {path}; expected exactly 1"),
+            ),
+            Self::AddOnExistingFile { path } => (
+                "patch_add_on_existing_file",
+                format!("cannot add: file already exists at {path}"),
+            ),
+            Self::ParentDirMissing { path } => (
+                "patch_parent_dir_missing",
+                format!("parent directory does not exist for {path}"),
+            ),
+            Self::UpdateOnMissingFile { path } => (
+                "patch_update_on_missing_file",
+                format!("cannot update: file does not exist at {path}"),
+            ),
+            Self::OutsideWorkspace { path } => (
+                "patch_outside_workspace",
+                format!("target path {path} escapes the workspace root"),
+            ),
+            Self::TooManyEdits { count } => (
+                "patch_too_many_edits",
+                format!("edits count {count} exceeded the {PATCH_MAX_EDITS} limit"),
+            ),
+            Self::MultipleEditsSamePath { path } => (
+                "patch_multiple_edits_same_path",
+                format!("more than one edit targets {path} within the same patch call"),
+            ),
+            Self::FileTooLarge { path } => (
+                "patch_file_too_large",
+                format!(
+                    "target or new content for {path} exceeded the {PATCH_MAX_FILE_BYTES} byte limit"
+                ),
+            ),
+            Self::IoError { path, message } => (
+                "patch_io_error",
+                format!("filesystem I/O failed for {path}: {message}"),
+            ),
+            Self::CrossDeviceRename { path } => (
+                "patch_cross_device_rename",
+                format!("cross-device rename not supported for {path}"),
+            ),
+        }
+    }
+}
+
+/// SHA-256 digest of a file captured at [`PatchTool::Update`] preview
+/// time. `sha256` is `None` for [`PatchTool::Add`] paths (whose apply-
+/// time check is "the file must NOT exist" rather than a hash match).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewHash {
+    pub path: String,
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// TUI-facing summary of an incoming patch, computed on the shell
+/// side from the `PatchInvocation` and delivered to the core with
+/// [`Event::PatchPreviewReady`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PatchPreview {
+    /// Sorted, deduplicated list of target paths.
+    pub target_paths: Vec<String>,
+    /// Number of `+` lines across all edits (unified-diff style).
+    pub added_lines: u64,
+    /// Number of `-` lines across all edits.
+    pub removed_lines: u64,
+    /// `invocation.edits.len()`.
+    pub edit_count: u64,
+}
+
+/// Approval status of a tool call. Read-only tools always report
+/// [`ApprovalState::NotRequired`]; patch tool calls flow through
+/// `Pending` → (`Approved` or `Rejected`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalState {
+    NotRequired,
+    Pending,
+    Approved,
+    Rejected,
 }
 
 impl ToolExecutionError {
@@ -312,7 +607,7 @@ impl ToolExecutionError {
             ),
             Self::UnknownTool => (
                 "unknown_tool",
-                "function_name does not match a known read-only tool".to_string(),
+                "function_name does not match a known tool".to_string(),
             ),
             Self::TurnToolCallLimitExceeded => (
                 "turn_tool_call_limit_exceeded",
@@ -321,6 +616,7 @@ impl ToolExecutionError {
                     TURN_TOOL_CALL_LIMIT
                 ),
             ),
+            Self::Patch(err) => err.to_code_and_message(),
         };
         Json(ToolErrorJson {
             code,
@@ -378,6 +674,11 @@ pub enum Status {
     /// [`Event::ToolResult`] for every outstanding call before
     /// auto-emitting the follow-up [`Action::StartRequest`].
     ToolRunning,
+    /// At least one patch call is waiting for user approval. Coexists
+    /// with in-flight read-only tool execution — the shell keeps
+    /// running those in the background while the UI focus is on the
+    /// approval prompt.
+    AwaitingApproval,
 }
 
 /// Buffered pieces of the assistant response for the in-flight request.
@@ -511,6 +812,14 @@ enum PendingPhase {
     /// Model finished with `finish_reason == "tool_calls"`; waiting on
     /// the shell to deliver [`Event::ToolResult`] for every call.
     ToolRunning,
+    /// At least one patch call is waiting for user approval. Read-only
+    /// tool results still land in this phase; `on_tool_result`'s gate
+    /// accepts both `ToolRunning` and `AwaitingApproval`.
+    #[expect(
+        dead_code,
+        reason = "constructed once the patch-loop state transitions land in the next commit"
+    )]
+    AwaitingApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -701,7 +1010,7 @@ impl AgentCore {
                     is_streaming: true,
                 })
                 .collect(),
-            PendingPhase::ToolRunning => pending
+            PendingPhase::ToolRunning | PendingPhase::AwaitingApproval => pending
                 .tool_results
                 .iter()
                 .map(|r| ActiveToolCall {
@@ -779,9 +1088,11 @@ impl AgentCore {
         };
         let cancel_action = match pending.phase {
             PendingPhase::Streaming => Action::CancelRequest { id: pending.id },
-            PendingPhase::ToolRunning => Action::CancelToolExecution {
-                request: pending.id,
-            },
+            PendingPhase::ToolRunning | PendingPhase::AwaitingApproval => {
+                Action::CancelToolExecution {
+                    request: pending.id,
+                }
+            }
         };
         self.status = Status::Idle;
         self.tool_calls_this_turn = 0;
@@ -1916,5 +2227,116 @@ mod tests {
         let s = ToolExecutionError::OutsideWorkspace.to_json_string();
         assert!(s.contains(r#""error":"outside_workspace""#));
         assert!(s.contains(r#""message""#));
+    }
+
+    // -------------------------------------------------------------
+    // PatchInvocation
+    // -------------------------------------------------------------
+
+    #[test]
+    fn patch_definition_advertises_the_patch_function_name() {
+        let def = PatchInvocation::definition();
+        assert_eq!(def.name, "patch");
+        assert!(def.description.contains("approval"));
+        assert!(def.parameters_json.contains("edits"));
+    }
+
+    #[test]
+    fn patch_parse_add_and_update_edits() {
+        let inv = PatchInvocation::parse(
+            r#"{"edits":[
+                {"kind":"add","path":"a.txt","content":"hello"},
+                {"kind":"update","path":"b.txt","before":"foo","after":"bar"}
+            ]}"#,
+        )
+        .expect("parses");
+        assert_eq!(inv.edits.len(), 2);
+        assert_eq!(
+            inv.edits[0],
+            PatchTool::Add {
+                path: "a.txt".to_string(),
+                content: "hello".to_string(),
+            }
+        );
+        assert_eq!(
+            inv.edits[1],
+            PatchTool::Update {
+                path: "b.txt".to_string(),
+                before: "foo".to_string(),
+                after: "bar".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn patch_parse_rejects_same_path_twice() {
+        let err = PatchInvocation::parse(
+            r#"{"edits":[
+                {"kind":"update","path":"dup","before":"a","after":"b"},
+                {"kind":"update","path":"dup","before":"c","after":"d"}
+            ]}"#,
+        )
+        .expect_err("same-path rejected");
+        assert_eq!(
+            err,
+            ToolExecutionError::Patch(PatchError::MultipleEditsSamePath {
+                path: "dup".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn patch_parse_rejects_empty_edits() {
+        let err = PatchInvocation::parse(r#"{"edits":[]}"#).expect_err("empty rejected");
+        assert!(matches!(err, ToolExecutionError::ArgumentsParseFailed(_)));
+    }
+
+    #[test]
+    fn patch_parse_rejects_too_many_edits() {
+        let mut edits = String::from("[");
+        for i in 0..(PATCH_MAX_EDITS + 1) {
+            if i > 0 {
+                edits.push(',');
+            }
+            edits.push_str(&format!(r#"{{"kind":"add","path":"f{i}","content":""}}"#));
+        }
+        edits.push(']');
+        let json = format!(r#"{{"edits":{edits}}}"#);
+        let err = PatchInvocation::parse(&json).expect_err("too many rejected");
+        assert!(matches!(
+            err,
+            ToolExecutionError::Patch(PatchError::TooManyEdits { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_parse_rejects_unknown_kind() {
+        let err = PatchInvocation::parse(r#"{"edits":[{"kind":"delete","path":"x"}]}"#)
+            .expect_err("unknown kind rejected");
+        assert!(matches!(err, ToolExecutionError::ArgumentsParseFailed(_)));
+    }
+
+    #[test]
+    fn patch_parse_rejects_add_over_size_limit() {
+        let big = "x".repeat(PATCH_MAX_FILE_BYTES + 1);
+        let json = format!(
+            r#"{{"edits":[{{"kind":"add","path":"big","content":{}}}]}}"#,
+            nojson::Json(&big),
+        );
+        let err = PatchInvocation::parse(&json).expect_err("too big rejected");
+        assert!(matches!(
+            err,
+            ToolExecutionError::Patch(PatchError::FileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn patch_error_json_encodes_code_and_message() {
+        let e = ToolExecutionError::Patch(PatchError::NoMatch {
+            path: "a.txt".to_string(),
+        });
+        let s = e.to_json_string();
+        assert!(s.contains(r#""error":"patch_no_match""#), "got {s}");
+        assert!(s.contains("a.txt"));
     }
 }

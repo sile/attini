@@ -356,6 +356,7 @@ fn build_header_line(state: &RenderState) -> StyledLine {
         Status::AwaitingModel => "waiting",
         Status::Streaming => "streaming",
         Status::ToolRunning => "tool",
+        Status::AwaitingApproval => "approval",
     };
     StyledLine {
         spans: vec![
