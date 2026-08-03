@@ -7,8 +7,8 @@
 //! [`tokio::sync::mpsc::Receiver`] until it closes.
 //!
 //! The prototype opens a fresh TLS connection per request and sends
-//! `Connection: close`. Persistent connection reuse and automatic retry
-//! are deferred to later issues.
+//! `Connection: close`. Persistent connection reuse and automatic
+//! retry are out of scope for the current transport.
 
 use std::sync::Arc;
 

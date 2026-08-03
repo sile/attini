@@ -48,9 +48,11 @@ pub struct TuiConfig {
 pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
     let mut terminal = Terminal::new()?;
     // `set_input_nonblocking` opens a fresh fd on the tty device and
-    // returns that; O_NONBLOCK on the new fd does NOT propagate to the
-    // stdout fd, which was the original bug behind the earlier
-    // spawn_blocking workaround. See tuinix issue 0001.
+    // returns that; O_NONBLOCK on the new fd does NOT propagate to
+    // the stdout fd. Applying O_NONBLOCK directly to `input_fd()`
+    // instead would flip stdout to non-blocking too (same open file
+    // description) and make `terminal.draw()` fail with EAGAIN once
+    // output exceeds ~1 KiB.
     let input_fd = terminal.set_input_nonblocking()?;
     let signal_fd = terminal.signal_fd();
     tuinix::set_nonblocking(signal_fd)?;

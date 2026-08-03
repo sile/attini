@@ -198,7 +198,7 @@ impl DisplayJson for RawJsonSlice<'_> {
 /// The wire representation always sets `"stream": true` because that
 /// is the only mode the prototype uses. `tools` is omitted from the
 /// wire body when empty so requests without tool support look
-/// identical to the pre-0006 shape.
+/// identical to a plain messages-only request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatRequest {
     pub model: String,

@@ -25,8 +25,9 @@ use crate::sansio::deepseek::{ChatMessage, ToolCall, ToolDef};
 use crate::sansio::tui::AgentView;
 
 /// Maximum bytes of tool-call arguments (accumulated across streaming
-/// fragments) the core will accept for a single tool call. See issue
-/// 0006 §resource limit の具体数値.
+/// fragments) the core will accept for a single tool call. Fragments
+/// past this limit are dropped and the call is resolved to
+/// `Err(ArgumentsTooLarge)` instead of being executed.
 pub const ARGUMENTS_MAX_BYTES: usize = 64 * 1024;
 
 /// Maximum number of tool calls the core will emit per user turn.
@@ -260,10 +261,11 @@ fn optional_usize(
 
 /// Result of executing a [`ReadOnlyTool`] on behalf of the model.
 ///
-/// See the issue-0006 discipline: partial-success outcomes (truncated
-/// output, silently-skipped binary files) are `Ok` with a JSON payload
-/// that includes `truncated: true` or `skipped_binary: N`. Only
-/// impossible-to-proceed situations become [`Err`](ToolExecutionError).
+/// Partial-success outcomes (truncated output, silently-skipped
+/// binary files) are `Ok` with a JSON payload that includes
+/// `truncated: true` or `skipped_binary: N` so the model can see what
+/// happened. Only impossible-to-proceed situations become
+/// [`Err`](ToolExecutionError).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolOutcome {
     Ok(String),
