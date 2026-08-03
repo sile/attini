@@ -362,4 +362,3 @@ fn search_absolute_prefix_is_rejected() {
     }));
     assert_eq!(err, ToolExecutionError::OutsideWorkspace);
 }
-

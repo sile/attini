@@ -4,7 +4,9 @@
 //! with stale / synthetic ones) and checks that the core's public
 //! contract holds after every step.
 
-use attini::sansio::agent::{Action, AgentCore, Event, RequestId, Status};
+use attini::sansio::agent::{
+    Action, AgentCore, Event, RequestId, Status, ToolExecutionError, ToolOutcome,
+};
 use attini::sansio::deepseek::ChatMessage;
 
 const ITERATIONS: usize = 256;
@@ -28,6 +30,58 @@ fn sample_request_id(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Req
     RequestId::new(noprop::sample_usize_in(ctx, 0..=8) as u64)
 }
 
+fn sample_call_id(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> String {
+    // Prefer a call_id from the currently-tracked tool call so that
+    // tool_results are occasionally committed (not always dropped as
+    // stale). Otherwise emit a synthetic id.
+    let active = core.active_tool_calls();
+    if !active.is_empty() && noprop::sample_ratio(ctx, 3, 5) {
+        let idx = noprop::sample_usize_in(ctx, 0..=(active.len() - 1));
+        return active[idx].call_id.clone();
+    }
+    format!("synth_{}", noprop::sample_usize_in(ctx, 0..=8))
+}
+
+fn sample_finish_reason(ctx: &mut noprop::TestCaseContext) -> Option<String> {
+    // Enrich the reason distribution so the tool-loop branch on
+    // "tool_calls" is exercised at meaningful frequency.
+    let kind = noprop::sample_choice(ctx, &["tool_calls", "stop", "length", "custom", "none"]);
+    match kind {
+        "tool_calls" => Some("tool_calls".to_string()),
+        "stop" => Some("stop".to_string()),
+        "length" => Some("length".to_string()),
+        "custom" => Some(sample_string(ctx)),
+        _ => None,
+    }
+}
+
+fn sample_tool_outcome(ctx: &mut noprop::TestCaseContext) -> ToolOutcome {
+    if noprop::sample_bool(ctx) {
+        ToolOutcome::Ok(sample_string(ctx))
+    } else {
+        ToolOutcome::Err(
+            match noprop::sample_choice(
+                ctx,
+                &[
+                    "outside_workspace",
+                    "not_utf8",
+                    "binary",
+                    "io_error",
+                    "parse_failed",
+                    "unknown_tool",
+                ],
+            ) {
+                "outside_workspace" => ToolExecutionError::OutsideWorkspace,
+                "not_utf8" => ToolExecutionError::NotUtf8,
+                "binary" => ToolExecutionError::Binary,
+                "io_error" => ToolExecutionError::IoError(sample_string(ctx)),
+                "parse_failed" => ToolExecutionError::ArgumentsParseFailed(sample_string(ctx)),
+                _ => ToolExecutionError::UnknownTool,
+            },
+        )
+    }
+}
+
 fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
     let kind = noprop::sample_choice(
         ctx,
@@ -36,7 +90,9 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             "cancel",
             "content_delta",
             "reasoning_delta",
+            "tool_call_delta",
             "finish",
+            "tool_result",
             "transport_error",
             "timeout",
         ],
@@ -52,13 +108,33 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             request: sample_request_id(ctx, core),
             text: sample_string(ctx),
         },
-        "finish" => Event::Finish {
+        "tool_call_delta" => Event::ToolCallDelta {
             request: sample_request_id(ctx, core),
-            reason: if noprop::sample_bool(ctx) {
+            index: noprop::sample_usize_in(ctx, 0..=3) as u64,
+            id: if noprop::sample_bool(ctx) {
+                Some(format!("call_{}", noprop::sample_usize_in(ctx, 0..=4)))
+            } else {
+                None
+            },
+            function_name: if noprop::sample_bool(ctx) {
+                Some(noprop::sample_choice(ctx, &["list", "read", "search", "bogus"]).to_string())
+            } else {
+                None
+            },
+            arguments_fragment: if noprop::sample_bool(ctx) {
                 Some(sample_string(ctx))
             } else {
                 None
             },
+        },
+        "finish" => Event::Finish {
+            request: sample_request_id(ctx, core),
+            reason: sample_finish_reason(ctx),
+        },
+        "tool_result" => Event::ToolResult {
+            request: sample_request_id(ctx, core),
+            call_id: sample_call_id(ctx, core),
+            outcome: sample_tool_outcome(ctx),
         },
         "transport_error" => Event::TransportError {
             request: sample_request_id(ctx, core),
@@ -112,6 +188,13 @@ fn count_user(core: &AgentCore) -> usize {
         .count()
 }
 
+fn count_tool(core: &AgentCore) -> usize {
+    core.conversation()
+        .iter()
+        .filter(|m| matches!(m, ChatMessage::Tool { .. }))
+        .count()
+}
+
 #[test]
 fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
@@ -121,16 +204,10 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
 
         let mut previous_conv_len: usize = 0;
         let mut previous_assistant: usize = 0;
-        let mut successful_finishes: usize = 0;
         let mut events_handled: u64 = 0;
 
         for _ in 0..STEPS {
-            let previous_active = core.active_request();
             let event = sample_event(ctx, &core);
-            let is_matching_finish = matches!(
-                &event,
-                Event::Finish { request, .. } if Some(*request) == previous_active
-            );
 
             let actions = core.handle_event(event);
             events_handled += 1;
@@ -146,20 +223,27 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
                 "assistant message count decreased",
             );
 
-            if is_matching_finish {
-                successful_finishes += 1;
-            }
+            // Every assistant turn is bracketed by a preceding user or
+            // tool message: the first assistant in a turn answers a
+            // user prompt; every subsequent one (in the tool loop)
+            // answers a batch of tool results. So the count is bounded
+            // by user + tool.
             assert!(
-                count_assistant(&core) <= successful_finishes,
-                "assistant count {} exceeds successful finish count {}",
-                count_assistant(&core),
-                successful_finishes,
-            );
-            assert!(
-                count_user(&core) >= count_assistant(&core),
-                "user turns {} < assistant turns {}",
+                count_user(&core) + count_tool(&core) >= count_assistant(&core),
+                "user({}) + tool({}) < assistant({})",
                 count_user(&core),
+                count_tool(&core),
                 count_assistant(&core),
+            );
+            // finishes_committed is the number of assistant turns
+            // materialised via a finish event; it is exactly the
+            // number of assistant messages in the conversation.
+            assert_eq!(
+                count_assistant(&core) as u64,
+                core.metrics().finishes_committed.get(),
+                "assistant count {} != finishes_committed {}",
+                count_assistant(&core),
+                core.metrics().finishes_committed.get(),
             );
 
             let start_requests = actions
@@ -172,6 +256,11 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
             );
 
             let m = core.metrics();
+            // Every input event lands in exactly one of these bins.
+            // `tool_call_arguments_fragments_dropped_over_limit` and
+            // the *_rejected_by_* / tool_calls_executed counters are
+            // per-slot/per-call bookkeeping, not per-event totals, so
+            // they are not summed here.
             let total = m.user_messages_accepted.get()
                 + m.user_messages_rejected_while_active.get()
                 + m.cancels_applied.get()
@@ -180,8 +269,12 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
                 + m.content_deltas_dropped_as_stale.get()
                 + m.reasoning_deltas_appended.get()
                 + m.reasoning_deltas_dropped_as_stale.get()
+                + m.tool_call_deltas_appended.get()
+                + m.tool_call_deltas_dropped_as_stale.get()
                 + m.finishes_committed.get()
                 + m.finishes_dropped_as_stale.get()
+                + m.tool_results_committed.get()
+                + m.tool_results_dropped_as_stale.get()
                 + m.transport_errors_recorded.get()
                 + m.transport_errors_dropped_as_stale.get()
                 + m.timeouts_applied.get()
@@ -190,8 +283,6 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
                 total, events_handled,
                 "metrics counter total {total} != events fed {events_handled}",
             );
-            // Success-only counters must never exceed their event-total
-            // partners (accepted <= accepted + rejected, and so on).
             assert!(m.finishes_committed.get() <= events_handled);
             assert!(m.user_messages_accepted.get() <= events_handled);
 
