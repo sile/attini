@@ -14,3 +14,4 @@
 pub mod agent;
 pub mod deepseek;
 pub mod sse;
+pub mod tui;

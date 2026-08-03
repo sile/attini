@@ -15,6 +15,7 @@
 //! this issue; they land on top of these primitives in later work.
 
 use crate::sansio::deepseek::{ChatMessage, Role};
+use crate::sansio::tui::AgentView;
 
 /// Opaque identifier for a model request tracked by the core.
 ///
@@ -142,6 +143,14 @@ impl AgentCore {
     /// The ID of the in-flight request, if any.
     pub fn active_request(&self) -> Option<RequestId> {
         self.pending.as_ref().map(|p| p.id)
+    }
+
+    /// Read-only projection consumed by pure functions such as
+    /// [`crate::sansio::tui::handle_key`].
+    pub fn view(&self) -> AgentView {
+        AgentView {
+            has_active_request: self.pending.is_some(),
+        }
     }
 
     /// Coarse runtime status suitable for a status line.
