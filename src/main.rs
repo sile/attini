@@ -159,6 +159,10 @@ async fn stream_response(
                     let _ = stderr.flush();
                 }
             }
+            StreamEvent::ToolCallDelta { .. } => {
+                // The one-shot CLI does not run the tool loop; the
+                // TUI shell wires tool_call fragments into AgentCore.
+            }
             StreamEvent::Comment(comment) => {
                 tracing::trace!(comment = %comment, "sse comment");
             }

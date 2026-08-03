@@ -36,8 +36,20 @@ const READ_CHUNK_SIZE: usize = 8192;
 pub enum StreamEvent {
     ContentDelta(String),
     ReasoningDelta(String),
+    /// One tool-call fragment from `choices[0].delta.tool_calls[]`.
+    /// `index` identifies which parallel tool call this fragment
+    /// belongs to (see the OpenAI streaming shape); higher layers
+    /// concatenate fragments across chunks by index.
+    ToolCallDelta {
+        index: u64,
+        id: Option<String>,
+        function_name: Option<String>,
+        arguments_fragment: Option<String>,
+    },
     Comment(String),
-    Finish { reason: Option<String> },
+    Finish {
+        reason: Option<String>,
+    },
 }
 
 /// Errors produced by the transport layer or bubbling up from the
@@ -404,6 +416,14 @@ fn translate_sse_event(
                     if let Some(reasoning) = chunk.reasoning_delta.filter(|s| !s.is_empty()) {
                         out.push(StreamEvent::ReasoningDelta(reasoning));
                     }
+                    for delta in chunk.tool_call_deltas {
+                        out.push(StreamEvent::ToolCallDelta {
+                            index: delta.index,
+                            id: delta.id,
+                            function_name: delta.function_name,
+                            arguments_fragment: delta.arguments_fragment,
+                        });
+                    }
                     if chunk.finish_reason.is_some() {
                         out.push(StreamEvent::Finish {
                             reason: chunk.finish_reason,
@@ -489,6 +509,61 @@ mod tests {
         .expect("translate");
         assert!(out.is_empty());
         assert!(done);
+    }
+
+    #[test]
+    fn translate_tool_call_deltas_expand_into_stream_events() {
+        let mut done = false;
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"c0","function":{"name":"list","arguments":"{\"pa"}},
+            {"index":1,"id":"c1","function":{"name":"read","arguments":"{\"pa"}}
+        ]}}]}"#;
+        let out = translate_sse_event(
+            SseEvent::Message {
+                data: payload.to_string(),
+            },
+            &mut done,
+        )
+        .expect("translate");
+        assert_eq!(
+            out,
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("c0".to_string()),
+                    function_name: Some("list".to_string()),
+                    arguments_fragment: Some(r#"{"pa"#.to_string()),
+                },
+                StreamEvent::ToolCallDelta {
+                    index: 1,
+                    id: Some("c1".to_string()),
+                    function_name: Some("read".to_string()),
+                    arguments_fragment: Some(r#"{"pa"#.to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn translate_tool_call_fragment_without_id_still_emits() {
+        let mut done = false;
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\"}"}}]}}]}"#;
+        let out = translate_sse_event(
+            SseEvent::Message {
+                data: payload.to_string(),
+            },
+            &mut done,
+        )
+        .expect("translate");
+        assert_eq!(
+            out,
+            vec![StreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                function_name: None,
+                arguments_fragment: Some(r#"th"}"#.to_string()),
+            }]
+        );
     }
 
     #[test]

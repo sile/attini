@@ -182,6 +182,18 @@ fn translate_stream_event(event: StreamEvent, request: RequestId) -> Vec<Event> 
     match event {
         StreamEvent::ContentDelta(text) => vec![Event::ContentDelta { request, text }],
         StreamEvent::ReasoningDelta(text) => vec![Event::ReasoningDelta { request, text }],
+        StreamEvent::ToolCallDelta {
+            index,
+            id,
+            function_name,
+            arguments_fragment,
+        } => vec![Event::ToolCallDelta {
+            request,
+            index,
+            id,
+            function_name,
+            arguments_fragment,
+        }],
         StreamEvent::Comment(_) => Vec::new(),
         StreamEvent::Finish { reason } => vec![Event::Finish { request, reason }],
     }
