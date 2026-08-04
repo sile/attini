@@ -189,6 +189,11 @@ impl Style {
         self.fg = Some(color);
         self
     }
+
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
+        self
+    }
 }
 
 /// Colours currently used by the TUI. Extend as needed.
@@ -199,6 +204,7 @@ pub enum Color {
     Red,
     Yellow,
     BrightBlack,
+    BrightYellow,
 }
 
 impl Color {
@@ -209,6 +215,7 @@ impl Color {
             Self::Red => "red",
             Self::Yellow => "yellow",
             Self::BrightBlack => "bright_black",
+            Self::BrightYellow => "bright_yellow",
         }
     }
 }
@@ -377,7 +384,7 @@ const PROMPT_ROWS: usize = 1;
 pub fn render(state: &RenderState, size: (usize, usize)) -> RenderedGrid {
     let (rows, cols) = size;
 
-    let header_line = build_header_line(state);
+    let header_line = build_header_line(state, cols);
     let header = Region {
         top: HEADER_TOP,
         lines: vec![header_line],
@@ -458,14 +465,8 @@ fn reasoning_style() -> Style {
     Style::new().fg(Color::BrightBlack)
 }
 
-fn build_header_line(state: &RenderState) -> StyledLine {
-    let status_label = match state.status {
-        Status::Idle => "idle",
-        Status::AwaitingModel => "waiting",
-        Status::Streaming => "streaming",
-        Status::ToolRunning => "tool",
-        Status::AwaitingApproval => "approval",
-    };
+fn build_header_line(state: &RenderState, cols: usize) -> StyledLine {
+    let status_label = header_status_label(state.status, state.model.len(), cols);
     StyledLine {
         spans: vec![
             StyledSpan {
@@ -480,6 +481,32 @@ fn build_header_line(state: &RenderState) -> StyledLine {
     }
 }
 
+/// Choose the status label so the full header line ("attini  model=<name>
+/// status=<label>") fits within `cols`. Only `AwaitingApproval` has a long
+/// form; the fallback ("approval") is the same word every other terminal
+/// width uses.
+fn header_status_label(status: Status, model_len: usize, cols: usize) -> &'static str {
+    let long_approval = "approval waiting: Y=approve / N=reject";
+    let short = match status {
+        Status::Idle => "idle",
+        Status::AwaitingModel => "waiting",
+        Status::Streaming => "streaming",
+        Status::ToolRunning => "tool",
+        Status::AwaitingApproval => "approval",
+    };
+    if !matches!(status, Status::AwaitingApproval) {
+        return short;
+    }
+    // Header text layout: "attini" (6) + "  model=" (8) + model +
+    // "  status=" (9) + label = 23 + model_len + label_len.
+    let overhead = 6 + 8 + model_len + 9;
+    if overhead + long_approval.len() <= cols {
+        long_approval
+    } else {
+        short
+    }
+}
+
 fn build_prompt_line(state: &RenderState) -> StyledLine {
     let hint = if state.awaiting_approval {
         "Y: approve   N/Esc: reject   Ctrl-C: cancel all"
@@ -487,6 +514,11 @@ fn build_prompt_line(state: &RenderState) -> StyledLine {
         "Esc / Ctrl-C: cancel"
     } else {
         "Enter: send   Ctrl-D: quit"
+    };
+    let hint_style = if state.awaiting_approval {
+        approval_waiting_style()
+    } else {
+        dim_style()
     };
     StyledLine {
         spans: vec![
@@ -500,7 +532,7 @@ fn build_prompt_line(state: &RenderState) -> StyledLine {
             },
             StyledSpan {
                 text: format!("[{hint}]"),
-                style: dim_style(),
+                style: hint_style,
             },
         ],
     }
@@ -549,6 +581,20 @@ fn push_labeled_tool_call(lines: &mut Vec<StyledLine>, call: &ActiveToolCall) {
         push_labeled_command_call(lines, call, preview);
         return;
     }
+    // Patch tool between on_finish and on_patch_preview_ready:
+    // approval == NotRequired and no preview yet. Distinguish from
+    // a generic tool so the user knows the shell is computing the
+    // diff, not stuck. (Command has no analogous gap because
+    // CommandPreview is populated synchronously in on_finish.)
+    if !call.is_streaming && call.function_name == "patch" && call.patch_preview.is_none() {
+        lines.push(StyledLine {
+            spans: vec![StyledSpan {
+                text: "[patch: computing preview]".to_string(),
+                style: tool_call_label_style(),
+            }],
+        });
+        return;
+    }
     let label = format!(
         "[tool: {} {}]",
         if call.function_name.is_empty() {
@@ -593,10 +639,15 @@ fn push_labeled_patch_call(
         targets, preview.added_lines, preview.removed_lines
     );
     let (state_word, state_style) = patch_state(call);
+    let label_style = if matches!(call.approval, ApprovalState::Pending) {
+        approval_waiting_style()
+    } else {
+        tool_call_label_style()
+    };
     let mut spans = vec![
         StyledSpan {
             text: label,
-            style: tool_call_label_style(),
+            style: label_style,
         },
         StyledSpan {
             text: format!(" {state_word}"),
@@ -620,10 +671,15 @@ fn push_labeled_command_call(
     let (kind, state_word, state_style) = command_state(call);
     let cmd = truncate_snippet(&preview.command_line, 60);
     let label = format!("[command {kind}] {cmd}");
+    let label_style = if matches!(call.approval, ApprovalState::Pending) {
+        approval_waiting_style()
+    } else {
+        tool_call_label_style()
+    };
     let mut spans = vec![
         StyledSpan {
             text: label,
-            style: tool_call_label_style(),
+            style: label_style,
         },
         StyledSpan {
             text: format!(" {state_word}"),
@@ -766,6 +822,14 @@ fn truncate_snippet(s: &str, max_chars: usize) -> String {
 
 fn tool_call_label_style() -> Style {
     Style::new().bold().fg(Color::Yellow)
+}
+
+/// Highlight style for tool calls that are blocking on user
+/// approval. Distinct from [`tool_call_label_style`] (which is
+/// also bold + yellow) so the eye can tell "waiting on me" apart
+/// from "running / done" at a glance.
+fn approval_waiting_style() -> Style {
+    Style::new().bold().fg(Color::BrightYellow).underline()
 }
 
 fn tool_call_running_style() -> Style {

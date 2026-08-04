@@ -663,6 +663,164 @@ fn approval_mode_ctrl_c_still_emits_cancel() {
     }
 }
 
+#[test]
+fn approval_prompt_hint_is_bold_bright_yellow_not_dim() {
+    let mut state = empty_state("m");
+    state.awaiting_approval = true;
+    state.active = true;
+    state.status = Status::AwaitingApproval;
+    let grid = render(&state, (10, 80));
+    let hint = grid.prompt.lines[0]
+        .spans
+        .iter()
+        .find(|s| s.text.starts_with("[Y:"))
+        .expect("approval hint");
+    assert!(hint.style.bold, "hint should be bold");
+    assert!(!hint.style.dim, "hint should not be dim in approval mode");
+    assert_eq!(hint.style.fg, Some(Color::BrightYellow));
+}
+
+#[test]
+fn patch_approval_label_uses_approval_waiting_style() {
+    let mut state = empty_state("m");
+    state.awaiting_approval = true;
+    state.active = true;
+    state.status = Status::AwaitingApproval;
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "p1".to_string(),
+            function_name: "patch".to_string(),
+            arguments_json: String::new(),
+            outcome: None,
+            is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::Pending,
+            patch_preview: Some(attini::sansio::agent::PatchPreview {
+                target_paths: vec!["src/main.rs".to_string()],
+                added_lines: 1,
+                removed_lines: 0,
+                edit_count: 1,
+            }),
+            preview_hashes: Vec::new(),
+            command_preview: None,
+            command_output_tail: None,
+        });
+    let grid = render(&state, (10, 80));
+    let label = grid
+        .body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.text.starts_with("[patch approval]"))
+        .cloned()
+        .expect("patch approval label span");
+    assert!(label.style.bold);
+    assert!(label.style.underline);
+    assert_eq!(label.style.fg, Some(Color::BrightYellow));
+}
+
+#[test]
+fn command_approval_label_uses_approval_waiting_style() {
+    let mut state = empty_state("m");
+    state.awaiting_approval = true;
+    state.active = true;
+    state.status = Status::AwaitingApproval;
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "c1".to_string(),
+            function_name: "command".to_string(),
+            arguments_json: String::new(),
+            outcome: None,
+            is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::Pending,
+            patch_preview: None,
+            preview_hashes: Vec::new(),
+            command_preview: Some(attini::sansio::agent::CommandPreview {
+                command_line: "pwd".to_string(),
+                timeout_seconds: 30,
+                working_directory: "/tmp".to_string(),
+            }),
+            command_output_tail: None,
+        });
+    let grid = render(&state, (10, 80));
+    let label = grid
+        .body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.text.starts_with("[command approval]"))
+        .cloned()
+        .expect("command approval label span");
+    assert!(label.style.bold);
+    assert!(label.style.underline);
+    assert_eq!(label.style.fg, Some(Color::BrightYellow));
+}
+
+#[test]
+fn patch_pre_preview_shows_computing_placeholder_not_generic_tool() {
+    let mut state = empty_state("m");
+    state.active = true;
+    state.status = Status::ToolRunning;
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "p2".to_string(),
+            function_name: "patch".to_string(),
+            arguments_json: r#"{"edits":[]}"#.to_string(),
+            outcome: None,
+            is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::NotRequired,
+            patch_preview: None,
+            preview_hashes: Vec::new(),
+            command_preview: None,
+            command_output_tail: None,
+        });
+    let grid = render(&state, (10, 80));
+    let body: String = grid
+        .body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(
+        body.contains("[patch: computing preview]"),
+        "body should show the patch-specific placeholder: {body}"
+    );
+    assert!(
+        !body.contains("[tool: patch"),
+        "body should not fall through to the generic label: {body}"
+    );
+}
+
+#[test]
+fn header_uses_long_approval_label_when_terminal_is_wide_enough() {
+    let mut state = empty_state("m");
+    state.status = Status::AwaitingApproval;
+    let grid = render(&state, (10, 200));
+    let header: String = grid.header.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(header.contains("approval waiting: Y=approve / N=reject"));
+}
+
+#[test]
+fn header_falls_back_to_short_approval_label_on_narrow_terminals() {
+    let mut state = empty_state("m");
+    state.status = Status::AwaitingApproval;
+    let grid = render(&state, (10, 40));
+    let header: String = grid.header.lines[0]
+        .spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(header.contains("status=approval"));
+    assert!(!header.contains("Y=approve"));
+}
+
 // -----------------------------------------------------------------
 // command tool rendering
 // -----------------------------------------------------------------

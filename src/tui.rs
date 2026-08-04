@@ -886,5 +886,6 @@ fn to_terminal_color(color: Color) -> TerminalColor {
         Color::Red => TerminalColor::RED,
         Color::Yellow => TerminalColor::YELLOW,
         Color::BrightBlack => TerminalColor::BRIGHT_BLACK,
+        Color::BrightYellow => TerminalColor::BRIGHT_YELLOW,
     }
 }
