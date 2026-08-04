@@ -14,6 +14,8 @@
 //! - Spawning transport / tool-executor tasks and merging their output
 //!   into the [`AgentCore`] state machine
 
+pub mod transcript;
+
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io;
