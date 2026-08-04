@@ -39,7 +39,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Interactive TUI
 
 ```sh
-attini tui [--model NAME] [--transcript PATH]
+attini tui [--model NAME] [--transcript PATH] [--metrics-snapshot-interval SECONDS]
 ```
 
 Starts the agent with the current directory as the workspace.
@@ -48,6 +48,11 @@ Starts the agent with the current directory as the workspace.
 later inspection with `jq`. The file is opened in append mode; each session
 begins with a `session_start` record and ends with `session_end`. If the
 file cannot be opened `attini tui` exits with a non-zero status.
+
+`--metrics-snapshot-interval SECONDS` (optional, requires `--transcript`)
+appends a `metrics_snapshot` record every `SECONDS` seconds, containing every
+`AgentMetrics` counter as of that instant. Useful for tracking accumulator
+trends over long sessions with `jq 'select(.kind=="metrics_snapshot")'`.
 
 ### One-shot chat
 

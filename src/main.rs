@@ -85,15 +85,38 @@ async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
         .doc("Append session records as JSON Lines to this file")
         .take(args)
         .present_and_then(|o| o.value().parse::<PathBuf>())?;
+    let metrics_snapshot_interval_secs: Option<u64> = noargs::opt("metrics-snapshot-interval")
+        .ty("SECONDS")
+        .doc("Emit a metrics_snapshot record to the transcript every N seconds (requires --transcript)")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
 
     if args.metadata().help_mode {
         return Ok(());
     }
 
+    let metrics_snapshot_interval = match metrics_snapshot_interval_secs {
+        Some(0) => {
+            return Err(RunError::Runtime(
+                "--metrics-snapshot-interval must be at least 1 second".to_string(),
+            ));
+        }
+        Some(n) => {
+            if transcript_path.is_none() {
+                return Err(RunError::Runtime(
+                    "--metrics-snapshot-interval requires --transcript".to_string(),
+                ));
+            }
+            Some(std::time::Duration::from_secs(n))
+        }
+        None => None,
+    };
+
     let client = DeepSeekClient::from_env()?;
     let config = TuiConfig {
         model,
         transcript_path,
+        metrics_snapshot_interval,
     };
     tui::run(client, config)
         .await

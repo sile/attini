@@ -45,8 +45,8 @@ use crate::sansio::tui::{
 use crate::tools::ToolExecutor;
 use crate::tools::command::{CommandOutputMessage, run_command};
 use crate::tui::transcript::{
-    ApprovalDecision, AssistantToolCall, CommandStream, SessionEndReason, TranscriptRecord,
-    TranscriptWriter, now_unix_millis,
+    ApprovalDecision, AssistantToolCall, CommandStream, MetricsCounters, SessionEndReason,
+    TranscriptRecord, TranscriptWriter, now_unix_millis,
 };
 
 /// Runtime configuration for the TUI.
@@ -56,6 +56,10 @@ pub struct TuiConfig {
     /// When `Some`, open this file for append and stream a JSON
     /// Lines session transcript to it. `None` disables recording.
     pub transcript_path: Option<PathBuf>,
+    /// When `Some`, emit a `metrics_snapshot` record to the
+    /// transcript on this interval. Requires `transcript_path` to
+    /// also be `Some`; the CLI layer enforces this pairing.
+    pub metrics_snapshot_interval: Option<std::time::Duration>,
 }
 
 /// Run the TUI event loop until the user quits.
@@ -111,6 +115,8 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
         transcript,
         conversation_len: 0,
     };
+    let mut metrics_interval = config.metrics_snapshot_interval.map(tokio::time::interval);
+
     let mut size = terminal.size();
     let mut should_quit = false;
     let mut session_end_reason = SessionEndReason::UserQuit;
@@ -214,6 +220,14 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
             }
             Some(msg) = wait_transcript_err(&mut transcript_err_rx) => {
                 shell.error_banner = Some(format!("transcript: {msg}"));
+            }
+            _ = tick_metrics(&mut metrics_interval) => {
+                if let Some(writer) = shell.transcript.as_ref() {
+                    writer.send(TranscriptRecord::MetricsSnapshot {
+                        ts: now_unix_millis(),
+                        counters: MetricsCounters::from_agent_metrics(agent.metrics()),
+                    });
+                }
             }
         }
         draw(&mut terminal, size, &ui, &agent, &shell)?;
@@ -375,6 +389,13 @@ async fn wait_transcript_err(rx: &mut Option<oneshot::Receiver<String>>) -> Opti
     let result = receiver.await.ok();
     *rx = None;
     result
+}
+
+async fn tick_metrics(interval: &mut Option<tokio::time::Interval>) -> tokio::time::Instant {
+    match interval.as_mut() {
+        Some(i) => i.tick().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn draw(
