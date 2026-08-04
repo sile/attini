@@ -18,7 +18,8 @@
 //! bindings, and CJK-width behaviour without a real terminal.
 
 use crate::sansio::agent::{
-    ActiveToolCall, AgentCore, Event, PendingResponse, Status, ToolOutcome,
+    ActiveToolCall, AgentCore, ApprovalState, Event, PatchPreview, PendingResponse, Status,
+    ToolOutcome,
 };
 use crate::sansio::deepseek::ChatMessage;
 
@@ -61,6 +62,9 @@ pub struct RenderState {
     pub model: String,
     pub status: Status,
     pub active: bool,
+    /// Mirrors [`AgentView::pending_approval_call_id`]: when `true`,
+    /// [`render`] uses the approval-mode prompt hint.
+    pub awaiting_approval: bool,
     pub draft: String,
     pub conversation: Vec<ChatMessage>,
     pub pending: Option<PendingResponse>,
@@ -201,10 +205,12 @@ pub fn build_render_state(
     agent: &AgentCore,
     error_banner: Option<&str>,
 ) -> RenderState {
+    let view = agent.view();
     RenderState {
         model: ui.model.clone(),
         status: agent.status(),
-        active: agent.active_request().is_some(),
+        active: view.has_active_request,
+        awaiting_approval: view.pending_approval_call_id.is_some(),
         draft: ui.draft.clone(),
         conversation: agent.conversation().to_vec(),
         pending: agent.pending_response().cloned(),
@@ -222,6 +228,30 @@ pub fn build_render_state(
 pub fn handle_key(key: KeyInput, ui: &mut UiState, view: AgentView) -> KeyOutcome {
     let mut events = Vec::new();
     let mut effect = KeyEffect::None;
+    if let Some(call_id) = view.pending_approval_call_id.as_deref() {
+        // Approval mode gates draft edits and remaps Y/N/Esc onto
+        // ApprovePatch/RejectPatch. Ctrl-C / Ctrl-D keep their global
+        // semantics; Enter is intentionally ignored so a leftover draft
+        // cannot accidentally approve.
+        match (key.ctrl, key.code) {
+            (true, KeyCode::Char('c')) => events.push(Event::Cancel),
+            (true, KeyCode::Char('d')) => effect = KeyEffect::Quit,
+            (false, KeyCode::Escape)
+            | (false, KeyCode::Char('n'))
+            | (false, KeyCode::Char('N')) => {
+                events.push(Event::RejectPatch {
+                    call_id: call_id.to_string(),
+                });
+            }
+            (false, KeyCode::Char('y')) | (false, KeyCode::Char('Y')) => {
+                events.push(Event::ApprovePatch {
+                    call_id: call_id.to_string(),
+                });
+            }
+            _ => {}
+        }
+        return KeyOutcome { events, effect };
+    }
     match (key.ctrl, key.code) {
         (true, KeyCode::Char('c')) => {
             if view.has_active_request {
@@ -380,7 +410,9 @@ fn build_header_line(state: &RenderState) -> StyledLine {
 }
 
 fn build_prompt_line(state: &RenderState) -> StyledLine {
-    let hint = if state.active {
+    let hint = if state.awaiting_approval {
+        "Y: approve   N/Esc: reject   Ctrl-C: cancel all"
+    } else if state.active {
         "Esc / Ctrl-C: cancel"
     } else {
         "Enter: send   Ctrl-D: quit"
@@ -438,6 +470,10 @@ fn build_body_lines(state: &RenderState) -> Vec<StyledLine> {
 }
 
 fn push_labeled_tool_call(lines: &mut Vec<StyledLine>, call: &ActiveToolCall) {
+    if let Some(preview) = call.patch_preview.as_ref() {
+        push_labeled_patch_call(lines, call, preview);
+        return;
+    }
     let label = format!(
         "[tool: {} {}]",
         if call.function_name.is_empty() {
@@ -467,6 +503,40 @@ fn push_labeled_tool_call(lines: &mut Vec<StyledLine>, call: &ActiveToolCall) {
     lines.push(StyledLine { spans });
 }
 
+fn push_labeled_patch_call(
+    lines: &mut Vec<StyledLine>,
+    call: &ActiveToolCall,
+    preview: &PatchPreview,
+) {
+    let targets = if preview.target_paths.is_empty() {
+        "?".to_string()
+    } else {
+        truncate_snippet(&preview.target_paths.join(", "), 40)
+    };
+    let label = format!(
+        "[patch approval] {} (+{}/-{})",
+        targets, preview.added_lines, preview.removed_lines
+    );
+    let (state_word, state_style) = patch_state(call);
+    let mut spans = vec![
+        StyledSpan {
+            text: label,
+            style: tool_call_label_style(),
+        },
+        StyledSpan {
+            text: format!(" {state_word}"),
+            style: state_style,
+        },
+    ];
+    if let Some(summary) = tool_call_summary(call) {
+        spans.push(StyledSpan {
+            text: format!(" — {summary}"),
+            style: tool_call_summary_style(),
+        });
+    }
+    lines.push(StyledLine { spans });
+}
+
 fn tool_call_state(call: &ActiveToolCall) -> (&'static str, Style) {
     if call.is_streaming {
         return ("pending", tool_call_running_style());
@@ -475,6 +545,21 @@ fn tool_call_state(call: &ActiveToolCall) -> (&'static str, Style) {
         None => ("running", tool_call_running_style()),
         Some(ToolOutcome::Ok(_)) => ("done", tool_call_summary_style()),
         Some(ToolOutcome::Err(_)) => ("error", error_style()),
+    }
+}
+
+fn patch_state(call: &ActiveToolCall) -> (&'static str, Style) {
+    // Rejected paths still carry Err(Patch(Rejected)); prefer the
+    // approval-oriented label over the generic error one.
+    match call.approval {
+        ApprovalState::Pending => ("awaiting", tool_call_running_style()),
+        ApprovalState::Approved => match &call.outcome {
+            None => ("applying", tool_call_running_style()),
+            Some(ToolOutcome::Ok(_)) => ("applied", tool_call_summary_style()),
+            Some(ToolOutcome::Err(_)) => ("error", error_style()),
+        },
+        ApprovalState::Rejected => ("rejected", error_style()),
+        ApprovalState::NotRequired => tool_call_state(call),
     }
 }
 

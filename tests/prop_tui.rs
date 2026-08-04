@@ -91,6 +91,7 @@ fn sample_state(ctx: &mut noprop::TestCaseContext) -> RenderState {
         model: "m".to_string(),
         status,
         active,
+        awaiting_approval: false,
         draft,
         conversation,
         pending,

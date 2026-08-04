@@ -16,6 +16,7 @@ fn empty_state(model: &str) -> RenderState {
         model: model.to_string(),
         status: Status::Idle,
         active: false,
+        awaiting_approval: false,
         draft: String::new(),
         conversation: Vec::new(),
         pending: None,
@@ -364,6 +365,7 @@ fn cjk_draft_survives_handle_key_and_render() {
         model: ui.model.clone(),
         status: Status::Idle,
         active: false,
+        awaiting_approval: false,
         draft: ui.draft.clone(),
         conversation: Vec::new(),
         pending: None,
@@ -520,4 +522,135 @@ fn errored_tool_call_shows_error_state_in_red() {
         .find(|s| s.text.contains("error"))
         .expect("error span");
     assert_eq!(error_span.style.fg, Some(Color::Red));
+}
+
+// -----------------------------------------------------------------
+// patch approval rendering + key handling
+// -----------------------------------------------------------------
+
+fn approval_view(call_id: &str) -> AgentView {
+    AgentView {
+        has_active_request: true,
+        pending_approval_call_id: Some(call_id.to_string()),
+    }
+}
+
+#[test]
+fn approval_mode_prompt_hint_switches_to_y_n() {
+    let mut state = empty_state("m");
+    state.awaiting_approval = true;
+    state.active = true;
+    state.status = Status::AwaitingApproval;
+    let grid = render(&state, (10, 60));
+    let hint = grid.prompt.lines[0]
+        .spans
+        .iter()
+        .find(|s| s.text.starts_with("[Y:"))
+        .expect("approval hint");
+    assert!(hint.text.contains("approve"));
+    assert!(hint.text.contains("reject"));
+}
+
+#[test]
+fn approval_pending_patch_shows_awaiting_label_with_diff_stats() {
+    let mut state = empty_state("m");
+    state.awaiting_approval = true;
+    state.active = true;
+    state.status = Status::AwaitingApproval;
+    state
+        .active_tool_calls
+        .push(attini::sansio::agent::ActiveToolCall {
+            call_id: "p1".to_string(),
+            function_name: "patch".to_string(),
+            arguments_json: String::new(),
+            outcome: None,
+            is_streaming: false,
+            approval: attini::sansio::agent::ApprovalState::Pending,
+            patch_preview: Some(attini::sansio::agent::PatchPreview {
+                target_paths: vec!["src/main.rs".to_string()],
+                added_lines: 3,
+                removed_lines: 1,
+                edit_count: 1,
+            }),
+            preview_hashes: Vec::new(),
+        });
+    let grid = render(&state, (10, 80));
+    let body: String = grid
+        .body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(body.contains("[patch approval]"), "body: {body}");
+    assert!(body.contains("src/main.rs"), "body: {body}");
+    assert!(body.contains("(+3/-1)"), "body: {body}");
+    assert!(body.contains("awaiting"), "body: {body}");
+}
+
+#[test]
+fn approval_mode_y_key_emits_approve_patch_event() {
+    let mut ui = UiState {
+        model: "m".to_string(),
+        draft: String::new(),
+    };
+    let outcome = handle_key(key(KeyCode::Char('y')), &mut ui, approval_view("p1"));
+    assert_eq!(outcome.effect, KeyEffect::None);
+    assert_eq!(outcome.events.len(), 1);
+    match &outcome.events[0] {
+        attini::sansio::agent::Event::ApprovePatch { call_id } => assert_eq!(call_id, "p1"),
+        other => panic!("expected ApprovePatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn approval_mode_n_key_emits_reject_patch_event() {
+    let mut ui = UiState {
+        model: "m".to_string(),
+        draft: String::new(),
+    };
+    let outcome = handle_key(key(KeyCode::Char('n')), &mut ui, approval_view("p1"));
+    match &outcome.events[..] {
+        [attini::sansio::agent::Event::RejectPatch { call_id }] => assert_eq!(call_id, "p1"),
+        other => panic!("expected RejectPatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn approval_mode_esc_key_also_rejects_patch() {
+    let mut ui = UiState {
+        model: "m".to_string(),
+        draft: String::new(),
+    };
+    let outcome = handle_key(key(KeyCode::Escape), &mut ui, approval_view("p1"));
+    match &outcome.events[..] {
+        [attini::sansio::agent::Event::RejectPatch { call_id }] => assert_eq!(call_id, "p1"),
+        other => panic!("expected RejectPatch from Esc, got {other:?}"),
+    }
+}
+
+#[test]
+fn approval_mode_ignores_draft_edit_keys() {
+    let mut ui = UiState {
+        model: "m".to_string(),
+        draft: "existing".to_string(),
+    };
+    let _ = handle_key(key(KeyCode::Char('a')), &mut ui, approval_view("p1"));
+    let _ = handle_key(key(KeyCode::Backspace), &mut ui, approval_view("p1"));
+    let outcome = handle_key(key(KeyCode::Enter), &mut ui, approval_view("p1"));
+    assert_eq!(ui.draft, "existing", "approval mode must not mutate draft");
+    assert!(outcome.events.is_empty());
+}
+
+#[test]
+fn approval_mode_ctrl_c_still_emits_cancel() {
+    let mut ui = UiState {
+        model: "m".to_string(),
+        draft: String::new(),
+    };
+    let outcome = handle_key(ctrl(KeyCode::Char('c')), &mut ui, approval_view("p1"));
+    match &outcome.events[..] {
+        [attini::sansio::agent::Event::Cancel] => {}
+        other => panic!("expected Cancel, got {other:?}"),
+    }
 }
