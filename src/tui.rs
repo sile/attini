@@ -331,6 +331,7 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
             }
             Action::CancelRequest { .. } => {
                 shell.stream = None;
+                shell.error_banner = Some("cancelled".to_string());
             }
             Action::ExecuteTool {
                 request,
@@ -360,6 +361,7 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                     }
                 });
                 cancel_commands_for_request(shell, request);
+                shell.error_banner = Some("cancelled".to_string());
             }
             Action::PreviewPatch {
                 request,
