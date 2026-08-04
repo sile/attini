@@ -47,15 +47,8 @@ pub struct TuiConfig {
 /// Run the TUI event loop until the user quits.
 pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
     let mut terminal = Terminal::new()?;
-    // `set_input_nonblocking` opens a fresh fd on the tty device and
-    // returns that; O_NONBLOCK on the new fd does NOT propagate to
-    // the stdout fd. Applying O_NONBLOCK directly to `input_fd()`
-    // instead would flip stdout to non-blocking too (same open file
-    // description) and make `terminal.draw()` fail with EAGAIN once
-    // output exceeds ~1 KiB.
     let input_fd = terminal.set_input_nonblocking()?;
-    let signal_fd = terminal.signal_fd();
-    tuinix::set_nonblocking(signal_fd)?;
+    let signal_fd = terminal.set_signal_nonblocking()?;
 
     // Terminal owns both fds and outlives the AsyncFd wrappers (the
     // whole function is one scope), so a bare RawFd newtype that does

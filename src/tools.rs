@@ -1,19 +1,22 @@
-//! Read-only workspace tool executor.
+//! Workspace tool executor.
 //!
-//! Runs the [`ReadOnlyTool`] invocations the model emits, enforcing
-//! the workspace boundary and the per-tool resource limits declared
-//! in [`crate::sansio::agent`]. All filesystem I/O happens here; the
-//! Sans I/O core is fed the resulting [`ToolOutcome`] and cannot
-//! observe the executor's internal state.
+//! Runs the [`ReadOnlyTool`] and [`PatchInvocation`] tool calls the
+//! model emits, enforcing the workspace boundary and the per-tool
+//! resource limits declared in [`crate::sansio::agent`]. All
+//! filesystem I/O happens here; the Sans I/O core is fed the
+//! resulting [`ToolOutcome`] / [`PatchPreview`] and cannot observe
+//! the executor's internal state.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use nojson::{DisplayJson, Json, JsonFormatter};
+use sha2::{Digest, Sha256};
 
 use crate::sansio::agent::{
-    DEFAULT_LIST_MAX_ENTRIES, DEFAULT_SEARCH_MAX_RESULTS, READ_MAX_BYTES, ReadOnlyTool,
+    DEFAULT_LIST_MAX_ENTRIES, DEFAULT_SEARCH_MAX_RESULTS, PATCH_MAX_FILE_BYTES, PatchError,
+    PatchInvocation, PatchPreview, PatchTool, PreviewHash, READ_MAX_BYTES, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
 
@@ -57,6 +60,242 @@ impl ToolExecutor {
                 case_sensitive,
                 max_results,
             ),
+        }
+    }
+
+    /// Read every target file (Update) and check every target does
+    /// not exist (Add), then produce the SHA-256 hashes and diff
+    /// summary that the [`AgentCore`](crate::sansio::agent::AgentCore)
+    /// needs to enter approval mode. Does NOT write anything to the
+    /// filesystem.
+    pub fn preview_patch(
+        &self,
+        invocation: &PatchInvocation,
+    ) -> Result<(Vec<PreviewHash>, PatchPreview), PatchError> {
+        let mut hashes = Vec::with_capacity(invocation.edits.len());
+        let mut added_lines: u64 = 0;
+        let mut removed_lines: u64 = 0;
+        let mut target_paths: Vec<String> = Vec::with_capacity(invocation.edits.len());
+        for edit in &invocation.edits {
+            target_paths.push(edit.path().to_string());
+            match edit {
+                PatchTool::Add { path, content } => {
+                    let full = self.resolve_add_target(path)?;
+                    if full.exists() {
+                        return Err(PatchError::AddOnExistingFile { path: path.clone() });
+                    }
+                    hashes.push(PreviewHash {
+                        path: path.clone(),
+                        sha256: None,
+                    });
+                    added_lines += line_count(content);
+                }
+                PatchTool::Update {
+                    path,
+                    before,
+                    after,
+                } => {
+                    let full = self.resolve_update_target(path)?;
+                    let bytes = read_file_capped(&full, path)?;
+                    let hash: [u8; 32] = Sha256::digest(&bytes).into();
+                    hashes.push(PreviewHash {
+                        path: path.clone(),
+                        sha256: Some(hash),
+                    });
+                    let matches = count_occurrences(&bytes, before.as_bytes());
+                    match matches {
+                        0 => return Err(PatchError::NoMatch { path: path.clone() }),
+                        1 => {
+                            removed_lines += line_count(before);
+                            added_lines += line_count(after);
+                        }
+                        n => {
+                            return Err(PatchError::AmbiguousMatch {
+                                path: path.clone(),
+                                match_count: n as u64,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        target_paths.sort();
+        target_paths.dedup();
+        let preview = PatchPreview {
+            target_paths,
+            added_lines,
+            removed_lines,
+            edit_count: invocation.edits.len() as u64,
+        };
+        Ok((hashes, preview))
+    }
+
+    /// Apply all edits atomically in two phases (see `0007` design):
+    ///
+    /// - **Phase 1**: verify each target is in the same state as it
+    ///   was at preview time (SHA-256 for Update, non-existence for
+    ///   Add), then write every new content to a per-target `.tmp`
+    ///   file. Any failure here aborts and deletes every `.tmp` file
+    ///   already written.
+    /// - **Phase 2**: rename each `.tmp` into its target in order.
+    ///   Failure in phase 2 is treated as a rare filesystem
+    ///   inconsistency: the remaining `.tmp` files are cleaned up but
+    ///   already-renamed targets are left in place (rollback would
+    ///   require another read + write pass and is out of scope).
+    pub fn apply_patch(
+        &self,
+        invocation: &PatchInvocation,
+        preview_hashes: &[PreviewHash],
+    ) -> Result<Vec<PathBuf>, PatchError> {
+        struct Prepared {
+            target: PathBuf,
+            tmp: PathBuf,
+        }
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(invocation.edits.len());
+        for (edit, expected_hash) in invocation.edits.iter().zip(preview_hashes.iter()) {
+            let step = || -> Result<Prepared, PatchError> {
+                match edit {
+                    PatchTool::Add { path, content } => {
+                        let full = self.resolve_add_target(path)?;
+                        if full.exists() {
+                            return Err(PatchError::AddOnExistingFile { path: path.clone() });
+                        }
+                        let tmp = tmp_path_for(&full);
+                        write_atomically(&tmp, content.as_bytes(), path)?;
+                        Ok(Prepared { target: full, tmp })
+                    }
+                    PatchTool::Update {
+                        path,
+                        before,
+                        after,
+                    } => {
+                        let full = self.resolve_update_target(path)?;
+                        let bytes = read_file_capped(&full, path)?;
+                        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+                        let expected = expected_hash
+                            .sha256
+                            .ok_or_else(|| PatchError::Conflict { path: path.clone() })?;
+                        if expected != hash {
+                            return Err(PatchError::Conflict { path: path.clone() });
+                        }
+                        let matches = count_occurrences(&bytes, before.as_bytes());
+                        if matches == 0 {
+                            return Err(PatchError::NoMatch { path: path.clone() });
+                        }
+                        if matches > 1 {
+                            return Err(PatchError::AmbiguousMatch {
+                                path: path.clone(),
+                                match_count: matches as u64,
+                            });
+                        }
+                        let new_bytes = replace_once(&bytes, before.as_bytes(), after.as_bytes());
+                        if new_bytes.len() > PATCH_MAX_FILE_BYTES {
+                            return Err(PatchError::FileTooLarge { path: path.clone() });
+                        }
+                        let tmp = tmp_path_for(&full);
+                        write_atomically(&tmp, &new_bytes, path)?;
+                        Ok(Prepared { target: full, tmp })
+                    }
+                }
+            };
+            match step() {
+                Ok(p) => prepared.push(p),
+                Err(e) => {
+                    for p in &prepared {
+                        let _ = fs::remove_file(&p.tmp);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let mut applied: Vec<PathBuf> = Vec::with_capacity(prepared.len());
+        for (idx, p) in prepared.iter().enumerate() {
+            match fs::rename(&p.tmp, &p.target) {
+                Ok(()) => applied.push(p.target.clone()),
+                Err(e) => {
+                    for rest in &prepared[idx..] {
+                        let _ = fs::remove_file(&rest.tmp);
+                    }
+                    let path = display_path(&p.target);
+                    // EXDEV = 18 on both Linux and macOS. std does
+                    // not expose a portable `ErrorKind` for this at
+                    // MSRV 1.93, so we probe the raw errno.
+                    if e.raw_os_error() == Some(18) {
+                        return Err(PatchError::CrossDeviceRename { path });
+                    }
+                    return Err(PatchError::IoError {
+                        path,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(applied)
+    }
+
+    fn resolve_add_target(&self, rel: &str) -> Result<PathBuf, PatchError> {
+        // For Add, the file itself does not exist yet. Resolve the
+        // parent directory with the read-only path resolver, then
+        // append the final component.
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute() {
+            return Err(PatchError::OutsideWorkspace {
+                path: rel.to_string(),
+            });
+        }
+        let parent = rel_path
+            .parent()
+            .ok_or_else(|| PatchError::OutsideWorkspace {
+                path: rel.to_string(),
+            })?;
+        let file_name = rel_path
+            .file_name()
+            .ok_or_else(|| PatchError::OutsideWorkspace {
+                path: rel.to_string(),
+            })?;
+        // Parent may itself be "" (root of workspace). resolve_within
+        // handles "." as workspace root; adapt "" the same way.
+        let parent_str = if parent.as_os_str().is_empty() {
+            "."
+        } else {
+            parent
+                .to_str()
+                .ok_or_else(|| PatchError::OutsideWorkspace {
+                    path: rel.to_string(),
+                })?
+        };
+        let parent_resolved = match resolve_within(&self.root, parent_str) {
+            Ok(p) => p,
+            Err(ToolExecutionError::OutsideWorkspace) => {
+                return Err(PatchError::OutsideWorkspace {
+                    path: rel.to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(PatchError::ParentDirMissing {
+                    path: rel.to_string(),
+                });
+            }
+        };
+        Ok(parent_resolved.join(file_name))
+    }
+
+    fn resolve_update_target(&self, rel: &str) -> Result<PathBuf, PatchError> {
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute() {
+            return Err(PatchError::OutsideWorkspace {
+                path: rel.to_string(),
+            });
+        }
+        match resolve_within(&self.root, rel) {
+            Ok(p) => Ok(p),
+            Err(ToolExecutionError::OutsideWorkspace) => Err(PatchError::OutsideWorkspace {
+                path: rel.to_string(),
+            }),
+            Err(_) => Err(PatchError::UpdateOnMissingFile {
+                path: rel.to_string(),
+            }),
         }
     }
 
@@ -425,6 +664,118 @@ fn resolve_line_range(text: &str, start: usize, end: usize) -> (usize, usize, us
         actual_end = start.saturating_sub(1);
     }
     (from, to_byte.min(text.len()), actual_end)
+}
+
+// -----------------------------------------------------------------
+// patch helpers
+// -----------------------------------------------------------------
+
+fn read_file_capped(path: &Path, rel: &str) -> Result<Vec<u8>, PatchError> {
+    let metadata = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(PatchError::UpdateOnMissingFile {
+                path: rel.to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(PatchError::IoError {
+                path: rel.to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
+    if metadata.is_dir() {
+        return Err(PatchError::IoError {
+            path: rel.to_string(),
+            message: "is a directory".to_string(),
+        });
+    }
+    if metadata.len() as usize > PATCH_MAX_FILE_BYTES {
+        return Err(PatchError::FileTooLarge {
+            path: rel.to_string(),
+        });
+    }
+    fs::read(path).map_err(|e| PatchError::IoError {
+        path: rel.to_string(),
+        message: e.to_string(),
+    })
+}
+
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            count += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn replace_once(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if let Some(pos) = position(haystack, needle) {
+        let mut out = Vec::with_capacity(haystack.len() - needle.len() + replacement.len());
+        out.extend_from_slice(&haystack[..pos]);
+        out.extend_from_slice(replacement);
+        out.extend_from_slice(&haystack[pos + needle.len()..]);
+        out
+    } else {
+        haystack.to_vec()
+    }
+}
+
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
+}
+
+fn line_count(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let base = text.matches('\n').count() as u64;
+    // Trailing content without a `\n` also counts as one line so that
+    // a single-line addition without a final newline shows +1.
+    if text.ends_with('\n') { base } else { base + 1 }
+}
+
+fn tmp_path_for(target: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut buf = target.as_os_str().to_os_string();
+    buf.push(format!(".attini-tmp-{pid}-{counter}"));
+    PathBuf::from(buf)
+}
+
+static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn write_atomically(tmp: &Path, bytes: &[u8], rel: &str) -> Result<(), PatchError> {
+    let mut file = fs::File::create(tmp).map_err(|e| PatchError::IoError {
+        path: rel.to_string(),
+        message: e.to_string(),
+    })?;
+    file.write_all(bytes).map_err(|e| PatchError::IoError {
+        path: rel.to_string(),
+        message: e.to_string(),
+    })?;
+    file.sync_all().map_err(|e| PatchError::IoError {
+        path: rel.to_string(),
+        message: e.to_string(),
+    })?;
+    Ok(())
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 // -----------------------------------------------------------------
