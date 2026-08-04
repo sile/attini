@@ -17,6 +17,8 @@
 //! lets `tests/test_tui.rs` cover layout, styling, overflow, key
 //! bindings, and CJK-width behaviour without a real terminal.
 
+use nojson::{DisplayJson, JsonFormatter};
+
 use crate::sansio::agent::{
     ActiveToolCall, AgentCore, ApprovalState, CommandOutputTail, CommandPreview, Event,
     PatchPreview, PendingResponse, Status, ToolOutcome,
@@ -197,6 +199,75 @@ pub enum Color {
     Red,
     Yellow,
     BrightBlack,
+}
+
+impl Color {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cyan => "cyan",
+            Self::Green => "green",
+            Self::Red => "red",
+            Self::Yellow => "yellow",
+            Self::BrightBlack => "bright_black",
+        }
+    }
+}
+
+impl DisplayJson for Color {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.value(self.as_str())
+    }
+}
+
+impl DisplayJson for Style {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("fg", self.fg)?;
+            f.member("bg", self.bg)?;
+            f.member("bold", self.bold)?;
+            f.member("dim", self.dim)?;
+            f.member("italic", self.italic)?;
+            f.member("underline", self.underline)
+        })
+    }
+}
+
+impl DisplayJson for StyledSpan {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("text", &self.text)?;
+            f.member("style", self.style)
+        })
+    }
+}
+
+impl DisplayJson for StyledLine {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| f.member("spans", &self.spans))
+    }
+}
+
+impl DisplayJson for Region {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("top", self.top)?;
+            f.member("lines", &self.lines)
+        })
+    }
+}
+
+impl DisplayJson for RenderedGrid {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("size", [self.size.0, self.size.1])?;
+            f.member("header", &self.header)?;
+            f.member("body", &self.body)?;
+            f.member("error", &self.error)?;
+            f.member("prompt", &self.prompt)?;
+            f.member("cursor", self.cursor.map(|(r, c)| [r, c]))?;
+            f.member("body_truncated", self.body_truncated)
+        })
+    }
 }
 
 /// Build a [`RenderState`] snapshot from the live shell state.

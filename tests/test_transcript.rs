@@ -242,13 +242,14 @@ fn reader_can_skip_unknown_kind_and_continue() {
     // Simulate a reader that stripes over JSON Lines and skips
     // lines whose `kind` is not recognised. This is the contract
     // future kinds (retry, backoff, ...) are added under.
-    let known: [&str; 12] = [
+    let known: [&str; 13] = [
         "session_start",
         "user_message",
         "assistant_message",
         "tool_result",
         "patch_preview_ready",
         "tool_approval",
+        "tool_approval_required",
         "command_output_chunk",
         "cancel",
         "transport_error",

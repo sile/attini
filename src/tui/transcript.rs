@@ -79,6 +79,11 @@ pub enum TranscriptRecord {
         call_id: String,
         decision: ApprovalDecision,
     },
+    ToolApprovalRequired {
+        ts: u64,
+        call_id: String,
+        tool_kind: ToolKind,
+    },
     CommandOutputChunk {
         ts: u64,
         call_id: String,
@@ -130,6 +135,25 @@ impl ApprovalDecision {
         match self {
             Self::Approve => "approve",
             Self::Reject => "reject",
+        }
+    }
+}
+
+/// Kind of tool waiting on approval, carried in
+/// [`TranscriptRecord::ToolApprovalRequired`]. The shell derives
+/// this by looking up the assistant tool_call whose `id` matches
+/// the pending call_id and reading its `function_name`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Patch,
+    Command,
+}
+
+impl ToolKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Patch => "patch",
+            Self::Command => "command",
         }
     }
 }
@@ -483,6 +507,16 @@ impl DisplayJson for TranscriptRecord {
                 f.member("kind", "metrics_snapshot")?;
                 f.member("ts", ts)?;
                 f.member("counters", counters)
+            }),
+            Self::ToolApprovalRequired {
+                ts,
+                call_id,
+                tool_kind,
+            } => f.object(|f| {
+                f.member("kind", "tool_approval_required")?;
+                f.member("ts", ts)?;
+                f.member("call_id", call_id)?;
+                f.member("tool_kind", tool_kind.as_str())
             }),
         }
     }
