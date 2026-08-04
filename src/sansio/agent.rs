@@ -884,14 +884,14 @@ pub enum Event {
         preview_hashes: Vec<PreviewHash>,
         preview: PatchPreview,
     },
-    /// User approved the patch preview for `call_id`. The core emits
-    /// [`Action::ApplyPatch`] with the previously-stored
-    /// `preview_hashes`.
-    ApprovePatch { call_id: String },
-    /// User rejected the patch preview for `call_id`. The core
-    /// synthesises `ToolOutcome::Err(Patch(Rejected))` for the call
-    /// and continues the tool loop.
-    RejectPatch { call_id: String },
+    /// User approved the approval-mode preview for `call_id`. The
+    /// core dispatches the tool-specific action ([`Action::ApplyPatch`]
+    /// for patch, [`Action::ExecuteCommand`] for command).
+    ApproveToolCall { call_id: String },
+    /// User rejected the approval-mode preview for `call_id`. The
+    /// core synthesises an `Err(Rejected)` outcome for the call and
+    /// continues the tool loop.
+    RejectToolCall { call_id: String },
     /// The transport reported an unrecoverable error for this request.
     TransportError { request: RequestId, message: String },
     /// The request exceeded its allotted time.
@@ -1026,7 +1026,7 @@ struct PendingToolResult {
     /// for patch tools before the shell has produced a preview.
     patch_preview: Option<PatchPreview>,
     /// Populated together with `patch_preview`. Retained here so
-    /// [`Event::ApprovePatch`] can hand the same hashes back to the
+    /// [`Event::ApproveToolCall`] can hand the same hashes back to the
     /// shell as [`Action::ApplyPatch`] without a round trip.
     preview_hashes: Vec<PreviewHash>,
     /// `None` while the shell is still executing the tool; `Some` once
@@ -1167,18 +1167,18 @@ pub struct AgentMetrics {
     /// active, the id did not match, no outstanding patch call had
     /// the matching `call_id`, or the call was already resolved.
     pub patch_previews_dropped_as_stale: Counter,
-    /// [`Event::ApprovePatch`] whose `call_id` matched an
+    /// [`Event::ApproveToolCall`] whose `call_id` matched an
     /// approval-pending patch call; [`Action::ApplyPatch`] was
     /// emitted.
     pub patch_approvals_committed: Counter,
-    /// [`Event::ApprovePatch`] dropped because no approval-pending
+    /// [`Event::ApproveToolCall`] dropped because no approval-pending
     /// patch call had the matching `call_id`.
     pub patch_approvals_dropped_as_stale: Counter,
-    /// [`Event::RejectPatch`] whose `call_id` matched an
+    /// [`Event::RejectToolCall`] whose `call_id` matched an
     /// approval-pending patch call; a synthetic
     /// `Err(Patch(Rejected))` outcome was recorded.
     pub patch_rejections_committed: Counter,
-    /// [`Event::RejectPatch`] dropped because no approval-pending
+    /// [`Event::RejectToolCall`] dropped because no approval-pending
     /// patch call had the matching `call_id`.
     pub patch_rejections_dropped_as_stale: Counter,
 }
@@ -1213,11 +1213,15 @@ impl AgentCore {
     }
 
     fn first_pending_approval_call_id(&self) -> Option<String> {
+        // Any tool call whose approval is `Pending` is ready to
+        // accept the user's decision — patch bumps to `Pending` on
+        // `PatchPreviewReady`, command bumps to `Pending` at
+        // `on_finish`. No further per-tool gating is needed.
         self.pending
             .as_ref()?
             .tool_results
             .iter()
-            .find(|r| r.approval == ApprovalState::Pending && r.patch_preview.is_some())
+            .find(|r| r.approval == ApprovalState::Pending)
             .map(|r| r.call_id.clone())
     }
 
@@ -1299,8 +1303,8 @@ impl AgentCore {
                 preview_hashes,
                 preview,
             } => self.on_patch_preview_ready(request, call_id, preview_hashes, preview),
-            Event::ApprovePatch { call_id } => self.on_approve_patch(call_id),
-            Event::RejectPatch { call_id } => self.on_reject_patch(call_id),
+            Event::ApproveToolCall { call_id } => self.on_approve_tool_call(call_id),
+            Event::RejectToolCall { call_id } => self.on_reject_tool_call(call_id),
             Event::TransportError { request, message } => self.on_transport_error(request, message),
             Event::Timeout { request } => self.on_timeout(request),
         }
@@ -1519,11 +1523,16 @@ impl AgentCore {
                             call_id: call.id.clone(),
                             invocation,
                         });
+                        // Approval stays `NotRequired` until the
+                        // preview arrives — user cannot see the diff
+                        // yet, so exposing this call in the approval
+                        // queue would prompt on an empty screen.
+                        // `on_patch_preview_ready` bumps to `Pending`.
                         pending_results.push(PendingToolResult {
                             call_id: call.id,
                             function_name: call.function_name,
                             arguments_json: call.arguments_json,
-                            approval: ApprovalState::Pending,
+                            approval: ApprovalState::NotRequired,
                             patch_preview: None,
                             preview_hashes: Vec::new(),
                             outcome: None,
@@ -1641,7 +1650,7 @@ impl AgentCore {
         }
         let Some(entry) = pending.tool_results.iter_mut().find(|r| {
             r.call_id == call_id
-                && r.approval == ApprovalState::Pending
+                && r.approval == ApprovalState::NotRequired
                 && r.outcome.is_none()
                 && r.patch_preview.is_none()
         }) else {
@@ -1650,12 +1659,13 @@ impl AgentCore {
         };
         entry.patch_preview = Some(preview);
         entry.preview_hashes = preview_hashes;
+        entry.approval = ApprovalState::Pending;
         self.metrics.patch_previews_committed.inc();
         self.recompute_phase_and_status();
         vec![Action::Redraw]
     }
 
-    fn on_approve_patch(&mut self, call_id: String) -> Vec<Action> {
+    fn on_approve_tool_call(&mut self, call_id: String) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
             self.metrics.patch_approvals_dropped_as_stale.inc();
             return Vec::new();
@@ -1696,7 +1706,7 @@ impl AgentCore {
         ]
     }
 
-    fn on_reject_patch(&mut self, call_id: String) -> Vec<Action> {
+    fn on_reject_tool_call(&mut self, call_id: String) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
             self.metrics.patch_rejections_dropped_as_stale.inc();
             return Vec::new();
@@ -2943,7 +2953,7 @@ mod tests {
             preview: PatchPreview::default(),
         });
 
-        let actions = core.handle_event(Event::ApprovePatch {
+        let actions = core.handle_event(Event::ApproveToolCall {
             call_id: "p1".to_string(),
         });
 
@@ -2978,7 +2988,7 @@ mod tests {
             preview: PatchPreview::default(),
         });
 
-        let actions = core.handle_event(Event::RejectPatch {
+        let actions = core.handle_event(Event::RejectToolCall {
             call_id: "p1".to_string(),
         });
 
@@ -3003,7 +3013,7 @@ mod tests {
     fn patch_approve_dropped_if_no_pending_call() {
         let mut core = AgentCore::new();
         let _ = user(&mut core, "hi");
-        let actions = core.handle_event(Event::ApprovePatch {
+        let actions = core.handle_event(Event::ApproveToolCall {
             call_id: "nope".to_string(),
         });
         assert!(actions.is_empty());

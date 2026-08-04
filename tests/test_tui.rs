@@ -598,8 +598,8 @@ fn approval_mode_y_key_emits_approve_patch_event() {
     assert_eq!(outcome.effect, KeyEffect::None);
     assert_eq!(outcome.events.len(), 1);
     match &outcome.events[0] {
-        attini::sansio::agent::Event::ApprovePatch { call_id } => assert_eq!(call_id, "p1"),
-        other => panic!("expected ApprovePatch, got {other:?}"),
+        attini::sansio::agent::Event::ApproveToolCall { call_id } => assert_eq!(call_id, "p1"),
+        other => panic!("expected ApproveToolCall, got {other:?}"),
     }
 }
 
@@ -611,8 +611,8 @@ fn approval_mode_n_key_emits_reject_patch_event() {
     };
     let outcome = handle_key(key(KeyCode::Char('n')), &mut ui, approval_view("p1"));
     match &outcome.events[..] {
-        [attini::sansio::agent::Event::RejectPatch { call_id }] => assert_eq!(call_id, "p1"),
-        other => panic!("expected RejectPatch, got {other:?}"),
+        [attini::sansio::agent::Event::RejectToolCall { call_id }] => assert_eq!(call_id, "p1"),
+        other => panic!("expected RejectToolCall, got {other:?}"),
     }
 }
 
@@ -624,8 +624,8 @@ fn approval_mode_esc_key_also_rejects_patch() {
     };
     let outcome = handle_key(key(KeyCode::Escape), &mut ui, approval_view("p1"));
     match &outcome.events[..] {
-        [attini::sansio::agent::Event::RejectPatch { call_id }] => assert_eq!(call_id, "p1"),
-        other => panic!("expected RejectPatch from Esc, got {other:?}"),
+        [attini::sansio::agent::Event::RejectToolCall { call_id }] => assert_eq!(call_id, "p1"),
+        other => panic!("expected RejectToolCall from Esc, got {other:?}"),
     }
 }
 

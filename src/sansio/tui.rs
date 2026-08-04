@@ -46,8 +46,8 @@ pub struct AgentView {
     /// approval. `None` when no approval is pending. `handle_key`
     /// switches to the approval-mode key bindings while this is
     /// `Some` and uses this call_id when emitting
-    /// [`crate::sansio::agent::Event::ApprovePatch`] /
-    /// [`crate::sansio::agent::Event::RejectPatch`].
+    /// [`crate::sansio::agent::Event::ApproveToolCall`] /
+    /// [`crate::sansio::agent::Event::RejectToolCall`].
     pub pending_approval_call_id: Option<String>,
 }
 
@@ -230,7 +230,7 @@ pub fn handle_key(key: KeyInput, ui: &mut UiState, view: AgentView) -> KeyOutcom
     let mut effect = KeyEffect::None;
     if let Some(call_id) = view.pending_approval_call_id.as_deref() {
         // Approval mode gates draft edits and remaps Y/N/Esc onto
-        // ApprovePatch/RejectPatch. Ctrl-C / Ctrl-D keep their global
+        // ApproveToolCall/RejectToolCall. Ctrl-C / Ctrl-D keep their global
         // semantics; Enter is intentionally ignored so a leftover draft
         // cannot accidentally approve.
         match (key.ctrl, key.code) {
@@ -239,12 +239,12 @@ pub fn handle_key(key: KeyInput, ui: &mut UiState, view: AgentView) -> KeyOutcom
             (false, KeyCode::Escape)
             | (false, KeyCode::Char('n'))
             | (false, KeyCode::Char('N')) => {
-                events.push(Event::RejectPatch {
+                events.push(Event::RejectToolCall {
                     call_id: call_id.to_string(),
                 });
             }
             (false, KeyCode::Char('y')) | (false, KeyCode::Char('Y')) => {
-                events.push(Event::ApprovePatch {
+                events.push(Event::ApproveToolCall {
                     call_id: call_id.to_string(),
                 });
             }

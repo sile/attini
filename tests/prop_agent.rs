@@ -166,10 +166,10 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
                 edit_count: 1,
             },
         },
-        "approve_patch" => Event::ApprovePatch {
+        "approve_patch" => Event::ApproveToolCall {
             call_id: sample_call_id(ctx, core),
         },
-        "reject_patch" => Event::RejectPatch {
+        "reject_patch" => Event::RejectToolCall {
             call_id: sample_call_id(ctx, core),
         },
         "transport_error" => Event::TransportError {
