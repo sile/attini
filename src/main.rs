@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS};
 use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
 use attini::sansio::deepseek::{ChatMessage, ChatRequest};
 use attini::tui::{self, TuiConfig};
@@ -14,7 +15,8 @@ const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(RunOutcome::Ok) => ExitCode::SUCCESS,
+        Ok(RunOutcome::Exit(code)) => code,
         Err(RunError::Usage(err)) => {
             eprintln!("{err:?}");
             ExitCode::from(EXIT_USAGE)
@@ -24,6 +26,11 @@ async fn main() -> ExitCode {
             ExitCode::from(EXIT_RUNTIME)
         }
     }
+}
+
+enum RunOutcome {
+    Ok,
+    Exit(ExitCode),
 }
 
 enum RunError {
@@ -43,24 +50,27 @@ impl From<TransportError> for RunError {
     }
 }
 
-async fn run() -> Result<(), RunError> {
+async fn run() -> Result<RunOutcome, RunError> {
     let mut args = noargs::raw_args();
     args.metadata_mut().app_name = env!("CARGO_PKG_NAME");
     args.metadata_mut().app_description = "DeepSeek-based coding agent prototype.";
 
     if noargs::VERSION_FLAG.take(&mut args).is_present() {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return Ok(RunOutcome::Ok);
     }
     noargs::HELP_FLAG.take_help(&mut args);
 
     try_run_chat(&mut args).await?;
     try_run_tui(&mut args).await?;
+    if let Some(exit) = try_run_agent(&mut args)? {
+        return Ok(RunOutcome::Exit(exit));
+    }
 
     if let Some(help) = args.finish()? {
         print!("{help}");
     }
-    Ok(())
+    Ok(RunOutcome::Ok)
 }
 
 async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
@@ -167,6 +177,99 @@ async fn try_run_chat(args: &mut noargs::RawArgs) -> Result<(), RunError> {
     let mut rx = client.call(request);
     stream_response(&mut rx, show_reasoning).await?;
     Ok(())
+}
+
+fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
+    if !noargs::cmd("agent")
+        .doc("Run one turn of the sync CLI agent against a persistent session")
+        .take(args)
+        .is_present()
+    {
+        return Ok(None);
+    }
+
+    let model: String = noargs::opt("model")
+        .ty("NAME")
+        .doc("Model name")
+        .default(DEFAULT_MODEL)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let system: Option<String> = noargs::opt("system")
+        .ty("TEXT")
+        .doc("Optional system prompt prepended to the conversation")
+        .take(args)
+        .present_and_then(|o| o.value().parse())?;
+    let show_reasoning = noargs::flag("show-reasoning")
+        .doc("Print reasoning_content deltas to stderr")
+        .take(args)
+        .is_present();
+    let approve = noargs::flag("approve")
+        .doc("Resume the session by approving its pending tool call")
+        .take(args)
+        .is_present();
+    let reject = noargs::flag("reject")
+        .doc("Resume the session by rejecting its pending tool call")
+        .take(args)
+        .is_present();
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; directory is .attini/<NAME>/")
+        .default("main")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let prompt: Option<String> = noargs::arg("[PROMPT]")
+        .doc("User prompt (required unless --approve or --reject is given)")
+        .example("List the files in src/")
+        .take(args)
+        .present_and_then(|a| a.value().parse())?;
+
+    if args.metadata().help_mode {
+        return Ok(None);
+    }
+
+    if approve && reject {
+        return Err(RunError::Runtime(
+            "--approve and --reject are mutually exclusive".to_string(),
+        ));
+    }
+    let cont = if approve {
+        if prompt.is_some() {
+            return Err(RunError::Runtime(
+                "PROMPT must be omitted when using --approve".to_string(),
+            ));
+        }
+        Continuation::Approve
+    } else if reject {
+        if prompt.is_some() {
+            return Err(RunError::Runtime(
+                "PROMPT must be omitted when using --reject".to_string(),
+            ));
+        }
+        Continuation::Reject
+    } else {
+        match prompt {
+            Some(p) => Continuation::Prompt(p),
+            None => {
+                return Err(RunError::Runtime(
+                    "PROMPT is required unless --approve or --reject is given".to_string(),
+                ));
+            }
+        }
+    };
+
+    let workspace_root = std::env::current_dir()
+        .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
+    let cfg = AgentConfig {
+        session_name,
+        model,
+        workspace_root,
+        system_prompt: system,
+        show_reasoning,
+        max_turns: DEFAULT_MAX_TURNS,
+    };
+    let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(Some(exit))
 }
 
 async fn stream_response(

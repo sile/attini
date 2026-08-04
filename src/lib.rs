@@ -6,9 +6,12 @@
 //! subprocess integration live in sibling modules that drive the
 //! Sans I/O types with concrete inputs.
 
+pub mod agent_cli;
+pub mod curl;
 pub mod deepseek;
 pub mod metrics;
 pub mod sansio;
+pub mod session;
 pub mod tools;
 pub mod tui;
 
