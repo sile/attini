@@ -83,4 +83,3 @@ after approval.
 | Variable | Description |
 | --- | --- |
 | `DEEPSEEK_API_KEY` | DeepSeek API key (required) |
-| `RUST_LOG` | Log filter for `tracing` (default: `attini=info,warn`) |

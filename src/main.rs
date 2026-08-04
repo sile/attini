@@ -6,7 +6,6 @@ use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
 use attini::sansio::deepseek::{ChatMessage, ChatRequest};
 use attini::tui::{self, TuiConfig};
 use tokio::sync::mpsc;
-use tracing_subscriber::EnvFilter;
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_RUNTIME: u8 = 1;
@@ -14,7 +13,6 @@ const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    init_tracing();
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(RunError::Usage(err)) => {
@@ -195,25 +193,13 @@ async fn stream_response(
                 // The one-shot CLI does not run the tool loop; the
                 // TUI shell wires tool_call fragments into AgentCore.
             }
-            StreamEvent::Comment(comment) => {
-                tracing::trace!(comment = %comment, "sse comment");
-            }
-            StreamEvent::Finish { reason } => {
+            StreamEvent::Comment(_) => {}
+            StreamEvent::Finish { .. } => {
                 if wrote_content {
                     let _ = writeln!(stdout);
                 }
-                tracing::info!(?reason, "stream finished");
             }
         }
     }
     Ok(())
-}
-
-fn init_tracing() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("attini=info,warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(io::stderr)
-        .init();
 }
