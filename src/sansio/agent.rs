@@ -56,6 +56,28 @@ pub const PATCH_MAX_EDITS: usize = 20;
 /// read.
 pub const PATCH_MAX_FILE_BYTES: usize = READ_MAX_BYTES;
 
+/// Default `timeout_seconds` for a [`CommandInvocation`] when the
+/// model does not specify one.
+pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 60;
+
+/// Upper bound on the `timeout_seconds` the model can request for a
+/// single [`CommandInvocation`].
+pub const COMMAND_MAX_TIMEOUT_SECONDS: u64 = 300;
+
+/// Maximum bytes retained from either stdout or stderr of a running
+/// command. Reaching this limit terminates the process group and
+/// marks the tool result as `truncated`.
+pub const COMMAND_MAX_STREAM_BYTES: usize = 256 * 1024;
+
+/// Milliseconds the shell waits between sending SIGTERM and SIGKILL
+/// when tearing a command's process group down.
+pub const COMMAND_KILL_GRACE_MS: u64 = 500;
+
+/// Chunk size for a single non-blocking read on the child's stdout /
+/// stderr pipe. Small enough to keep the TUI tail buffer responsive
+/// under high-throughput output.
+pub const COMMAND_STREAM_CHUNK_SIZE: usize = 4 * 1024;
+
 /// A read-only tool the model can invoke while the agent is running.
 ///
 /// Semantics and per-tool limits are defined in `src/tools.rs`; this
@@ -373,6 +395,79 @@ const PATCH_PARAMS_SCHEMA: &str = r#"{
 "required":["edits"]
 }"#;
 
+/// A single shell command the model wants the shell to run. Parsed
+/// from the `command` tool call's arguments and dispatched only
+/// after user approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandInvocation {
+    /// String passed verbatim to `/bin/sh -c`. Approval-gated because
+    /// shell metacharacters make the effective set of side effects
+    /// wide.
+    pub command_line: String,
+    /// Real-clock cap; `<= COMMAND_MAX_TIMEOUT_SECONDS`.
+    pub timeout_seconds: u64,
+}
+
+impl CommandInvocation {
+    /// Wire definition advertised to the model alongside
+    /// [`ReadOnlyTool::definitions`] and [`PatchInvocation::definition`].
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "command".to_string(),
+            description: "Run a shell command in the workspace. Every command \
+                 needs user approval before it starts. Output and \
+                 runtime are capped; non-zero exit status is returned \
+                 as a normal result (not an error)."
+                .to_string(),
+            parameters_json: COMMAND_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    /// Parse the JSON `arguments` supplied by the model.
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+        let root = json.value();
+        let command_line = required_string(root, "command_line")?;
+        if command_line.is_empty() {
+            return Err(ToolExecutionError::Command(CommandError::EmptyCommandLine));
+        }
+        let timeout_seconds = match optional_u64(root, "timeout_seconds")? {
+            Some(0) => {
+                return Err(ToolExecutionError::Command(
+                    CommandError::TimeoutOutOfRange { seconds: 0 },
+                ));
+            }
+            Some(n) if n > COMMAND_MAX_TIMEOUT_SECONDS => {
+                return Err(ToolExecutionError::Command(
+                    CommandError::TimeoutOutOfRange { seconds: n },
+                ));
+            }
+            Some(n) => n,
+            None => DEFAULT_COMMAND_TIMEOUT_SECONDS,
+        };
+        Ok(Self {
+            command_line,
+            timeout_seconds,
+        })
+    }
+}
+
+const COMMAND_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"command_line":{"type":"string","description":"Shell command line passed to /bin/sh -c. Requires user approval before running."},
+"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":60,"description":"Real-clock timeout in seconds. Exceeding it terminates the process group and yields termination_reason=timeout."}
+},
+"required":["command_line"]
+}"#;
+
+fn optional_u64(root: RawJsonValue<'_, '_>, name: &str) -> Result<Option<u64>, ToolExecutionError> {
+    match root.to_member(name).map_err(map_parse_err)?.optional() {
+        None => Ok(None),
+        Some(value) => Ok(Some(value.try_into().map_err(map_parse_err)?)),
+    }
+}
+
 fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
     let value = root
         .to_member(name)
@@ -442,6 +537,12 @@ pub enum ToolExecutionError {
     /// letting patch introduce approval- and filesystem-write-
     /// specific failure modes.
     Patch(PatchError),
+    /// Failure of a [`CommandInvocation`] before the child process
+    /// produced meaningful output (rejected, spawn failed, arguments
+    /// out of range). In-run terminations (timeout, cancel, output
+    /// limit) are surfaced as `Ok` with a `termination_reason`
+    /// instead.
+    Command(CommandError),
 }
 
 /// Failure modes specific to [`PatchTool`] invocations. See the
@@ -546,6 +647,48 @@ impl PatchError {
     }
 }
 
+/// Failure modes specific to [`CommandInvocation`]. In-run
+/// terminations (timeout, cancel, output limit) do not appear here;
+/// they surface as `Ok` with a `termination_reason` in the tool
+/// result JSON so the model can still see the partial output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandError {
+    /// User rejected the approval preview.
+    Rejected,
+    /// `fork`/`exec` failed (shell not on PATH, ENOMEM, EPERM, ...).
+    SpawnFailed { message: String },
+    /// `timeout_seconds` was 0 or above
+    /// [`COMMAND_MAX_TIMEOUT_SECONDS`].
+    TimeoutOutOfRange { seconds: u64 },
+    /// `command_line` was an empty string.
+    EmptyCommandLine,
+}
+
+impl CommandError {
+    pub fn to_code_and_message(&self) -> (&'static str, String) {
+        match self {
+            Self::Rejected => (
+                "command_rejected",
+                "user rejected the command preview".to_string(),
+            ),
+            Self::SpawnFailed { message } => (
+                "command_spawn_failed",
+                format!("failed to spawn shell: {message}"),
+            ),
+            Self::TimeoutOutOfRange { seconds } => (
+                "command_timeout_out_of_range",
+                format!(
+                    "timeout_seconds={seconds} is out of range (1..={COMMAND_MAX_TIMEOUT_SECONDS})"
+                ),
+            ),
+            Self::EmptyCommandLine => (
+                "command_empty_command_line",
+                "command_line must not be empty".to_string(),
+            ),
+        }
+    }
+}
+
 /// SHA-256 digest of a file captured at [`PatchTool::Update`] preview
 /// time. `sha256` is `None` for [`PatchTool::Add`] paths (whose apply-
 /// time check is "the file must NOT exist" rather than a hash match).
@@ -617,6 +760,7 @@ impl ToolExecutionError {
                 ),
             ),
             Self::Patch(err) => err.to_code_and_message(),
+            Self::Command(err) => err.to_code_and_message(),
         };
         Json(ToolErrorJson {
             code,
@@ -2634,6 +2778,76 @@ mod tests {
         let s = e.to_json_string();
         assert!(s.contains(r#""error":"patch_no_match""#), "got {s}");
         assert!(s.contains("a.txt"));
+    }
+
+    // -------------------------------------------------------------
+    // CommandInvocation
+    // -------------------------------------------------------------
+
+    #[test]
+    fn command_definition_advertises_the_command_function_name() {
+        let def = CommandInvocation::definition();
+        assert_eq!(def.name, "command");
+        assert!(def.description.contains("approval"));
+        assert!(def.parameters_json.contains("command_line"));
+        assert!(def.parameters_json.contains("timeout_seconds"));
+    }
+
+    #[test]
+    fn command_parse_applies_default_timeout_when_omitted() {
+        let inv = CommandInvocation::parse(r#"{"command_line":"ls -la"}"#).expect("parses");
+        assert_eq!(inv.command_line, "ls -la");
+        assert_eq!(inv.timeout_seconds, DEFAULT_COMMAND_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn command_parse_accepts_explicit_timeout() {
+        let inv =
+            CommandInvocation::parse(r#"{"command_line":"cargo test","timeout_seconds":120}"#)
+                .expect("parses");
+        assert_eq!(inv.timeout_seconds, 120);
+    }
+
+    #[test]
+    fn command_parse_rejects_empty_command_line() {
+        let err = CommandInvocation::parse(r#"{"command_line":""}"#).expect_err("empty rejected");
+        assert_eq!(
+            err,
+            ToolExecutionError::Command(CommandError::EmptyCommandLine)
+        );
+    }
+
+    #[test]
+    fn command_parse_rejects_zero_timeout() {
+        let err = CommandInvocation::parse(r#"{"command_line":"ls","timeout_seconds":0}"#)
+            .expect_err("zero timeout rejected");
+        assert_eq!(
+            err,
+            ToolExecutionError::Command(CommandError::TimeoutOutOfRange { seconds: 0 })
+        );
+    }
+
+    #[test]
+    fn command_parse_rejects_timeout_over_max() {
+        let json = format!(
+            r#"{{"command_line":"ls","timeout_seconds":{}}}"#,
+            COMMAND_MAX_TIMEOUT_SECONDS + 1
+        );
+        let err = CommandInvocation::parse(&json).expect_err("over-max rejected");
+        assert!(matches!(
+            err,
+            ToolExecutionError::Command(CommandError::TimeoutOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn command_error_json_encodes_code_and_message() {
+        let e = ToolExecutionError::Command(CommandError::SpawnFailed {
+            message: "no such file".to_string(),
+        });
+        let s = e.to_json_string();
+        assert!(s.contains(r#""error":"command_spawn_failed""#), "got {s}");
+        assert!(s.contains("no such file"));
     }
 
     // -------------------------------------------------------------
