@@ -662,3 +662,136 @@ fn approval_mode_ctrl_c_still_emits_cancel() {
         other => panic!("expected Cancel, got {other:?}"),
     }
 }
+
+// -----------------------------------------------------------------
+// command tool rendering
+// -----------------------------------------------------------------
+
+fn command_call(
+    call_id: &str,
+    command_line: &str,
+    approval: attini::sansio::agent::ApprovalState,
+    outcome: Option<attini::sansio::agent::ToolOutcome>,
+    tail: Option<attini::sansio::agent::CommandOutputTail>,
+) -> attini::sansio::agent::ActiveToolCall {
+    attini::sansio::agent::ActiveToolCall {
+        call_id: call_id.to_string(),
+        function_name: "command".to_string(),
+        arguments_json: String::new(),
+        outcome,
+        is_streaming: false,
+        approval,
+        patch_preview: None,
+        preview_hashes: Vec::new(),
+        command_preview: Some(attini::sansio::agent::CommandPreview {
+            command_line: command_line.to_string(),
+            timeout_seconds: 60,
+            working_directory: "/tmp/wksp".to_string(),
+        }),
+        command_output_tail: tail,
+    }
+}
+
+fn body_text(state: &attini::sansio::tui::RenderState) -> String {
+    let grid = render(state, (12, 100));
+    grid.body
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.text.as_str())
+        .collect()
+}
+
+#[test]
+fn approval_pending_command_shows_awaiting_label_with_timeout_and_cwd() {
+    let mut state = empty_state("m");
+    state.awaiting_approval = true;
+    state.active = true;
+    state.status = Status::AwaitingApproval;
+    state.active_tool_calls.push(command_call(
+        "c1",
+        "cargo test --lib",
+        attini::sansio::agent::ApprovalState::Pending,
+        None,
+        None,
+    ));
+    let body = body_text(&state);
+    assert!(
+        body.contains("[command approval] cargo test --lib"),
+        "body: {body}"
+    );
+    assert!(body.contains("awaiting"), "body: {body}");
+    assert!(body.contains("timeout=60s"), "body: {body}");
+    assert!(body.contains("cwd=/tmp/wksp"), "body: {body}");
+}
+
+#[test]
+fn approved_running_command_shows_stream_totals_and_tail() {
+    let mut state = empty_state("m");
+    state.active = true;
+    state.status = Status::ToolRunning;
+    let tail = attini::sansio::agent::CommandOutputTail {
+        stdout_tail: "compiling\ndone\n".to_string(),
+        stderr_tail: "warning: unused\n".to_string(),
+        stdout_bytes_total: 42,
+        stderr_bytes_total: 15,
+    };
+    state.active_tool_calls.push(command_call(
+        "c1",
+        "cargo build",
+        attini::sansio::agent::ApprovalState::Approved,
+        None,
+        Some(tail),
+    ));
+    let body = body_text(&state);
+    assert!(
+        body.contains("[command running] cargo build"),
+        "body: {body}"
+    );
+    assert!(body.contains("stdout=42B"), "body: {body}");
+    assert!(body.contains("stderr=15B"), "body: {body}");
+    assert!(body.contains("| compiling"), "body: {body}");
+    assert!(body.contains("| done"), "body: {body}");
+    assert!(body.contains("! warning: unused"), "body: {body}");
+}
+
+#[test]
+fn completed_command_shows_done_label_and_summary() {
+    let mut state = empty_state("m");
+    state.active_tool_calls.push(command_call(
+        "c1",
+        "true",
+        attini::sansio::agent::ApprovalState::Approved,
+        Some(attini::sansio::agent::ToolOutcome::Ok(
+            r#"{"exit_code":0,"termination_reason":"exited"}"#.to_string(),
+        )),
+        None,
+    ));
+    let body = body_text(&state);
+    assert!(body.contains("[command done] true"), "body: {body}");
+}
+
+#[test]
+fn rejected_command_shows_rejected_label_in_red() {
+    let mut state = empty_state("m");
+    state.active_tool_calls.push(command_call(
+        "c1",
+        "rm -rf /",
+        attini::sansio::agent::ApprovalState::Rejected,
+        Some(attini::sansio::agent::ToolOutcome::Err(
+            attini::sansio::agent::ToolExecutionError::Command(
+                attini::sansio::agent::CommandError::Rejected,
+            ),
+        )),
+        None,
+    ));
+    let grid = render(&state, (12, 100));
+    // The label span contains "rejected" too ("[command rejected]"),
+    // so pick out the state-word span explicitly (starts with a space).
+    let state_span = grid.body.lines[0]
+        .spans
+        .iter()
+        .find(|s| s.text.trim() == "rejected")
+        .expect("state span");
+    assert_eq!(state_span.style.fg, Some(Color::Red));
+}

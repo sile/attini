@@ -18,8 +18,8 @@
 //! bindings, and CJK-width behaviour without a real terminal.
 
 use crate::sansio::agent::{
-    ActiveToolCall, AgentCore, ApprovalState, Event, PatchPreview, PendingResponse, Status,
-    ToolOutcome,
+    ActiveToolCall, AgentCore, ApprovalState, CommandOutputTail, CommandPreview, Event,
+    PatchPreview, PendingResponse, Status, ToolOutcome,
 };
 use crate::sansio::deepseek::ChatMessage;
 
@@ -474,6 +474,10 @@ fn push_labeled_tool_call(lines: &mut Vec<StyledLine>, call: &ActiveToolCall) {
         push_labeled_patch_call(lines, call, preview);
         return;
     }
+    if let Some(preview) = call.command_preview.as_ref() {
+        push_labeled_command_call(lines, call, preview);
+        return;
+    }
     let label = format!(
         "[tool: {} {}]",
         if call.function_name.is_empty() {
@@ -536,6 +540,98 @@ fn push_labeled_patch_call(
     }
     lines.push(StyledLine { spans });
 }
+
+fn push_labeled_command_call(
+    lines: &mut Vec<StyledLine>,
+    call: &ActiveToolCall,
+    preview: &CommandPreview,
+) {
+    let (kind, state_word, state_style) = command_state(call);
+    let cmd = truncate_snippet(&preview.command_line, 60);
+    let label = format!("[command {kind}] {cmd}");
+    let mut spans = vec![
+        StyledSpan {
+            text: label,
+            style: tool_call_label_style(),
+        },
+        StyledSpan {
+            text: format!(" {state_word}"),
+            style: state_style,
+        },
+    ];
+    if let Some(meta) = command_meta_suffix(call, preview) {
+        spans.push(StyledSpan {
+            text: format!("   {meta}"),
+            style: tool_call_summary_style(),
+        });
+    }
+    lines.push(StyledLine { spans });
+    if let Some(tail) = call.command_output_tail.as_ref() {
+        push_command_output_tail(lines, tail);
+    }
+}
+
+fn command_state(call: &ActiveToolCall) -> (&'static str, &'static str, Style) {
+    match call.approval {
+        ApprovalState::Pending => ("approval", "awaiting", tool_call_running_style()),
+        ApprovalState::Approved => match &call.outcome {
+            None => ("running", "…", tool_call_running_style()),
+            Some(ToolOutcome::Ok(_)) => ("done", "ok", tool_call_summary_style()),
+            Some(ToolOutcome::Err(_)) => ("error", "error", error_style()),
+        },
+        ApprovalState::Rejected => ("rejected", "rejected", error_style()),
+        ApprovalState::NotRequired => ("done", "done", tool_call_summary_style()),
+    }
+}
+
+fn command_meta_suffix(call: &ActiveToolCall, preview: &CommandPreview) -> Option<String> {
+    match call.approval {
+        ApprovalState::Pending => {
+            let cwd = if preview.working_directory.is_empty() {
+                String::new()
+            } else {
+                format!("   cwd={}", preview.working_directory)
+            };
+            Some(format!("timeout={}s{cwd}", preview.timeout_seconds))
+        }
+        ApprovalState::Approved => {
+            let tail = call.command_output_tail.as_ref()?;
+            Some(format!(
+                "stdout={}B, stderr={}B",
+                tail.stdout_bytes_total, tail.stderr_bytes_total,
+            ))
+        }
+        ApprovalState::Rejected | ApprovalState::NotRequired => None,
+    }
+}
+
+fn push_command_output_tail(lines: &mut Vec<StyledLine>, tail: &CommandOutputTail) {
+    // Show up to the last COMMAND_TAIL_DISPLAY_LINES from each
+    // stream so long outputs do not push the whole body off screen.
+    // stderr is drawn after stdout, matching the shell convention.
+    push_tail_lines(lines, &tail.stdout_tail, "  | ", tool_call_summary_style());
+    push_tail_lines(
+        lines,
+        &tail.stderr_tail,
+        "  ! ",
+        Style::new().fg(Color::Red),
+    );
+}
+
+fn push_tail_lines(lines: &mut Vec<StyledLine>, text: &str, prefix: &str, style: Style) {
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(COMMAND_TAIL_DISPLAY_LINES);
+    for line in &all[start..] {
+        lines.push(StyledLine {
+            spans: vec![StyledSpan {
+                text: format!("{prefix}{line}"),
+                style,
+            }],
+        });
+    }
+}
+
+const COMMAND_TAIL_DISPLAY_LINES: usize = 6;
 
 fn tool_call_state(call: &ActiveToolCall) -> (&'static str, Style) {
     if call.is_streaming {
