@@ -29,6 +29,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::sansio::agent::AgentMetrics;
+
 /// Take a unix-milliseconds timestamp from the wall clock. Falls
 /// back to `0` if the clock is set before the epoch (should be
 /// unreachable on any live system).
@@ -99,6 +101,10 @@ pub enum TranscriptRecord {
         ts: u64,
         reason: SessionEndReason,
     },
+    MetricsSnapshot {
+        ts: u64,
+        counters: MetricsCounters,
+    },
 }
 
 /// Tool call attached to an assistant message. Mirrors
@@ -141,6 +147,196 @@ impl CommandStream {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
         }
+    }
+}
+
+/// Point-in-time snapshot of every counter in [`AgentMetrics`].
+///
+/// The field set is a mirror of `AgentMetrics`, listed explicitly so
+/// a rename or removal on the core side surfaces as a compile
+/// error rather than a silently dropped counter in the transcript.
+/// Adding a new counter to `AgentMetrics` requires adding it here
+/// too — that is intentional (readers rely on the field set being
+/// stable per attini release).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsCounters {
+    pub user_messages_accepted: u64,
+    pub user_messages_rejected_while_active: u64,
+    pub cancels_applied: u64,
+    pub cancels_ignored_when_idle: u64,
+    pub content_deltas_appended: u64,
+    pub content_deltas_dropped_as_stale: u64,
+    pub reasoning_deltas_appended: u64,
+    pub reasoning_deltas_dropped_as_stale: u64,
+    pub finishes_committed: u64,
+    pub finishes_dropped_as_stale: u64,
+    pub transport_errors_recorded: u64,
+    pub transport_errors_dropped_as_stale: u64,
+    pub timeouts_applied: u64,
+    pub timeouts_dropped_as_stale: u64,
+    pub tool_call_deltas_appended: u64,
+    pub tool_call_deltas_dropped_as_stale: u64,
+    pub tool_call_arguments_fragments_dropped_over_limit: u64,
+    pub tool_results_committed: u64,
+    pub tool_results_dropped_as_stale: u64,
+    pub tool_calls_executed: u64,
+    pub tool_calls_rejected_by_turn_limit: u64,
+    pub tool_calls_rejected_by_arguments_limit: u64,
+    pub patch_calls_previewed: u64,
+    pub patch_previews_committed: u64,
+    pub patch_previews_dropped_as_stale: u64,
+    pub tool_call_approvals_committed: u64,
+    pub tool_call_approvals_dropped_as_stale: u64,
+    pub tool_call_rejections_committed: u64,
+    pub tool_call_rejections_dropped_as_stale: u64,
+    pub command_calls_dispatched: u64,
+    pub command_executions_started: u64,
+    pub command_output_chunks_appended: u64,
+    pub command_output_chunks_dropped_as_stale: u64,
+}
+
+impl MetricsCounters {
+    /// Take an independent point-in-time snapshot of every counter
+    /// in `metrics`. `Counter::get` is a `Relaxed` load, so this is
+    /// safe to call from any thread while the core keeps
+    /// incrementing.
+    pub fn from_agent_metrics(metrics: &AgentMetrics) -> Self {
+        Self {
+            user_messages_accepted: metrics.user_messages_accepted.get(),
+            user_messages_rejected_while_active: metrics.user_messages_rejected_while_active.get(),
+            cancels_applied: metrics.cancels_applied.get(),
+            cancels_ignored_when_idle: metrics.cancels_ignored_when_idle.get(),
+            content_deltas_appended: metrics.content_deltas_appended.get(),
+            content_deltas_dropped_as_stale: metrics.content_deltas_dropped_as_stale.get(),
+            reasoning_deltas_appended: metrics.reasoning_deltas_appended.get(),
+            reasoning_deltas_dropped_as_stale: metrics.reasoning_deltas_dropped_as_stale.get(),
+            finishes_committed: metrics.finishes_committed.get(),
+            finishes_dropped_as_stale: metrics.finishes_dropped_as_stale.get(),
+            transport_errors_recorded: metrics.transport_errors_recorded.get(),
+            transport_errors_dropped_as_stale: metrics.transport_errors_dropped_as_stale.get(),
+            timeouts_applied: metrics.timeouts_applied.get(),
+            timeouts_dropped_as_stale: metrics.timeouts_dropped_as_stale.get(),
+            tool_call_deltas_appended: metrics.tool_call_deltas_appended.get(),
+            tool_call_deltas_dropped_as_stale: metrics.tool_call_deltas_dropped_as_stale.get(),
+            tool_call_arguments_fragments_dropped_over_limit: metrics
+                .tool_call_arguments_fragments_dropped_over_limit
+                .get(),
+            tool_results_committed: metrics.tool_results_committed.get(),
+            tool_results_dropped_as_stale: metrics.tool_results_dropped_as_stale.get(),
+            tool_calls_executed: metrics.tool_calls_executed.get(),
+            tool_calls_rejected_by_turn_limit: metrics.tool_calls_rejected_by_turn_limit.get(),
+            tool_calls_rejected_by_arguments_limit: metrics
+                .tool_calls_rejected_by_arguments_limit
+                .get(),
+            patch_calls_previewed: metrics.patch_calls_previewed.get(),
+            patch_previews_committed: metrics.patch_previews_committed.get(),
+            patch_previews_dropped_as_stale: metrics.patch_previews_dropped_as_stale.get(),
+            tool_call_approvals_committed: metrics.tool_call_approvals_committed.get(),
+            tool_call_approvals_dropped_as_stale: metrics
+                .tool_call_approvals_dropped_as_stale
+                .get(),
+            tool_call_rejections_committed: metrics.tool_call_rejections_committed.get(),
+            tool_call_rejections_dropped_as_stale: metrics
+                .tool_call_rejections_dropped_as_stale
+                .get(),
+            command_calls_dispatched: metrics.command_calls_dispatched.get(),
+            command_executions_started: metrics.command_executions_started.get(),
+            command_output_chunks_appended: metrics.command_output_chunks_appended.get(),
+            command_output_chunks_dropped_as_stale: metrics
+                .command_output_chunks_dropped_as_stale
+                .get(),
+        }
+    }
+}
+
+impl DisplayJson for MetricsCounters {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("user_messages_accepted", self.user_messages_accepted)?;
+            f.member(
+                "user_messages_rejected_while_active",
+                self.user_messages_rejected_while_active,
+            )?;
+            f.member("cancels_applied", self.cancels_applied)?;
+            f.member("cancels_ignored_when_idle", self.cancels_ignored_when_idle)?;
+            f.member("content_deltas_appended", self.content_deltas_appended)?;
+            f.member(
+                "content_deltas_dropped_as_stale",
+                self.content_deltas_dropped_as_stale,
+            )?;
+            f.member("reasoning_deltas_appended", self.reasoning_deltas_appended)?;
+            f.member(
+                "reasoning_deltas_dropped_as_stale",
+                self.reasoning_deltas_dropped_as_stale,
+            )?;
+            f.member("finishes_committed", self.finishes_committed)?;
+            f.member("finishes_dropped_as_stale", self.finishes_dropped_as_stale)?;
+            f.member("transport_errors_recorded", self.transport_errors_recorded)?;
+            f.member(
+                "transport_errors_dropped_as_stale",
+                self.transport_errors_dropped_as_stale,
+            )?;
+            f.member("timeouts_applied", self.timeouts_applied)?;
+            f.member("timeouts_dropped_as_stale", self.timeouts_dropped_as_stale)?;
+            f.member("tool_call_deltas_appended", self.tool_call_deltas_appended)?;
+            f.member(
+                "tool_call_deltas_dropped_as_stale",
+                self.tool_call_deltas_dropped_as_stale,
+            )?;
+            f.member(
+                "tool_call_arguments_fragments_dropped_over_limit",
+                self.tool_call_arguments_fragments_dropped_over_limit,
+            )?;
+            f.member("tool_results_committed", self.tool_results_committed)?;
+            f.member(
+                "tool_results_dropped_as_stale",
+                self.tool_results_dropped_as_stale,
+            )?;
+            f.member("tool_calls_executed", self.tool_calls_executed)?;
+            f.member(
+                "tool_calls_rejected_by_turn_limit",
+                self.tool_calls_rejected_by_turn_limit,
+            )?;
+            f.member(
+                "tool_calls_rejected_by_arguments_limit",
+                self.tool_calls_rejected_by_arguments_limit,
+            )?;
+            f.member("patch_calls_previewed", self.patch_calls_previewed)?;
+            f.member("patch_previews_committed", self.patch_previews_committed)?;
+            f.member(
+                "patch_previews_dropped_as_stale",
+                self.patch_previews_dropped_as_stale,
+            )?;
+            f.member(
+                "tool_call_approvals_committed",
+                self.tool_call_approvals_committed,
+            )?;
+            f.member(
+                "tool_call_approvals_dropped_as_stale",
+                self.tool_call_approvals_dropped_as_stale,
+            )?;
+            f.member(
+                "tool_call_rejections_committed",
+                self.tool_call_rejections_committed,
+            )?;
+            f.member(
+                "tool_call_rejections_dropped_as_stale",
+                self.tool_call_rejections_dropped_as_stale,
+            )?;
+            f.member("command_calls_dispatched", self.command_calls_dispatched)?;
+            f.member(
+                "command_executions_started",
+                self.command_executions_started,
+            )?;
+            f.member(
+                "command_output_chunks_appended",
+                self.command_output_chunks_appended,
+            )?;
+            f.member(
+                "command_output_chunks_dropped_as_stale",
+                self.command_output_chunks_dropped_as_stale,
+            )
+        })
     }
 }
 
@@ -282,6 +478,11 @@ impl DisplayJson for TranscriptRecord {
                 f.member("kind", "session_end")?;
                 f.member("ts", ts)?;
                 f.member("reason", reason.as_str())
+            }),
+            Self::MetricsSnapshot { ts, counters } => f.object(|f| {
+                f.member("kind", "metrics_snapshot")?;
+                f.member("ts", ts)?;
+                f.member("counters", counters)
             }),
         }
     }

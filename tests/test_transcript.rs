@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
+use attini::sansio::agent::AgentMetrics;
 use attini::tui::transcript::{
     ApprovalDecision, AssistantToolCall, COMMAND_OUTPUT_PREVIEW_MAX_BYTES, CommandStream,
-    SessionEndReason, TranscriptRecord, TranscriptWriter,
+    MetricsCounters, SessionEndReason, TranscriptRecord, TranscriptWriter,
 };
 use tempdir_alt::TempDir;
 use tokio::fs;
@@ -240,8 +241,8 @@ fn session_start_never_carries_authorization_material() {
 fn reader_can_skip_unknown_kind_and_continue() {
     // Simulate a reader that stripes over JSON Lines and skips
     // lines whose `kind` is not recognised. This is the contract
-    // future kinds (retry / metrics / ...) are added under.
-    let known: [&str; 11] = [
+    // future kinds (retry, backoff, ...) are added under.
+    let known: [&str; 12] = [
         "session_start",
         "user_message",
         "assistant_message",
@@ -253,11 +254,12 @@ fn reader_can_skip_unknown_kind_and_continue() {
         "transport_error",
         "finish",
         "session_end",
+        "metrics_snapshot",
     ];
     let file = concat!(
         r#"{"kind":"user_message","ts":1,"text":"hi"}"#,
         "\n",
-        r#"{"kind":"future_metrics_snapshot","ts":2,"whatever":true}"#,
+        r#"{"kind":"future_retry","ts":2,"whatever":true}"#,
         "\n",
         r#"{"kind":"finish","ts":3,"reason":"stop"}"#,
         "\n",
@@ -270,6 +272,85 @@ fn reader_can_skip_unknown_kind_and_continue() {
         }
     }
     assert_eq!(kept, vec!["user_message".to_string(), "finish".to_string()]);
+}
+
+// ---- metrics snapshot ----------------------------------------------
+
+#[test]
+fn metrics_snapshot_record_has_kind_ts_and_counters() {
+    let counters = MetricsCounters::from_agent_metrics(&AgentMetrics::default());
+    let json = TranscriptRecord::MetricsSnapshot { ts: 42, counters }.to_json_string();
+    assert!(json.contains(r#""kind":"metrics_snapshot""#));
+    assert!(json.contains(r#""ts":42"#));
+    assert!(json.contains(r#""counters":{"#));
+}
+
+#[test]
+fn metrics_snapshot_counters_cover_every_agent_metrics_field() {
+    // Baseline: default AgentMetrics has all counters at 0. The
+    // JSON must include every field name from AgentMetrics so
+    // downstream jq / parsers see a stable, complete map.
+    let counters = MetricsCounters::from_agent_metrics(&AgentMetrics::default());
+    let json = TranscriptRecord::MetricsSnapshot { ts: 0, counters }.to_json_string();
+    // The 33 counter names from AgentMetrics as of this release.
+    // Adding a counter here without adding one to MetricsCounters
+    // will fail on the compile-time snapshot builder, so this
+    // list is the last-line reader-facing contract check.
+    let expected = [
+        "user_messages_accepted",
+        "user_messages_rejected_while_active",
+        "cancels_applied",
+        "cancels_ignored_when_idle",
+        "content_deltas_appended",
+        "content_deltas_dropped_as_stale",
+        "reasoning_deltas_appended",
+        "reasoning_deltas_dropped_as_stale",
+        "finishes_committed",
+        "finishes_dropped_as_stale",
+        "transport_errors_recorded",
+        "transport_errors_dropped_as_stale",
+        "timeouts_applied",
+        "timeouts_dropped_as_stale",
+        "tool_call_deltas_appended",
+        "tool_call_deltas_dropped_as_stale",
+        "tool_call_arguments_fragments_dropped_over_limit",
+        "tool_results_committed",
+        "tool_results_dropped_as_stale",
+        "tool_calls_executed",
+        "tool_calls_rejected_by_turn_limit",
+        "tool_calls_rejected_by_arguments_limit",
+        "patch_calls_previewed",
+        "patch_previews_committed",
+        "patch_previews_dropped_as_stale",
+        "tool_call_approvals_committed",
+        "tool_call_approvals_dropped_as_stale",
+        "tool_call_rejections_committed",
+        "tool_call_rejections_dropped_as_stale",
+        "command_calls_dispatched",
+        "command_executions_started",
+        "command_output_chunks_appended",
+        "command_output_chunks_dropped_as_stale",
+    ];
+    assert_eq!(expected.len(), 33);
+    for name in expected {
+        let needle = format!(r#""{name}":0"#);
+        assert!(
+            json.contains(&needle),
+            "MetricsSnapshot JSON missing field {name}: {json}"
+        );
+    }
+}
+
+#[test]
+fn metrics_snapshot_reflects_incremented_counters() {
+    let metrics = AgentMetrics::default();
+    metrics.tool_calls_executed.inc();
+    metrics.tool_calls_executed.inc();
+    metrics.transport_errors_recorded.inc();
+    let counters = MetricsCounters::from_agent_metrics(&metrics);
+    assert_eq!(counters.tool_calls_executed, 2);
+    assert_eq!(counters.transport_errors_recorded, 1);
+    assert_eq!(counters.timeouts_applied, 0);
 }
 
 // ---- writer end-to-end ---------------------------------------------
