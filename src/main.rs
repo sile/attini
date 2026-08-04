@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
@@ -79,13 +80,21 @@ async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
         .default(DEFAULT_MODEL)
         .take(args)
         .then(|o| o.value().parse())?;
+    let transcript_path: Option<PathBuf> = noargs::opt("transcript")
+        .ty("PATH")
+        .doc("Append session records as JSON Lines to this file")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<PathBuf>())?;
 
     if args.metadata().help_mode {
         return Ok(());
     }
 
     let client = DeepSeekClient::from_env()?;
-    let config = TuiConfig { model };
+    let config = TuiConfig {
+        model,
+        transcript_path,
+    };
     tui::run(client, config)
         .await
         .map_err(|err| RunError::Runtime(err.to_string()))?;

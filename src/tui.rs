@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tuinix::{
     EstimateCharWidth, Terminal, TerminalColor, TerminalFrame, TerminalInput, TerminalPosition,
@@ -38,17 +38,24 @@ use crate::sansio::agent::{
     Action, AgentCore, CommandInvocation, CommandOutputStream, Event, PatchInvocation,
     PatchPreview, PreviewHash, ReadOnlyTool, RequestId, ToolExecutionError, ToolOutcome,
 };
-use crate::sansio::deepseek::ChatRequest;
+use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall};
 use crate::sansio::tui::{
     self, Color, KeyCode, KeyEffect, KeyInput, Region, RenderedGrid, Style, StyledLine, UiState,
 };
 use crate::tools::ToolExecutor;
 use crate::tools::command::{CommandOutputMessage, run_command};
+use crate::tui::transcript::{
+    ApprovalDecision, AssistantToolCall, CommandStream, SessionEndReason, TranscriptRecord,
+    TranscriptWriter, now_unix_millis,
+};
 
 /// Runtime configuration for the TUI.
 #[derive(Debug, Clone)]
 pub struct TuiConfig {
     pub model: String,
+    /// When `Some`, open this file for append and stream a JSON
+    /// Lines session transcript to it. `None` disables recording.
+    pub transcript_path: Option<PathBuf>,
 }
 
 /// Run the TUI event loop until the user quits.
@@ -71,6 +78,21 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
             .map_err(|e| io::Error::other(format!("workspace {workspace:?}: {e}")))?,
     );
 
+    let (transcript, mut transcript_err_rx) = match config.transcript_path.as_ref() {
+        Some(path) => {
+            let (writer, err_rx) = TranscriptWriter::open(
+                path,
+                env!("CARGO_PKG_VERSION").to_string(),
+                config.model.clone(),
+                workspace.display().to_string(),
+            )
+            .await
+            .map_err(|e| io::Error::other(format!("transcript {path:?}: {e}")))?;
+            (Some(writer), Some(err_rx))
+        }
+        None => (None, None),
+    };
+
     let mut ui = UiState {
         model: config.model,
         draft: String::new(),
@@ -86,9 +108,12 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
         workspace: workspace.clone(),
         active_command: None,
         pending_commands: VecDeque::new(),
+        transcript,
+        conversation_len: 0,
     };
     let mut size = terminal.size();
     let mut should_quit = false;
+    let mut session_end_reason = SessionEndReason::UserQuit;
 
     draw(&mut terminal, size, &ui, &agent, &shell)?;
 
@@ -112,31 +137,35 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                     Some(ToolFeedback::Result { request, call_id, outcome }) => {
                         shell.tool_handles.remove(&(request, call_id.clone()));
                         on_command_finished(&mut shell, &call_id);
-                        let actions = agent.handle_event(Event::ToolResult {
+                        dispatch(&mut agent, &ui, &client, &mut shell, Event::ToolResult {
                             request,
                             call_id,
                             outcome,
                         });
-                        apply_actions(&ui, actions, &client, &mut shell);
                     }
                     Some(ToolFeedback::CommandOutputChunk { request, call_id, stream, bytes }) => {
-                        let actions = agent.handle_event(Event::CommandOutputChunk {
+                        transcript_send(&mut shell, TranscriptRecord::CommandOutputChunk {
+                            ts: now_unix_millis(),
+                            call_id: call_id.clone(),
+                            stream: to_transcript_stream(stream),
+                            bytes_len: bytes.len() as u64,
+                            preview: TranscriptRecord::command_preview_from_bytes(&bytes),
+                        });
+                        dispatch(&mut agent, &ui, &client, &mut shell, Event::CommandOutputChunk {
                             request,
                             call_id,
                             stream,
                             bytes,
                         });
-                        apply_actions(&ui, actions, &client, &mut shell);
                     }
                     Some(ToolFeedback::PatchPreviewReady { request, call_id, preview_hashes, preview }) => {
                         shell.tool_handles.remove(&(request, call_id.clone()));
-                        let actions = agent.handle_event(Event::PatchPreviewReady {
+                        dispatch(&mut agent, &ui, &client, &mut shell, Event::PatchPreviewReady {
                             request,
                             call_id,
                             preview_hashes,
                             preview,
                         });
-                        apply_actions(&ui, actions, &client, &mut shell);
                     }
                     Some(ToolFeedback::PatchPreviewFailed { request, call_id, outcome }) => {
                         // Preview itself failed (e.g. workspace boundary,
@@ -144,12 +173,11 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                         // result so the model sees the error without
                         // going through approval.
                         shell.tool_handles.remove(&(request, call_id.clone()));
-                        let actions = agent.handle_event(Event::ToolResult {
+                        dispatch(&mut agent, &ui, &client, &mut shell, Event::ToolResult {
                             request,
                             call_id,
                             outcome,
                         });
-                        apply_actions(&ui, actions, &client, &mut shell);
                     }
                     None => {
                         // All senders (only the tool executor tasks) dropped
@@ -157,6 +185,7 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                         // happen because `shell` still owns a sender; treat
                         // it as a safety net.
                         should_quit = true;
+                        session_end_reason = SessionEndReason::Eof;
                     }
                 }
             }
@@ -171,19 +200,20 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                     }
                     Some(Ok(event)) => {
                         for core_event in translate_stream_event(event, request) {
-                            let actions = agent.handle_event(core_event);
-                            apply_actions(&ui, actions, &client, &mut shell);
+                            dispatch(&mut agent, &ui, &client, &mut shell, core_event);
                         }
                     }
                     Some(Err(err)) => {
-                        let actions = agent.handle_event(Event::TransportError {
+                        dispatch(&mut agent, &ui, &client, &mut shell, Event::TransportError {
                             request,
                             message: err.to_string(),
                         });
-                        apply_actions(&ui, actions, &client, &mut shell);
                         shell.stream = None;
                     }
                 }
+            }
+            Some(msg) = wait_transcript_err(&mut transcript_err_rx) => {
+                shell.error_banner = Some(format!("transcript: {msg}"));
             }
         }
         draw(&mut terminal, size, &ui, &agent, &shell)?;
@@ -191,6 +221,9 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
 
     for (_, handle) in shell.tool_handles.drain() {
         handle.abort();
+    }
+    if let Some(writer) = shell.transcript.take() {
+        writer.shutdown(session_end_reason).await;
     }
     Ok(())
 }
@@ -213,14 +246,135 @@ fn drain_input(
                 let outcome = tui::handle_key(to_sansio_key(key), ui, agent.view());
                 *should_quit |= matches!(outcome.effect, KeyEffect::Quit);
                 for event in outcome.events {
-                    let actions = agent.handle_event(event);
-                    apply_actions(ui, actions, client, shell);
+                    dispatch(agent, ui, client, shell, event);
                 }
             }
             TerminalInput::Mouse(_) => {}
         }
     }
     Ok(())
+}
+
+/// Feed `event` through the core, wrapping the call with transcript
+/// bookkeeping. Events that carry information not preserved in the
+/// resulting `ChatMessage` (approval decisions, finish reason,
+/// transport errors, cancel, patch preview details) are recorded
+/// before dispatch; newly-appended `ChatMessage`s are recorded after.
+fn dispatch(
+    agent: &mut AgentCore,
+    ui: &UiState,
+    client: &DeepSeekClient,
+    shell: &mut Shell,
+    event: Event,
+) {
+    if let Some(record) = pre_event_record(&event) {
+        transcript_send(shell, record);
+    }
+    let actions = agent.handle_event(event);
+    emit_conversation_records(shell, agent);
+    apply_actions(ui, actions, client, shell);
+}
+
+fn pre_event_record(event: &Event) -> Option<TranscriptRecord> {
+    let ts = now_unix_millis();
+    match event {
+        Event::Cancel => Some(TranscriptRecord::Cancel { ts }),
+        Event::TransportError { message, .. } => Some(TranscriptRecord::TransportError {
+            ts,
+            message: message.clone(),
+        }),
+        Event::Finish { reason, .. } => Some(TranscriptRecord::Finish {
+            ts,
+            reason: reason.clone(),
+        }),
+        Event::PatchPreviewReady {
+            call_id, preview, ..
+        } => Some(TranscriptRecord::PatchPreviewReady {
+            ts,
+            call_id: call_id.clone(),
+            target_paths: preview.target_paths.clone(),
+            added_lines: preview.added_lines,
+            removed_lines: preview.removed_lines,
+            edit_count: preview.edit_count,
+        }),
+        Event::ApproveToolCall { call_id } => Some(TranscriptRecord::ToolApproval {
+            ts,
+            call_id: call_id.clone(),
+            decision: ApprovalDecision::Approve,
+        }),
+        Event::RejectToolCall { call_id } => Some(TranscriptRecord::ToolApproval {
+            ts,
+            call_id: call_id.clone(),
+            decision: ApprovalDecision::Reject,
+        }),
+        _ => None,
+    }
+}
+
+fn emit_conversation_records(shell: &mut Shell, agent: &AgentCore) {
+    let conv = agent.conversation();
+    while shell.conversation_len < conv.len() {
+        let msg = &conv[shell.conversation_len];
+        shell.conversation_len += 1;
+        let record = match msg {
+            ChatMessage::User(text) => TranscriptRecord::UserMessage {
+                ts: now_unix_millis(),
+                text: text.clone(),
+            },
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => TranscriptRecord::AssistantMessage {
+                ts: now_unix_millis(),
+                content: content.clone(),
+                reasoning: reasoning_content.clone(),
+                tool_calls: tool_calls.iter().map(from_wire_tool_call).collect(),
+            },
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => TranscriptRecord::ToolResult {
+                ts: now_unix_millis(),
+                call_id: tool_call_id.clone(),
+                content: content.clone(),
+            },
+            // The core never appends `System` on its own; the TUI
+            // shell does not seed one either. Guard defensively.
+            ChatMessage::System(_) => continue,
+        };
+        transcript_send(shell, record);
+    }
+}
+
+fn from_wire_tool_call(tc: &ToolCall) -> AssistantToolCall {
+    AssistantToolCall {
+        id: tc.id.clone(),
+        function_name: tc.function_name.clone(),
+        arguments_json: tc.arguments_json.clone(),
+    }
+}
+
+fn to_transcript_stream(stream: CommandOutputStream) -> CommandStream {
+    match stream {
+        CommandOutputStream::Stdout => CommandStream::Stdout,
+        CommandOutputStream::Stderr => CommandStream::Stderr,
+    }
+}
+
+fn transcript_send(shell: &mut Shell, record: TranscriptRecord) {
+    if let Some(writer) = shell.transcript.as_ref() {
+        writer.send(record);
+    }
+}
+
+async fn wait_transcript_err(rx: &mut Option<oneshot::Receiver<String>>) -> Option<String> {
+    let Some(receiver) = rx.as_mut() else {
+        return std::future::pending().await;
+    };
+    let result = receiver.await.ok();
+    *rx = None;
+    result
 }
 
 fn draw(
@@ -263,6 +417,14 @@ struct Shell {
     active_command: Option<ActiveCommand>,
     /// FIFO queue of command executions waiting on `active_command`.
     pending_commands: VecDeque<PendingCommand>,
+    /// Optional JSON Lines session log. `None` when `--transcript`
+    /// was not passed.
+    transcript: Option<TranscriptWriter>,
+    /// Length of `agent.conversation()` after the last
+    /// `handle_event` call. Used to detect newly-appended
+    /// `ChatMessage`s so they can be turned into transcript records
+    /// without a core-side hook.
+    conversation_len: usize,
 }
 
 struct ActiveCommand {

@@ -39,10 +39,15 @@ export DEEPSEEK_API_KEY=sk-...
 ### Interactive TUI
 
 ```sh
-attini tui [--model NAME]
+attini tui [--model NAME] [--transcript PATH]
 ```
 
 Starts the agent with the current directory as the workspace.
+
+`--transcript PATH` (optional) appends a JSON Lines session log to `PATH` for
+later inspection with `jq`. The file is opened in append mode; each session
+begins with a `session_start` record and ends with `session_end`. If the
+file cannot be opened `attini tui` exits with a non-zero status.
 
 ### One-shot chat
 
