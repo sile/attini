@@ -446,6 +446,8 @@ fn active_tool_call_appears_in_body_with_yellow_label_and_state_word() {
             approval: attini::sansio::agent::ApprovalState::NotRequired,
             patch_preview: None,
             preview_hashes: Vec::new(),
+            command_preview: None,
+            command_output_tail: None,
         });
     state.status = Status::ToolRunning;
     state.active = true;
@@ -485,6 +487,8 @@ fn completed_ok_tool_call_shows_done_and_summary() {
             approval: attini::sansio::agent::ApprovalState::NotRequired,
             patch_preview: None,
             preview_hashes: Vec::new(),
+            command_preview: None,
+            command_output_tail: None,
         });
     let grid = render(&state, (10, 60));
     let joined: String = grid
@@ -514,6 +518,8 @@ fn errored_tool_call_shows_error_state_in_red() {
             approval: attini::sansio::agent::ApprovalState::NotRequired,
             patch_preview: None,
             preview_hashes: Vec::new(),
+            command_preview: None,
+            command_output_tail: None,
         });
     let grid = render(&state, (10, 60));
     let error_span = grid.body.lines[0]
@@ -573,6 +579,8 @@ fn approval_pending_patch_shows_awaiting_label_with_diff_stats() {
                 edit_count: 1,
             }),
             preview_hashes: Vec::new(),
+            command_preview: None,
+            command_output_tail: None,
         });
     let grid = render(&state, (10, 80));
     let body: String = grid

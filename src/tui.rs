@@ -331,6 +331,12 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
             } => {
                 spawn_apply_patch(shell, request, call_id, invocation, preview_hashes);
             }
+            Action::ExecuteCommand { .. } => {
+                // Command executor wiring lands in a follow-up
+                // commit; CommandInvocation::definition() is not yet
+                // advertised on the wire, so the model cannot
+                // produce a command tool call in the meantime.
+            }
             Action::ReportError { message } => {
                 shell.error_banner = Some(message);
             }

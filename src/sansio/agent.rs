@@ -714,8 +714,8 @@ pub struct PatchPreview {
 }
 
 /// Approval status of a tool call. Read-only tools always report
-/// [`ApprovalState::NotRequired`]; patch tool calls flow through
-/// `Pending` → (`Approved` or `Rejected`).
+/// [`ApprovalState::NotRequired`]; patch and command tool calls flow
+/// through `Pending` → (`Approved` or `Rejected`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalState {
     NotRequired,
@@ -723,6 +723,41 @@ pub enum ApprovalState {
     Approved,
     Rejected,
 }
+
+/// TUI-facing summary of an incoming command call, populated at
+/// `on_finish` so the approval prompt has the full command text and
+/// timeout to display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPreview {
+    pub command_line: String,
+    pub timeout_seconds: u64,
+    /// Directory the shell will spawn the child in. Copied from
+    /// [`AgentCore::set_workspace_display`] so the pure Sans I/O core
+    /// does not have to know the filesystem.
+    pub working_directory: String,
+}
+
+/// Rolling tail of a running command's output plus running byte
+/// totals. Updated on every [`Event::CommandOutputChunk`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandOutputTail {
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub stdout_bytes_total: u64,
+    pub stderr_bytes_total: u64,
+}
+
+/// Which pipe an [`Event::CommandOutputChunk`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// Maximum characters retained in [`CommandOutputTail::stdout_tail`]
+/// / `stderr_tail` for TUI display. New chunks push the tail
+/// forward; older content is dropped so the tail stays small.
+const COMMAND_TAIL_CHARS: usize = 4 * 1024;
 
 impl ToolExecutionError {
     /// Compact JSON representation suitable for a `Tool` role message
@@ -892,6 +927,15 @@ pub enum Event {
     /// core synthesises an `Err(Rejected)` outcome for the call and
     /// continues the tool loop.
     RejectToolCall { call_id: String },
+    /// Shell delivered a chunk of stdout or stderr from a running
+    /// command. Only accepted while the corresponding pending tool
+    /// result has `ApprovalState::Approved` and `outcome.is_none()`.
+    CommandOutputChunk {
+        request: RequestId,
+        call_id: String,
+        stream: CommandOutputStream,
+        bytes: Vec<u8>,
+    },
     /// The transport reported an unrecoverable error for this request.
     TransportError { request: RequestId, message: String },
     /// The request exceeded its allotted time.
@@ -944,6 +988,15 @@ pub enum Action {
         invocation: PatchInvocation,
         preview_hashes: Vec<PreviewHash>,
     },
+    /// User approved the command preview; run the shell command,
+    /// stream stdout/stderr back via [`Event::CommandOutputChunk`],
+    /// and finish with an [`Event::ToolResult`] carrying the JSON
+    /// result described in the polished `0008` design.
+    ExecuteCommand {
+        request: RequestId,
+        call_id: String,
+        invocation: CommandInvocation,
+    },
     /// Abort any tool executions that were dispatched for `request`
     /// but have not yet reported an outcome. Emitted when the user
     /// cancels or the request times out while in
@@ -968,6 +1021,11 @@ pub struct AgentCore {
     /// user turn began. Reset to 0 on every transition to
     /// [`Status::Idle`], including cancels, errors, and timeouts.
     tool_calls_this_turn: usize,
+    /// Human-readable workspace root, copied into
+    /// [`CommandPreview::working_directory`] so the approval prompt
+    /// can show it. Set by the shell during startup via
+    /// [`AgentCore::set_workspace_display`]; empty when unset.
+    workspace_display: String,
     metrics: AgentMetrics,
 }
 
@@ -1017,18 +1075,24 @@ struct PendingToolResult {
     function_name: String,
     arguments_json: String,
     /// Approval state. Read-only tools are always
-    /// [`ApprovalState::NotRequired`]. Patch tools start as
-    /// [`ApprovalState::Pending`] once
-    /// [`Event::PatchPreviewReady`] lands.
+    /// [`ApprovalState::NotRequired`]. Patch tools stay in
+    /// `NotRequired` until [`Event::PatchPreviewReady`] bumps them to
+    /// `Pending`; command tools are `Pending` from `on_finish`.
     approval: ApprovalState,
     /// Populated when [`Event::PatchPreviewReady`] arrives so the TUI
-    /// can render the diff summary. `None` for read-only tools and
+    /// can render the diff summary. `None` for non-patch tools and
     /// for patch tools before the shell has produced a preview.
     patch_preview: Option<PatchPreview>,
     /// Populated together with `patch_preview`. Retained here so
-    /// [`Event::ApproveToolCall`] can hand the same hashes back to the
-    /// shell as [`Action::ApplyPatch`] without a round trip.
+    /// [`Event::ApproveToolCall`] can hand the same hashes back to
+    /// the shell as [`Action::ApplyPatch`] without a round trip.
     preview_hashes: Vec<PreviewHash>,
+    /// Populated at `on_finish` for command tool calls. Drives the
+    /// approval-mode label content in the TUI.
+    command_preview: Option<CommandPreview>,
+    /// Populated on the first [`Event::CommandOutputChunk`] and
+    /// updated on every subsequent one until the tool result lands.
+    command_output_tail: Option<CommandOutputTail>,
     /// `None` while the shell is still executing the tool; `Some` once
     /// it has reported (or the core has synthesised) an outcome.
     outcome: Option<ToolOutcome>,
@@ -1048,16 +1112,22 @@ pub struct ActiveToolCall {
     pub outcome: Option<ToolOutcome>,
     pub is_streaming: bool,
     /// Approval status. [`ApprovalState::NotRequired`] for read-only
-    /// tools; otherwise reflects the patch approval flow state.
+    /// tools; otherwise reflects the approval flow state.
     pub approval: ApprovalState,
     /// Diff summary from [`Event::PatchPreviewReady`]. `None` for
-    /// read-only tools or patch tools whose preview has not yet
+    /// non-patch tools or patch tools whose preview has not yet
     /// arrived.
     pub patch_preview: Option<PatchPreview>,
-    /// SHA-256 hashes captured at preview time. Empty for read-only
+    /// SHA-256 hashes captured at preview time. Empty for non-patch
     /// tools; the TUI does not display them (they exist only so the
     /// core can hand them to [`Action::ApplyPatch`] on approval).
     pub preview_hashes: Vec<PreviewHash>,
+    /// Approval-mode label content for command tool calls. `None`
+    /// for other tool kinds.
+    pub command_preview: Option<CommandPreview>,
+    /// Rolling output tail while a command is running. `None` before
+    /// the first chunk arrives, or for non-command tool kinds.
+    pub command_output_tail: Option<CommandOutputTail>,
 }
 
 /// Cumulative counters for the branches taken by
@@ -1160,32 +1230,53 @@ pub struct AgentMetrics {
     pub patch_calls_previewed: Counter,
     /// [`Event::PatchPreviewReady`] whose `call_id` matched an
     /// outstanding patch call; the diff summary and hashes were
-    /// stored on the pending tool result and the phase transitioned
-    /// to `AwaitingApproval`.
+    /// stored on the pending tool result approval bumped to `Pending`,
+    /// and the phase transitioned to `AwaitingApproval`.
     pub patch_previews_committed: Counter,
     /// [`Event::PatchPreviewReady`] dropped because no request was
     /// active, the id did not match, no outstanding patch call had
     /// the matching `call_id`, or the call was already resolved.
     pub patch_previews_dropped_as_stale: Counter,
     /// [`Event::ApproveToolCall`] whose `call_id` matched an
-    /// approval-pending patch call; [`Action::ApplyPatch`] was
-    /// emitted.
-    pub patch_approvals_committed: Counter,
+    /// approval-pending call; the tool-specific apply/execute action
+    /// was emitted.
+    pub tool_call_approvals_committed: Counter,
     /// [`Event::ApproveToolCall`] dropped because no approval-pending
-    /// patch call had the matching `call_id`.
-    pub patch_approvals_dropped_as_stale: Counter,
+    /// call had the matching `call_id`.
+    pub tool_call_approvals_dropped_as_stale: Counter,
     /// [`Event::RejectToolCall`] whose `call_id` matched an
-    /// approval-pending patch call; a synthetic
-    /// `Err(Patch(Rejected))` outcome was recorded.
-    pub patch_rejections_committed: Counter,
+    /// approval-pending call; a synthetic `Err(_::Rejected)` outcome
+    /// was recorded for the target tool.
+    pub tool_call_rejections_committed: Counter,
     /// [`Event::RejectToolCall`] dropped because no approval-pending
-    /// patch call had the matching `call_id`.
-    pub patch_rejections_dropped_as_stale: Counter,
+    /// call had the matching `call_id`.
+    pub tool_call_rejections_dropped_as_stale: Counter,
+    /// A command call was accepted by `on_finish` (parsed and added
+    /// to the approval queue with `ApprovalState::Pending`).
+    pub command_calls_dispatched: Counter,
+    /// [`Action::ExecuteCommand`] was emitted for an approved
+    /// command call.
+    pub command_executions_started: Counter,
+    /// [`Event::CommandOutputChunk`] whose `call_id` matched a
+    /// running command; the chunk was folded into the tool result's
+    /// output tail.
+    pub command_output_chunks_appended: Counter,
+    /// [`Event::CommandOutputChunk`] dropped because no request was
+    /// active, the id did not match, or no running command call had
+    /// the matching `call_id`.
+    pub command_output_chunks_dropped_as_stale: Counter,
 }
 
 impl AgentCore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record a human-readable workspace root for display in the
+    /// command approval prompt. Empty string means "not set" — the
+    /// TUI falls back to omitting the cwd line in that case.
+    pub fn set_workspace_display(&mut self, display: String) {
+        self.workspace_display = display;
     }
 
     /// The committed user / assistant message history.
@@ -1252,6 +1343,8 @@ impl AgentCore {
                     approval: ApprovalState::NotRequired,
                     patch_preview: None,
                     preview_hashes: Vec::new(),
+                    command_preview: None,
+                    command_output_tail: None,
                 })
                 .collect(),
             PendingPhase::ToolRunning | PendingPhase::AwaitingApproval => pending
@@ -1266,6 +1359,8 @@ impl AgentCore {
                     approval: r.approval,
                     patch_preview: r.patch_preview.clone(),
                     preview_hashes: r.preview_hashes.clone(),
+                    command_preview: r.command_preview.clone(),
+                    command_output_tail: r.command_output_tail.clone(),
                 })
                 .collect(),
         }
@@ -1305,6 +1400,12 @@ impl AgentCore {
             } => self.on_patch_preview_ready(request, call_id, preview_hashes, preview),
             Event::ApproveToolCall { call_id } => self.on_approve_tool_call(call_id),
             Event::RejectToolCall { call_id } => self.on_reject_tool_call(call_id),
+            Event::CommandOutputChunk {
+                request,
+                call_id,
+                stream,
+                bytes,
+            } => self.on_command_output_chunk(request, call_id, stream, bytes),
             Event::TransportError { request, message } => self.on_transport_error(request, message),
             Event::Timeout { request } => self.on_timeout(request),
         }
@@ -1488,30 +1589,18 @@ impl AgentCore {
         let mut pending_results: Vec<PendingToolResult> = Vec::with_capacity(tool_calls.len());
         for call in tool_calls.into_iter() {
             if over_limit_ids.contains(&call.id) {
-                pending_results.push(PendingToolResult {
-                    call_id: call.id,
-                    function_name: call.function_name,
-                    arguments_json: call.arguments_json,
-                    approval: ApprovalState::NotRequired,
-                    patch_preview: None,
-                    preview_hashes: Vec::new(),
-                    outcome: Some(ToolOutcome::Err(ToolExecutionError::ArgumentsTooLarge)),
-                });
+                pending_results.push(synthetic_err_result(
+                    call,
+                    ToolExecutionError::ArgumentsTooLarge,
+                ));
                 self.metrics.tool_calls_rejected_by_arguments_limit.inc();
                 continue;
             }
             if self.tool_calls_this_turn >= TURN_TOOL_CALL_LIMIT {
-                pending_results.push(PendingToolResult {
-                    call_id: call.id,
-                    function_name: call.function_name,
-                    arguments_json: call.arguments_json,
-                    approval: ApprovalState::NotRequired,
-                    patch_preview: None,
-                    preview_hashes: Vec::new(),
-                    outcome: Some(ToolOutcome::Err(
-                        ToolExecutionError::TurnToolCallLimitExceeded,
-                    )),
-                });
+                pending_results.push(synthetic_err_result(
+                    call,
+                    ToolExecutionError::TurnToolCallLimitExceeded,
+                ));
                 self.metrics.tool_calls_rejected_by_turn_limit.inc();
                 continue;
             }
@@ -1528,28 +1617,31 @@ impl AgentCore {
                         // yet, so exposing this call in the approval
                         // queue would prompt on an empty screen.
                         // `on_patch_preview_ready` bumps to `Pending`.
-                        pending_results.push(PendingToolResult {
-                            call_id: call.id,
-                            function_name: call.function_name,
-                            arguments_json: call.arguments_json,
-                            approval: ApprovalState::NotRequired,
-                            patch_preview: None,
-                            preview_hashes: Vec::new(),
-                            outcome: None,
-                        });
+                        pending_results.push(patch_pending_result(call));
                         self.tool_calls_this_turn += 1;
                         self.metrics.patch_calls_previewed.inc();
                     }
                     Err(err) => {
-                        pending_results.push(PendingToolResult {
-                            call_id: call.id,
-                            function_name: call.function_name,
-                            arguments_json: call.arguments_json,
-                            approval: ApprovalState::NotRequired,
-                            patch_preview: None,
-                            preview_hashes: Vec::new(),
-                            outcome: Some(ToolOutcome::Err(err)),
-                        });
+                        pending_results.push(synthetic_err_result(call, err));
+                    }
+                }
+            } else if call.function_name == "command" {
+                match CommandInvocation::parse(&call.arguments_json) {
+                    Ok(invocation) => {
+                        let preview = CommandPreview {
+                            command_line: invocation.command_line.clone(),
+                            timeout_seconds: invocation.timeout_seconds,
+                            working_directory: self.workspace_display.clone(),
+                        };
+                        // No action emitted from on_finish; the shell
+                        // waits for the user to approve. Action::ExecuteCommand
+                        // will be produced by on_approve_tool_call.
+                        pending_results.push(command_pending_result(call, preview));
+                        self.tool_calls_this_turn += 1;
+                        self.metrics.command_calls_dispatched.inc();
+                    }
+                    Err(err) => {
+                        pending_results.push(synthetic_err_result(call, err));
                     }
                 }
             } else {
@@ -1560,28 +1652,12 @@ impl AgentCore {
                             call_id: call.id.clone(),
                             invocation,
                         });
-                        pending_results.push(PendingToolResult {
-                            call_id: call.id,
-                            function_name: call.function_name,
-                            arguments_json: call.arguments_json,
-                            approval: ApprovalState::NotRequired,
-                            patch_preview: None,
-                            preview_hashes: Vec::new(),
-                            outcome: None,
-                        });
+                        pending_results.push(read_only_pending_result(call));
                         self.tool_calls_this_turn += 1;
                         self.metrics.tool_calls_executed.inc();
                     }
                     Err(err) => {
-                        pending_results.push(PendingToolResult {
-                            call_id: call.id,
-                            function_name: call.function_name,
-                            arguments_json: call.arguments_json,
-                            approval: ApprovalState::NotRequired,
-                            patch_preview: None,
-                            preview_hashes: Vec::new(),
-                            outcome: Some(ToolOutcome::Err(err)),
-                        });
+                        pending_results.push(synthetic_err_result(call, err));
                     }
                 }
             }
@@ -1597,6 +1673,11 @@ impl AgentCore {
         pending.tool_results = pending_results;
         self.pending = Some(pending);
         self.status = Status::ToolRunning;
+        // Command tool calls are already `Pending` approval as they
+        // land here; bump the phase / status straight to
+        // `AwaitingApproval` if any exists so the TUI does not have
+        // to wait for a follow-up event before showing the prompt.
+        self.recompute_phase_and_status();
         actions.push(Action::Redraw);
         actions
     }
@@ -1667,65 +1748,141 @@ impl AgentCore {
 
     fn on_approve_tool_call(&mut self, call_id: String) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
-            self.metrics.patch_approvals_dropped_as_stale.inc();
+            self.metrics.tool_call_approvals_dropped_as_stale.inc();
             return Vec::new();
         };
         let request_id = pending.id;
-        let Some(entry) = pending.tool_results.iter_mut().find(|r| {
-            r.call_id == call_id
-                && r.approval == ApprovalState::Pending
-                && r.patch_preview.is_some()
-        }) else {
-            self.metrics.patch_approvals_dropped_as_stale.inc();
+        let Some(entry) = pending
+            .tool_results
+            .iter_mut()
+            .find(|r| r.call_id == call_id && r.approval == ApprovalState::Pending)
+        else {
+            self.metrics.tool_call_approvals_dropped_as_stale.inc();
             return Vec::new();
         };
         entry.approval = ApprovalState::Approved;
-        let preview_hashes = entry.preview_hashes.clone();
         // Re-parse the arguments captured at on_finish. Parse cannot
         // fail here because on_finish already accepted it, but treat
-        // an error as a synthetic Rejected to keep the loop moving.
-        let invocation = match PatchInvocation::parse(&entry.arguments_json) {
-            Ok(inv) => inv,
-            Err(err) => {
-                entry.outcome = Some(ToolOutcome::Err(err));
-                self.metrics.patch_approvals_committed.inc();
+        // an error as an immediate resolution to keep the loop
+        // moving.
+        let action = match entry.function_name.as_str() {
+            "patch" => {
+                let preview_hashes = entry.preview_hashes.clone();
+                match PatchInvocation::parse(&entry.arguments_json) {
+                    Ok(invocation) => Action::ApplyPatch {
+                        request: request_id,
+                        call_id: call_id.clone(),
+                        invocation,
+                        preview_hashes,
+                    },
+                    Err(err) => {
+                        entry.outcome = Some(ToolOutcome::Err(err));
+                        self.metrics.tool_call_approvals_committed.inc();
+                        self.recompute_phase_and_status();
+                        return self.maybe_advance_to_next_request();
+                    }
+                }
+            }
+            "command" => match CommandInvocation::parse(&entry.arguments_json) {
+                Ok(invocation) => {
+                    self.metrics.command_executions_started.inc();
+                    Action::ExecuteCommand {
+                        request: request_id,
+                        call_id: call_id.clone(),
+                        invocation,
+                    }
+                }
+                Err(err) => {
+                    entry.outcome = Some(ToolOutcome::Err(err));
+                    self.metrics.tool_call_approvals_committed.inc();
+                    self.recompute_phase_and_status();
+                    return self.maybe_advance_to_next_request();
+                }
+            },
+            other => {
+                // Approval fired for a tool that never enters the
+                // approval flow. Fail loudly through a synthetic Err.
+                entry.outcome = Some(ToolOutcome::Err(ToolExecutionError::ArgumentsParseFailed(
+                    format!("no approval flow for tool {other}"),
+                )));
+                self.metrics.tool_call_approvals_committed.inc();
                 self.recompute_phase_and_status();
                 return self.maybe_advance_to_next_request();
             }
         };
-        self.metrics.patch_approvals_committed.inc();
+        self.metrics.tool_call_approvals_committed.inc();
         self.recompute_phase_and_status();
-        vec![
-            Action::ApplyPatch {
-                request: request_id,
-                call_id,
-                invocation,
-                preview_hashes,
-            },
-            Action::Redraw,
-        ]
+        vec![action, Action::Redraw]
     }
 
     fn on_reject_tool_call(&mut self, call_id: String) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
-            self.metrics.patch_rejections_dropped_as_stale.inc();
+            self.metrics.tool_call_rejections_dropped_as_stale.inc();
             return Vec::new();
         };
-        let Some(entry) = pending.tool_results.iter_mut().find(|r| {
-            r.call_id == call_id
-                && r.approval == ApprovalState::Pending
-                && r.patch_preview.is_some()
-        }) else {
-            self.metrics.patch_rejections_dropped_as_stale.inc();
+        let Some(entry) = pending
+            .tool_results
+            .iter_mut()
+            .find(|r| r.call_id == call_id && r.approval == ApprovalState::Pending)
+        else {
+            self.metrics.tool_call_rejections_dropped_as_stale.inc();
             return Vec::new();
         };
         entry.approval = ApprovalState::Rejected;
-        entry.outcome = Some(ToolOutcome::Err(ToolExecutionError::Patch(
-            PatchError::Rejected,
-        )));
-        self.metrics.patch_rejections_committed.inc();
+        entry.outcome = Some(match entry.function_name.as_str() {
+            "command" => ToolOutcome::Err(ToolExecutionError::Command(CommandError::Rejected)),
+            // Patch is the only other tool that reaches this path; any
+            // future approval-gated tool falls through to Patch::Rejected
+            // by default, which is close enough for the model to see it
+            // as "user did not approve".
+            _ => ToolOutcome::Err(ToolExecutionError::Patch(PatchError::Rejected)),
+        });
+        self.metrics.tool_call_rejections_committed.inc();
         self.recompute_phase_and_status();
         self.maybe_advance_to_next_request()
+    }
+
+    fn on_command_output_chunk(
+        &mut self,
+        request: RequestId,
+        call_id: String,
+        stream: CommandOutputStream,
+        bytes: Vec<u8>,
+    ) -> Vec<Action> {
+        let Some(pending) = self.pending.as_mut() else {
+            self.metrics.command_output_chunks_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        if pending.id != request || matches!(pending.phase, PendingPhase::Streaming) {
+            self.metrics.command_output_chunks_dropped_as_stale.inc();
+            return Vec::new();
+        }
+        let Some(entry) = pending.tool_results.iter_mut().find(|r| {
+            r.call_id == call_id
+                && r.approval == ApprovalState::Approved
+                && r.outcome.is_none()
+                && r.function_name == "command"
+        }) else {
+            self.metrics.command_output_chunks_dropped_as_stale.inc();
+            return Vec::new();
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let byte_len = bytes.len() as u64;
+        let tail = entry
+            .command_output_tail
+            .get_or_insert_with(CommandOutputTail::default);
+        match stream {
+            CommandOutputStream::Stdout => {
+                append_bounded(&mut tail.stdout_tail, &text, COMMAND_TAIL_CHARS);
+                tail.stdout_bytes_total = tail.stdout_bytes_total.saturating_add(byte_len);
+            }
+            CommandOutputStream::Stderr => {
+                append_bounded(&mut tail.stderr_tail, &text, COMMAND_TAIL_CHARS);
+                tail.stderr_bytes_total = tail.stderr_bytes_total.saturating_add(byte_len);
+            }
+        }
+        self.metrics.command_output_chunks_appended.inc();
+        vec![Action::Redraw]
     }
 
     /// After any state change to `tool_results`, adjust `pending.phase`
@@ -1850,6 +2007,79 @@ impl AgentCore {
             },
             Action::Redraw,
         ]
+    }
+}
+
+fn synthetic_err_result(call: ToolCall, err: ToolExecutionError) -> PendingToolResult {
+    PendingToolResult {
+        call_id: call.id,
+        function_name: call.function_name,
+        arguments_json: call.arguments_json,
+        approval: ApprovalState::NotRequired,
+        patch_preview: None,
+        preview_hashes: Vec::new(),
+        command_preview: None,
+        command_output_tail: None,
+        outcome: Some(ToolOutcome::Err(err)),
+    }
+}
+
+fn read_only_pending_result(call: ToolCall) -> PendingToolResult {
+    PendingToolResult {
+        call_id: call.id,
+        function_name: call.function_name,
+        arguments_json: call.arguments_json,
+        approval: ApprovalState::NotRequired,
+        patch_preview: None,
+        preview_hashes: Vec::new(),
+        command_preview: None,
+        command_output_tail: None,
+        outcome: None,
+    }
+}
+
+fn patch_pending_result(call: ToolCall) -> PendingToolResult {
+    PendingToolResult {
+        call_id: call.id,
+        function_name: call.function_name,
+        arguments_json: call.arguments_json,
+        approval: ApprovalState::NotRequired,
+        patch_preview: None,
+        preview_hashes: Vec::new(),
+        command_preview: None,
+        command_output_tail: None,
+        outcome: None,
+    }
+}
+
+/// Append `text` to `tail` while keeping `tail.chars().count()` at
+/// most `max_chars`. Older content is dropped from the front so the
+/// most recent output stays visible.
+fn append_bounded(tail: &mut String, text: &str, max_chars: usize) {
+    tail.push_str(text);
+    let count = tail.chars().count();
+    if count > max_chars {
+        let drop = count - max_chars;
+        let split = tail
+            .char_indices()
+            .nth(drop)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        tail.drain(..split);
+    }
+}
+
+fn command_pending_result(call: ToolCall, preview: CommandPreview) -> PendingToolResult {
+    PendingToolResult {
+        call_id: call.id,
+        function_name: call.function_name,
+        arguments_json: call.arguments_json,
+        approval: ApprovalState::Pending,
+        patch_preview: None,
+        preview_hashes: Vec::new(),
+        command_preview: Some(preview),
+        command_output_tail: None,
+        outcome: None,
     }
 }
 
@@ -2249,10 +2479,14 @@ mod tests {
         assert_eq!(m.patch_calls_previewed.get(), 0);
         assert_eq!(m.patch_previews_committed.get(), 0);
         assert_eq!(m.patch_previews_dropped_as_stale.get(), 0);
-        assert_eq!(m.patch_approvals_committed.get(), 0);
-        assert_eq!(m.patch_approvals_dropped_as_stale.get(), 0);
-        assert_eq!(m.patch_rejections_committed.get(), 0);
-        assert_eq!(m.patch_rejections_dropped_as_stale.get(), 0);
+        assert_eq!(m.tool_call_approvals_committed.get(), 0);
+        assert_eq!(m.tool_call_approvals_dropped_as_stale.get(), 0);
+        assert_eq!(m.tool_call_rejections_committed.get(), 0);
+        assert_eq!(m.tool_call_rejections_dropped_as_stale.get(), 0);
+        assert_eq!(m.command_calls_dispatched.get(), 0);
+        assert_eq!(m.command_executions_started.get(), 0);
+        assert_eq!(m.command_output_chunks_appended.get(), 0);
+        assert_eq!(m.command_output_chunks_dropped_as_stale.get(), 0);
     }
 
     // -------------------------------------------------------------
@@ -2970,7 +3204,7 @@ mod tests {
             .expect("ApplyPatch emitted");
         assert_eq!(apply.0, "p1");
         assert_eq!(apply.1, vec![hash]);
-        assert_eq!(core.metrics().patch_approvals_committed.get(), 1);
+        assert_eq!(core.metrics().tool_call_approvals_committed.get(), 1);
         // Approved but not yet resolved — approval left, phase now ToolRunning.
         assert_eq!(core.status(), Status::ToolRunning);
         assert!(core.view().pending_approval_call_id.is_none());
@@ -2998,7 +3232,7 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::StartRequest { .. }))
         );
-        assert_eq!(core.metrics().patch_rejections_committed.get(), 1);
+        assert_eq!(core.metrics().tool_call_rejections_committed.get(), 1);
         // The synthetic Tool message contains the patch_rejected code.
         let last = core.conversation().last().expect("has tool message");
         match last {
@@ -3017,7 +3251,7 @@ mod tests {
             call_id: "nope".to_string(),
         });
         assert!(actions.is_empty());
-        assert_eq!(core.metrics().patch_approvals_dropped_as_stale.get(), 1);
+        assert_eq!(core.metrics().tool_call_approvals_dropped_as_stale.get(), 1);
     }
 
     #[test]
@@ -3077,5 +3311,170 @@ mod tests {
         assert_eq!(actions, vec![Action::Redraw]);
         // Still in approval phase because patch is not yet resolved.
         assert_eq!(core.status(), Status::AwaitingApproval);
+    }
+
+    // -------------------------------------------------------------
+    // command approval loop
+    // -------------------------------------------------------------
+
+    fn drive_single_command_call(
+        core: &mut AgentCore,
+        request: RequestId,
+        call_id: &str,
+        arguments_json: &str,
+    ) -> Vec<Action> {
+        let _ = core.handle_event(tool_call_delta(
+            request,
+            0,
+            Some(call_id),
+            Some("command"),
+            Some(arguments_json),
+        ));
+        core.handle_event(Event::Finish {
+            request,
+            reason: Some("tool_calls".to_string()),
+        })
+    }
+
+    fn valid_command_json() -> &'static str {
+        r#"{"command_line":"echo hi","timeout_seconds":10}"#
+    }
+
+    #[test]
+    fn command_finish_populates_command_preview_and_marks_pending() {
+        let mut core = AgentCore::new();
+        core.set_workspace_display("/tmp/wksp".to_string());
+        let id = last_start_id(&user(&mut core, "hi"));
+        let actions = drive_single_command_call(&mut core, id, "c1", valid_command_json());
+
+        // No ExecuteCommand yet — that only fires on approval.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ExecuteCommand { .. }))
+        );
+        assert_eq!(core.status(), Status::AwaitingApproval);
+        assert_eq!(core.metrics().command_calls_dispatched.get(), 1);
+
+        let active = core.active_tool_calls();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].approval, ApprovalState::Pending);
+        let preview = active[0]
+            .command_preview
+            .as_ref()
+            .expect("preview populated");
+        assert_eq!(preview.command_line, "echo hi");
+        assert_eq!(preview.timeout_seconds, 10);
+        assert_eq!(preview.working_directory, "/tmp/wksp");
+        assert_eq!(core.view().pending_approval_call_id, Some("c1".to_string()));
+    }
+
+    #[test]
+    fn command_approve_emits_execute_command_action() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_command_call(&mut core, id, "c1", valid_command_json());
+
+        let actions = core.handle_event(Event::ApproveToolCall {
+            call_id: "c1".to_string(),
+        });
+
+        assert_eq!(core.metrics().tool_call_approvals_committed.get(), 1);
+        assert_eq!(core.metrics().command_executions_started.get(), 1);
+        let matched = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::ExecuteCommand { call_id, invocation, .. }
+                    if call_id == "c1"
+                        && invocation.command_line == "echo hi"
+                        && invocation.timeout_seconds == 10
+            )
+        });
+        assert!(matched, "expected ExecuteCommand, got {actions:?}");
+        assert_eq!(core.status(), Status::ToolRunning);
+    }
+
+    #[test]
+    fn command_reject_synthesizes_command_rejected_err() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_command_call(&mut core, id, "c1", valid_command_json());
+
+        let actions = core.handle_event(Event::RejectToolCall {
+            call_id: "c1".to_string(),
+        });
+
+        assert_eq!(core.metrics().tool_call_rejections_committed.get(), 1);
+        // Advance emits StartRequest with the synthetic Tool message.
+        let start = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::StartRequest { messages, .. } => Some(messages.clone()),
+                _ => None,
+            })
+            .expect("StartRequest emitted");
+        let tool_msg = start
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("Tool message present");
+        assert!(tool_msg.contains("command_rejected"), "content={tool_msg}");
+    }
+
+    #[test]
+    fn command_output_chunk_appends_to_tail_when_approved() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_command_call(&mut core, id, "c1", valid_command_json());
+        let _ = core.handle_event(Event::ApproveToolCall {
+            call_id: "c1".to_string(),
+        });
+
+        let _ = core.handle_event(Event::CommandOutputChunk {
+            request: id,
+            call_id: "c1".to_string(),
+            stream: CommandOutputStream::Stdout,
+            bytes: b"line 1\n".to_vec(),
+        });
+        let _ = core.handle_event(Event::CommandOutputChunk {
+            request: id,
+            call_id: "c1".to_string(),
+            stream: CommandOutputStream::Stderr,
+            bytes: b"warn\n".to_vec(),
+        });
+
+        assert_eq!(core.metrics().command_output_chunks_appended.get(), 2);
+        let active = core.active_tool_calls();
+        let tail = active[0]
+            .command_output_tail
+            .as_ref()
+            .expect("tail populated");
+        assert_eq!(tail.stdout_tail, "line 1\n");
+        assert_eq!(tail.stderr_tail, "warn\n");
+        assert_eq!(tail.stdout_bytes_total, 7);
+        assert_eq!(tail.stderr_bytes_total, 5);
+    }
+
+    #[test]
+    fn command_output_chunk_dropped_if_not_approved() {
+        let mut core = AgentCore::new();
+        let id = last_start_id(&user(&mut core, "hi"));
+        let _ = drive_single_command_call(&mut core, id, "c1", valid_command_json());
+        // Still Pending, not yet Approved → chunk must drop as stale.
+
+        let actions = core.handle_event(Event::CommandOutputChunk {
+            request: id,
+            call_id: "c1".to_string(),
+            stream: CommandOutputStream::Stdout,
+            bytes: b"early".to_vec(),
+        });
+        assert!(actions.is_empty());
+        assert_eq!(
+            core.metrics().command_output_chunks_dropped_as_stale.get(),
+            1
+        );
     }
 }
