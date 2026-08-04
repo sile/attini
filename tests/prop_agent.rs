@@ -5,7 +5,8 @@
 //! contract holds after every step.
 
 use attini::sansio::agent::{
-    Action, AgentCore, Event, RequestId, Status, ToolExecutionError, ToolOutcome,
+    Action, AgentCore, Event, PatchPreview, PreviewHash, RequestId, Status, ToolExecutionError,
+    ToolOutcome,
 };
 use attini::sansio::deepseek::ChatMessage;
 
@@ -91,8 +92,12 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             "content_delta",
             "reasoning_delta",
             "tool_call_delta",
+            "patch_call_delta",
             "finish",
             "tool_result",
+            "patch_preview_ready",
+            "approve_patch",
+            "reject_patch",
             "transport_error",
             "timeout",
         ],
@@ -127,6 +132,17 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
                 None
             },
         },
+        "patch_call_delta" => Event::ToolCallDelta {
+            request: sample_request_id(ctx, core),
+            index: noprop::sample_usize_in(ctx, 0..=3) as u64,
+            id: Some(format!("patch_{}", noprop::sample_usize_in(ctx, 0..=4))),
+            function_name: Some("patch".to_string()),
+            // Fixed valid patch payload so this fragment actually
+            // parses when the tool_calls finish lands.
+            arguments_fragment: Some(
+                r#"{"edits":[{"kind":"add","path":"pbt.txt","content":"hi"}]}"#.to_string(),
+            ),
+        },
         "finish" => Event::Finish {
             request: sample_request_id(ctx, core),
             reason: sample_finish_reason(ctx),
@@ -135,6 +151,26 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             request: sample_request_id(ctx, core),
             call_id: sample_call_id(ctx, core),
             outcome: sample_tool_outcome(ctx),
+        },
+        "patch_preview_ready" => Event::PatchPreviewReady {
+            request: sample_request_id(ctx, core),
+            call_id: sample_call_id(ctx, core),
+            preview_hashes: vec![PreviewHash {
+                path: "pbt.txt".to_string(),
+                sha256: None,
+            }],
+            preview: PatchPreview {
+                target_paths: vec!["pbt.txt".to_string()],
+                added_lines: 1,
+                removed_lines: 0,
+                edit_count: 1,
+            },
+        },
+        "approve_patch" => Event::ApprovePatch {
+            call_id: sample_call_id(ctx, core),
+        },
+        "reject_patch" => Event::RejectPatch {
+            call_id: sample_call_id(ctx, core),
         },
         "transport_error" => Event::TransportError {
             request: sample_request_id(ctx, core),
