@@ -14,15 +14,16 @@
 //! - Spawning transport / tool-executor tasks and merging their output
 //!   into the [`AgentCore`] state machine
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tuinix::{
     EstimateCharWidth, Terminal, TerminalColor, TerminalFrame, TerminalInput, TerminalPosition,
@@ -32,14 +33,15 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::deepseek::{DeepSeekClient, StreamEvent, TransportError};
 use crate::sansio::agent::{
-    Action, AgentCore, Event, PatchInvocation, PatchPreview, PreviewHash, ReadOnlyTool, RequestId,
-    ToolExecutionError, ToolOutcome,
+    Action, AgentCore, CommandInvocation, CommandOutputStream, Event, PatchInvocation,
+    PatchPreview, PreviewHash, ReadOnlyTool, RequestId, ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::ChatRequest;
 use crate::sansio::tui::{
     self, Color, KeyCode, KeyEffect, KeyInput, Region, RenderedGrid, Style, StyledLine, UiState,
 };
 use crate::tools::ToolExecutor;
+use crate::tools::command::{CommandOutputMessage, run_command};
 
 /// Runtime configuration for the TUI.
 #[derive(Debug, Clone)]
@@ -72,12 +74,16 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
         draft: String::new(),
     };
     let mut agent = AgentCore::new();
+    agent.set_workspace_display(workspace.display().to_string());
     let mut shell = Shell {
         stream: None,
         error_banner: None,
         tool_handles: HashMap::new(),
         tool_executor,
         event_tx,
+        workspace: workspace.clone(),
+        active_command: None,
+        pending_commands: VecDeque::new(),
     };
     let mut size = terminal.size();
     let mut should_quit = false;
@@ -103,10 +109,20 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
                 match feedback {
                     Some(ToolFeedback::Result { request, call_id, outcome }) => {
                         shell.tool_handles.remove(&(request, call_id.clone()));
+                        on_command_finished(&mut shell, &call_id);
                         let actions = agent.handle_event(Event::ToolResult {
                             request,
                             call_id,
                             outcome,
+                        });
+                        apply_actions(&ui, actions, &client, &mut shell);
+                    }
+                    Some(ToolFeedback::CommandOutputChunk { request, call_id, stream, bytes }) => {
+                        let actions = agent.handle_event(Event::CommandOutputChunk {
+                            request,
+                            call_id,
+                            stream,
+                            bytes,
                         });
                         apply_actions(&ui, actions, &client, &mut shell);
                     }
@@ -237,6 +253,27 @@ struct Shell {
     tool_handles: HashMap<(RequestId, String), JoinHandle<()>>,
     tool_executor: Arc<ToolExecutor>,
     event_tx: mpsc::UnboundedSender<ToolFeedback>,
+    /// Workspace directory child processes are spawned in.
+    workspace: PathBuf,
+    /// The command currently running, if any. Additional
+    /// `ExecuteCommand` actions are queued in `pending_commands`
+    /// until this one drains.
+    active_command: Option<ActiveCommand>,
+    /// FIFO queue of command executions waiting on `active_command`.
+    pending_commands: VecDeque<PendingCommand>,
+}
+
+struct ActiveCommand {
+    request: RequestId,
+    call_id: String,
+    cancel: Arc<Notify>,
+    _task: JoinHandle<()>,
+}
+
+struct PendingCommand {
+    request: RequestId,
+    call_id: String,
+    invocation: CommandInvocation,
 }
 
 #[derive(Debug)]
@@ -256,6 +293,12 @@ enum ToolFeedback {
         request: RequestId,
         call_id: String,
         outcome: ToolOutcome,
+    },
+    CommandOutputChunk {
+        request: RequestId,
+        call_id: String,
+        stream: CommandOutputStream,
+        bytes: Vec<u8>,
     },
 }
 
@@ -281,6 +324,7 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                 shell.error_banner = None;
                 let mut tools = ReadOnlyTool::definitions();
                 tools.push(PatchInvocation::definition());
+                tools.push(CommandInvocation::definition());
                 let request = ChatRequest::new(ui.model.clone(), messages).with_tools(tools);
                 let rx = client.call(request);
                 shell.stream = Some(Stream { id, rx });
@@ -315,6 +359,7 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                         true
                     }
                 });
+                cancel_commands_for_request(shell, request);
             }
             Action::PreviewPatch {
                 request,
@@ -331,11 +376,20 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
             } => {
                 spawn_apply_patch(shell, request, call_id, invocation, preview_hashes);
             }
-            Action::ExecuteCommand { .. } => {
-                // Command executor wiring lands in a follow-up
-                // commit; CommandInvocation::definition() is not yet
-                // advertised on the wire, so the model cannot
-                // produce a command tool call in the meantime.
+            Action::ExecuteCommand {
+                request,
+                call_id,
+                invocation,
+            } => {
+                if shell.active_command.is_some() {
+                    shell.pending_commands.push_back(PendingCommand {
+                        request,
+                        call_id,
+                        invocation,
+                    });
+                } else {
+                    start_command(shell, request, call_id, invocation);
+                }
             }
             Action::ReportError { message } => {
                 shell.error_banner = Some(message);
@@ -396,6 +450,95 @@ fn spawn_apply_patch(
         });
     });
     shell.tool_handles.insert(key, handle);
+}
+
+fn start_command(
+    shell: &mut Shell,
+    request: RequestId,
+    call_id: String,
+    invocation: CommandInvocation,
+) {
+    let cancel = Arc::new(Notify::new());
+    let cancel_task = cancel.clone();
+    let cwd = shell.workspace.clone();
+    let tx = shell.event_tx.clone();
+    let call_id_for_stream = call_id.clone();
+    let call_id_for_result = call_id.clone();
+
+    // Forward the CommandOutputMessage stream from run_command into
+    // our ToolFeedback::CommandOutputChunk stream, then await the
+    // final result and send a single ToolFeedback::Result.
+    let task = tokio::spawn(async move {
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<CommandOutputMessage>();
+        let tx_forward = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(msg) = chunk_rx.recv().await {
+                let _ = tx_forward.send(ToolFeedback::CommandOutputChunk {
+                    request,
+                    call_id: call_id_for_stream.clone(),
+                    stream: msg.stream,
+                    bytes: msg.bytes,
+                });
+            }
+        });
+        let result = run_command(cwd, invocation, cancel_task, chunk_tx).await;
+        // Dropping chunk_tx above (goes out of scope with run_command
+        // returning) lets the forwarder loop exit; wait for it before
+        // reporting the result so ordering stays "chunks → result".
+        let _ = forwarder.await;
+        let outcome = match result {
+            Ok(res) => ToolOutcome::Ok(res.to_json_string()),
+            Err(err) => ToolOutcome::Err(ToolExecutionError::Command(
+                crate::sansio::agent::CommandError::SpawnFailed {
+                    message: err.to_string(),
+                },
+            )),
+        };
+        let _ = tx.send(ToolFeedback::Result {
+            request,
+            call_id: call_id_for_result,
+            outcome,
+        });
+    });
+
+    shell.active_command = Some(ActiveCommand {
+        request,
+        call_id: call_id.clone(),
+        cancel,
+        _task: task,
+    });
+    // Also track in tool_handles so that generic CancelToolExecution
+    // for the wider request can find and remove the entry.
+    // The task itself is owned by ActiveCommand; use a dummy no-op
+    // handle here.
+    // (No JoinHandle stored here — real join lives in ActiveCommand.)
+    let _ = call_id;
+}
+
+fn on_command_finished(shell: &mut Shell, call_id: &str) {
+    if shell
+        .active_command
+        .as_ref()
+        .is_some_and(|c| c.call_id == call_id)
+    {
+        shell.active_command = None;
+        if let Some(next) = shell.pending_commands.pop_front() {
+            start_command(shell, next.request, next.call_id, next.invocation);
+        }
+    }
+}
+
+fn cancel_commands_for_request(shell: &mut Shell, request: RequestId) {
+    if let Some(active) = shell.active_command.as_ref()
+        && active.request == request
+    {
+        active.cancel.notify_one();
+    }
+    // Discard any queued commands whose request no longer matters.
+    // Their absence will naturally surface as "no ToolResult for this
+    // call_id" — but core's CancelToolExecution already dropped the
+    // entire pending, so they will not be looked up.
+    shell.pending_commands.retain(|p| p.request != request);
 }
 
 fn translate_stream_event(event: StreamEvent, request: RequestId) -> Vec<Event> {
