@@ -5,8 +5,8 @@
 //! contract holds after every step.
 
 use attini::sansio::agent::{
-    Action, AgentCore, Event, PatchPreview, PreviewHash, RequestId, Status, ToolExecutionError,
-    ToolOutcome,
+    Action, AgentCore, CommandOutputStream, Event, PatchPreview, PreviewHash, RequestId, Status,
+    ToolExecutionError, ToolOutcome,
 };
 use attini::sansio::deepseek::ChatMessage;
 
@@ -93,9 +93,11 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             "reasoning_delta",
             "tool_call_delta",
             "patch_call_delta",
+            "command_call_delta",
             "finish",
             "tool_result",
             "patch_preview_ready",
+            "command_output_chunk",
             "approve_patch",
             "reject_patch",
             "transport_error",
@@ -143,6 +145,15 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
                 r#"{"edits":[{"kind":"add","path":"pbt.txt","content":"hi"}]}"#.to_string(),
             ),
         },
+        "command_call_delta" => Event::ToolCallDelta {
+            request: sample_request_id(ctx, core),
+            index: noprop::sample_usize_in(ctx, 0..=3) as u64,
+            id: Some(format!("cmd_{}", noprop::sample_usize_in(ctx, 0..=4))),
+            function_name: Some("command".to_string()),
+            arguments_fragment: Some(
+                r#"{"command_line":"echo pbt","timeout_seconds":5}"#.to_string(),
+            ),
+        },
         "finish" => Event::Finish {
             request: sample_request_id(ctx, core),
             reason: sample_finish_reason(ctx),
@@ -151,6 +162,16 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             request: sample_request_id(ctx, core),
             call_id: sample_call_id(ctx, core),
             outcome: sample_tool_outcome(ctx),
+        },
+        "command_output_chunk" => Event::CommandOutputChunk {
+            request: sample_request_id(ctx, core),
+            call_id: sample_call_id(ctx, core),
+            stream: if noprop::sample_bool(ctx) {
+                CommandOutputStream::Stdout
+            } else {
+                CommandOutputStream::Stderr
+            },
+            bytes: sample_string(ctx).into_bytes(),
         },
         "patch_preview_ready" => Event::PatchPreviewReady {
             request: sample_request_id(ctx, core),
