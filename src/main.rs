@@ -1,8 +1,10 @@
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
+use attini::rpc::{self, RpcConfig};
 use attini::sansio::deepseek::{ChatMessage, ChatRequest};
 use attini::tui::{self, TuiConfig};
 use tokio::sync::mpsc;
@@ -58,10 +60,77 @@ async fn run() -> Result<(), RunError> {
 
     try_run_chat(&mut args).await?;
     try_run_tui(&mut args).await?;
+    try_run_rpc(&mut args).await?;
 
     if let Some(help) = args.finish()? {
         print!("{help}");
     }
+    Ok(())
+}
+
+async fn try_run_rpc(args: &mut noargs::RawArgs) -> Result<(), RunError> {
+    if !noargs::cmd("rpc")
+        .doc("Launch a JSON-RPC 2.0 control server (headless; TCP loopback only)")
+        .take(args)
+        .is_present()
+    {
+        return Ok(());
+    }
+
+    let listen_addr: SocketAddr = noargs::opt("listen")
+        .ty("ADDR")
+        .doc("TCP address to bind (e.g. 127.0.0.1:0 for OS-assigned port)")
+        .example("127.0.0.1:0")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let model: String = noargs::opt("model")
+        .ty("NAME")
+        .doc("Model name")
+        .default(DEFAULT_MODEL)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let transcript_path: Option<PathBuf> = noargs::opt("transcript")
+        .ty("PATH")
+        .doc("Append session records as JSON Lines to this file")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<PathBuf>())?;
+    let metrics_snapshot_interval_secs: Option<u64> = noargs::opt("metrics-snapshot-interval")
+        .ty("SECONDS")
+        .doc("Emit a metrics_snapshot record to the transcript every N seconds (requires --transcript)")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
+
+    if args.metadata().help_mode {
+        return Ok(());
+    }
+
+    let metrics_snapshot_interval = match metrics_snapshot_interval_secs {
+        Some(0) => {
+            return Err(RunError::Runtime(
+                "--metrics-snapshot-interval must be at least 1 second".to_string(),
+            ));
+        }
+        Some(n) => {
+            if transcript_path.is_none() {
+                return Err(RunError::Runtime(
+                    "--metrics-snapshot-interval requires --transcript".to_string(),
+                ));
+            }
+            Some(std::time::Duration::from_secs(n))
+        }
+        None => None,
+    };
+
+    let client = DeepSeekClient::from_env()?;
+    let config = RpcConfig {
+        model,
+        listen_addr,
+        transcript_path,
+        metrics_snapshot_interval,
+    };
+    rpc::server::run(client, config)
+        .await
+        .map_err(|err| RunError::Runtime(err.to_string()))?;
     Ok(())
 }
 

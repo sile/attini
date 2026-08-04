@@ -46,7 +46,7 @@ use crate::tools::ToolExecutor;
 use crate::tools::command::{CommandOutputMessage, run_command};
 use crate::tui::transcript::{
     ApprovalDecision, AssistantToolCall, CommandStream, MetricsCounters, SessionEndReason,
-    TranscriptRecord, TranscriptWriter, now_unix_millis,
+    ToolKind, TranscriptRecord, TranscriptWriter, now_unix_millis,
 };
 
 /// Runtime configuration for the TUI.
@@ -114,6 +114,8 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
         pending_commands: VecDeque::new(),
         transcript,
         conversation_len: 0,
+        last_pending_approval: None,
+        tool_call_kinds: HashMap::new(),
     };
     let mut metrics_interval = config.metrics_snapshot_interval.map(tokio::time::interval);
 
@@ -286,6 +288,7 @@ fn dispatch(
     }
     let actions = agent.handle_event(event);
     emit_conversation_records(shell, agent);
+    emit_pending_approval(shell, agent);
     apply_actions(ui, actions, client, shell);
 }
 
@@ -339,12 +342,19 @@ fn emit_conversation_records(shell: &mut Shell, agent: &AgentCore) {
                 content,
                 reasoning_content,
                 tool_calls,
-            } => TranscriptRecord::AssistantMessage {
-                ts: now_unix_millis(),
-                content: content.clone(),
-                reasoning: reasoning_content.clone(),
-                tool_calls: tool_calls.iter().map(from_wire_tool_call).collect(),
-            },
+            } => {
+                for tc in tool_calls {
+                    if let Some(kind) = to_tool_kind(&tc.function_name) {
+                        shell.tool_call_kinds.insert(tc.id.clone(), kind);
+                    }
+                }
+                TranscriptRecord::AssistantMessage {
+                    ts: now_unix_millis(),
+                    content: content.clone(),
+                    reasoning: reasoning_content.clone(),
+                    tool_calls: tool_calls.iter().map(from_wire_tool_call).collect(),
+                }
+            }
             ChatMessage::Tool {
                 tool_call_id,
                 content,
@@ -358,6 +368,37 @@ fn emit_conversation_records(shell: &mut Shell, agent: &AgentCore) {
             ChatMessage::System(_) => continue,
         };
         transcript_send(shell, record);
+    }
+}
+
+fn emit_pending_approval(shell: &mut Shell, agent: &AgentCore) {
+    let current = agent.view().pending_approval_call_id.clone();
+    if shell.last_pending_approval == current {
+        return;
+    }
+    shell.last_pending_approval = current.clone();
+    if let Some(call_id) = current {
+        let tool_kind = shell
+            .tool_call_kinds
+            .get(&call_id)
+            .copied()
+            .unwrap_or(ToolKind::Patch);
+        transcript_send(
+            shell,
+            TranscriptRecord::ToolApprovalRequired {
+                ts: now_unix_millis(),
+                call_id,
+                tool_kind,
+            },
+        );
+    }
+}
+
+fn to_tool_kind(function_name: &str) -> Option<ToolKind> {
+    match function_name {
+        "patch" => Some(ToolKind::Patch),
+        "command" => Some(ToolKind::Command),
+        _ => None,
     }
 }
 
@@ -446,6 +487,15 @@ struct Shell {
     /// `ChatMessage`s so they can be turned into transcript records
     /// without a core-side hook.
     conversation_len: usize,
+    /// Last observed value of `AgentView::pending_approval_call_id`.
+    /// A change to `Some(new_call_id)` triggers a
+    /// `ToolApprovalRequired` transcript record.
+    last_pending_approval: Option<String>,
+    /// Map from tool_call.id to its `ToolKind` (patch / command),
+    /// derived by scanning finalised `ChatMessage::Assistant`
+    /// tool_calls. Consulted when a pending approval is detected
+    /// to populate `ToolApprovalRequired.tool_kind`.
+    tool_call_kinds: HashMap<String, ToolKind>,
 }
 
 struct ActiveCommand {
