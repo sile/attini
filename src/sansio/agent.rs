@@ -791,10 +791,13 @@ pub enum Action {
     },
     /// User approved the patch preview; apply the 2-phase writeback
     /// using `preview_hashes` to detect concurrent modifications
-    /// between preview and apply.
+    /// between preview and apply. `invocation` is re-parsed from the
+    /// tool call arguments so the shell does not need to cache it
+    /// between preview and approval.
     ApplyPatch {
         request: RequestId,
         call_id: String,
+        invocation: PatchInvocation,
         preview_hashes: Vec<PreviewHash>,
     },
     /// Abort any tool executions that were dispatched for `request`
@@ -1524,12 +1527,25 @@ impl AgentCore {
         };
         entry.approval = ApprovalState::Approved;
         let preview_hashes = entry.preview_hashes.clone();
+        // Re-parse the arguments captured at on_finish. Parse cannot
+        // fail here because on_finish already accepted it, but treat
+        // an error as a synthetic Rejected to keep the loop moving.
+        let invocation = match PatchInvocation::parse(&entry.arguments_json) {
+            Ok(inv) => inv,
+            Err(err) => {
+                entry.outcome = Some(ToolOutcome::Err(err));
+                self.metrics.patch_approvals_committed.inc();
+                self.recompute_phase_and_status();
+                return self.maybe_advance_to_next_request();
+            }
+        };
         self.metrics.patch_approvals_committed.inc();
         self.recompute_phase_and_status();
         vec![
             Action::ApplyPatch {
                 request: request_id,
                 call_id,
+                invocation,
                 preview_hashes,
             },
             Action::Redraw,
@@ -1565,10 +1581,14 @@ impl AgentCore {
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
+        // A patch is only "still waiting for approval" while its
+        // outcome has not been committed. If the shell fails preview
+        // and short-circuits to Err via ToolResult, the call is done
+        // regardless of the `approval` field.
         let has_pending_approval = pending
             .tool_results
             .iter()
-            .any(|r| r.approval == ApprovalState::Pending);
+            .any(|r| r.approval == ApprovalState::Pending && r.outcome.is_none());
         match (pending.phase, has_pending_approval) {
             (PendingPhase::Streaming, _) => {}
             (_, true) => {

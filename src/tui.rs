@@ -31,7 +31,10 @@ use tuinix::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::deepseek::{DeepSeekClient, StreamEvent, TransportError};
-use crate::sansio::agent::{Action, AgentCore, Event, RequestId, ToolOutcome};
+use crate::sansio::agent::{
+    Action, AgentCore, Event, PatchInvocation, PatchPreview, PreviewHash, ReadOnlyTool, RequestId,
+    ToolExecutionError, ToolOutcome,
+};
 use crate::sansio::deepseek::ChatRequest;
 use crate::sansio::tui::{
     self, Color, KeyCode, KeyEffect, KeyInput, Region, RenderedGrid, Style, StyledLine, UiState,
@@ -99,6 +102,29 @@ pub async fn run(client: DeepSeekClient, config: TuiConfig) -> io::Result<()> {
             feedback = event_rx.recv() => {
                 match feedback {
                     Some(ToolFeedback::Result { request, call_id, outcome }) => {
+                        shell.tool_handles.remove(&(request, call_id.clone()));
+                        let actions = agent.handle_event(Event::ToolResult {
+                            request,
+                            call_id,
+                            outcome,
+                        });
+                        apply_actions(&ui, actions, &client, &mut shell);
+                    }
+                    Some(ToolFeedback::PatchPreviewReady { request, call_id, preview_hashes, preview }) => {
+                        shell.tool_handles.remove(&(request, call_id.clone()));
+                        let actions = agent.handle_event(Event::PatchPreviewReady {
+                            request,
+                            call_id,
+                            preview_hashes,
+                            preview,
+                        });
+                        apply_actions(&ui, actions, &client, &mut shell);
+                    }
+                    Some(ToolFeedback::PatchPreviewFailed { request, call_id, outcome }) => {
+                        // Preview itself failed (e.g. workspace boundary,
+                        // no match). Feed it back as an immediate tool
+                        // result so the model sees the error without
+                        // going through approval.
                         shell.tool_handles.remove(&(request, call_id.clone()));
                         let actions = agent.handle_event(Event::ToolResult {
                             request,
@@ -220,6 +246,17 @@ enum ToolFeedback {
         call_id: String,
         outcome: ToolOutcome,
     },
+    PatchPreviewReady {
+        request: RequestId,
+        call_id: String,
+        preview_hashes: Vec<PreviewHash>,
+        preview: PatchPreview,
+    },
+    PatchPreviewFailed {
+        request: RequestId,
+        call_id: String,
+        outcome: ToolOutcome,
+    },
 }
 
 struct Stream {
@@ -242,8 +279,9 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                 // keeps handle_key pure and pins the reset to "a new
                 // request just started" instead of "Enter was pressed".
                 shell.error_banner = None;
-                let request = ChatRequest::new(ui.model.clone(), messages)
-                    .with_tools(crate::sansio::agent::ReadOnlyTool::definitions());
+                let mut tools = ReadOnlyTool::definitions();
+                tools.push(PatchInvocation::definition());
+                let request = ChatRequest::new(ui.model.clone(), messages).with_tools(tools);
                 let rx = client.call(request);
                 shell.stream = Some(Stream { id, rx });
             }
@@ -278,13 +316,20 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
                     }
                 });
             }
-            Action::PreviewPatch { .. } | Action::ApplyPatch { .. } => {
-                // Patch executor wiring lands in a follow-up commit;
-                // without it, a turn containing a patch call stays
-                // parked in `AwaitingApproval` forever. Guarded by
-                // the fact that PatchInvocation::definition() is not
-                // yet advertised on the wire, so the model cannot
-                // produce a patch tool call in the meantime.
+            Action::PreviewPatch {
+                request,
+                call_id,
+                invocation,
+            } => {
+                spawn_preview_patch(shell, request, call_id, invocation);
+            }
+            Action::ApplyPatch {
+                request,
+                call_id,
+                invocation,
+                preview_hashes,
+            } => {
+                spawn_apply_patch(shell, request, call_id, invocation, preview_hashes);
             }
             Action::ReportError { message } => {
                 shell.error_banner = Some(message);
@@ -292,6 +337,59 @@ fn apply_actions(ui: &UiState, actions: Vec<Action>, client: &DeepSeekClient, sh
             Action::Redraw => {}
         }
     }
+}
+
+fn spawn_preview_patch(
+    shell: &mut Shell,
+    request: RequestId,
+    call_id: String,
+    invocation: PatchInvocation,
+) {
+    let exec = shell.tool_executor.clone();
+    let tx = shell.event_tx.clone();
+    let key = (request, call_id.clone());
+    let handle = tokio::task::spawn_blocking(move || match exec.preview_patch(&invocation) {
+        Ok((preview_hashes, preview)) => {
+            let _ = tx.send(ToolFeedback::PatchPreviewReady {
+                request,
+                call_id,
+                preview_hashes,
+                preview,
+            });
+        }
+        Err(err) => {
+            let _ = tx.send(ToolFeedback::PatchPreviewFailed {
+                request,
+                call_id,
+                outcome: ToolOutcome::Err(ToolExecutionError::Patch(err)),
+            });
+        }
+    });
+    shell.tool_handles.insert(key, handle);
+}
+
+fn spawn_apply_patch(
+    shell: &mut Shell,
+    request: RequestId,
+    call_id: String,
+    invocation: PatchInvocation,
+    preview_hashes: Vec<PreviewHash>,
+) {
+    let exec = shell.tool_executor.clone();
+    let tx = shell.event_tx.clone();
+    let key = (request, call_id.clone());
+    let handle = tokio::task::spawn_blocking(move || {
+        let outcome = match exec.apply_patch(&invocation, &preview_hashes) {
+            Ok(_) => ToolOutcome::Ok(r#"{"applied":true}"#.to_string()),
+            Err(err) => ToolOutcome::Err(ToolExecutionError::Patch(err)),
+        };
+        let _ = tx.send(ToolFeedback::Result {
+            request,
+            call_id,
+            outcome,
+        });
+    });
+    shell.tool_handles.insert(key, handle);
 }
 
 fn translate_stream_event(event: StreamEvent, request: RequestId) -> Vec<Event> {
