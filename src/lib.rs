@@ -8,7 +8,6 @@
 
 pub mod deepseek;
 pub mod metrics;
-pub mod rpc;
 pub mod sansio;
 pub mod tools;
 pub mod tui;

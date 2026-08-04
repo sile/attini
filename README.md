@@ -62,29 +62,6 @@ attini chat [--model NAME] [--system TEXT] [--show-reasoning] "<PROMPT>"
 
 Streams the response to stdout. The tool loop is not run.
 
-### JSON-RPC control server
-
-```sh
-attini rpc --listen 127.0.0.1:0 [--model NAME] [--transcript PATH] [--metrics-snapshot-interval SECONDS]
-```
-
-Runs a headless JSON-RPC 2.0 server on the given TCP address. Line-delimited
-JSON in / line-delimited JSON out; loopback only (no auth). At most one
-concurrent client; a second connection is closed immediately.
-
-On bind the actually-bound address is printed on stdout as one JSON line, so
-`--listen 127.0.0.1:0` (OS-assigned port, useful for tests) can be
-programmatically read back:
-
-```
-{"rpc_bound_addr":"127.0.0.1:54321"}
-```
-
-Method / notification set is documented in
-`issues/attini/closed/0019-add-jsonrpc-control-interface.md` (once merged).
-Real API is required (needs `DEEPSEEK_API_KEY`) because RPC drives the same
-tool loop the TUI drives.
-
 ### Model selection
 
 - Default model: `deepseek-v4-flash` (override with `--model`)
