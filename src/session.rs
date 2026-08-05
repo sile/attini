@@ -46,6 +46,11 @@ impl Session {
     pub fn open(name: &str) -> io::Result<Self> {
         let paths = session_paths(name)?;
         fs::create_dir_all(&paths.dir)?;
+        // Layer 2 free-write zone. Errors here surface as Session::open
+        // failure: scratchpad is a hard prerequisite of the patch tool's
+        // always-allow rule, so `warn + skip` would leave the invariant
+        // silently broken.
+        fs::create_dir_all(&paths.scratchpad)?;
         let lock = acquire_lock_with_stale_retry(name, &paths.lock)?;
         let writer = OpenOptions::new()
             .create(true)
@@ -277,6 +282,11 @@ pub struct SessionPaths {
     pub conversation: PathBuf,
     pub pending: PathBuf,
     pub lock: PathBuf,
+    /// Agent-writable free zone (`.attini/{NAME}/scratchpad/`). The
+    /// patch tool's Layer 2 always-allow rule covers everything under
+    /// this directory regardless of git status; `Session::open`
+    /// auto-creates it so the agent can rely on its existence.
+    pub scratchpad: PathBuf,
 }
 
 /// Root directory (`.attini/`) that holds every session in the CWD.
@@ -304,6 +314,7 @@ pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
         conversation: dir.join("conversation.jsonl"),
         pending: dir.join("pending.json"),
         lock: dir.join("LOCK"),
+        scratchpad: dir.join("scratchpad"),
         dir,
     })
 }

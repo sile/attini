@@ -568,6 +568,26 @@ pub enum PatchError {
     UpdateOnMissingFile { path: String },
     /// The resolved canonical path escapes the workspace root.
     OutsideWorkspace { path: String },
+    /// Layer 1 hardcoded reject: the target is a runtime-critical file
+    /// (`.git/**`, `.attini/*/{LOCK,conversation.jsonl,...}`,
+    /// `.attini/{permissions.json,memories.md}`) regardless of git
+    /// tracking status. `reason` is a short human-readable classifier
+    /// (`"git metadata"`, `"session runtime state"`, etc.) embedded in
+    /// the message; it is not exposed as a separate JSON field.
+    ExcludedPath { path: String, reason: String },
+    /// Layer 3 Update reject: the target is not present in the
+    /// startup-captured git tracked set (nor added by an earlier
+    /// successful Add in the same invocation). Writing would be
+    /// irrecoverable, so the write is refused.
+    UntrackedTarget { path: String },
+    /// Layer 3 Add reject: the parent directory of the new file is
+    /// under a gitignored region, indicating an area the user has
+    /// declared out-of-scope for the repo.
+    IgnoredParent { path: String },
+    /// Layer 4 reject: the workspace is not inside a git repository,
+    /// so Layer 3 cannot judge. Layer 1/2 still apply; writes outside
+    /// scratchpad are refused as the safe default.
+    NotInGitRepo { path: String },
     /// `edits.len()` exceeded [`PATCH_MAX_EDITS`].
     TooManyEdits { count: u64 },
     /// Two edits within the same call named the same target path.
@@ -619,6 +639,24 @@ impl PatchError {
             Self::OutsideWorkspace { path } => (
                 "patch_outside_workspace",
                 format!("target path {path} escapes the workspace root"),
+            ),
+            Self::ExcludedPath { path, reason } => (
+                "patch_excluded_path",
+                format!("path is runtime-critical ({reason}): {path}"),
+            ),
+            Self::UntrackedTarget { path } => (
+                "patch_untracked_target",
+                format!("cannot update git-untracked file (would be irrecoverable): {path}"),
+            ),
+            Self::IgnoredParent { path } => (
+                "patch_ignored_parent",
+                format!("cannot add into git-ignored directory: {path}"),
+            ),
+            Self::NotInGitRepo { path } => (
+                "patch_not_in_git_repo",
+                format!(
+                    "workspace is not a git repository; patch refused outside scratchpad: {path}"
+                ),
             ),
             Self::TooManyEdits { count } => (
                 "patch_too_many_edits",
