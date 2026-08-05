@@ -11,13 +11,17 @@ use std::time::{Duration, Instant};
 use nojson::DisplayJson;
 
 use crate::curl::{self, ProgressSinks};
+use crate::permissions::{self, LoadedRules};
 use crate::sansio::agent::{
     CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool, ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
+use crate::sansio::permissions::{
+    AutoDecision, Judgment, Mode, evaluate, has_shell_operator, tokenize,
+};
 use crate::session::{
-    ApprovalDecision, InvocationEndReason, MetricsSnapshotBody, Pending, PendingToolKind, Session,
-    SessionRecord, now_unix_millis,
+    ApprovalDecision, AutoDecidedBy, InvocationEndReason, MetricsSnapshotBody, Pending,
+    PendingToolKind, Session, SessionRecord, now_unix_millis,
 };
 use crate::tools::ToolExecutor;
 
@@ -34,6 +38,7 @@ pub struct AgentConfig {
     pub system_prompt: Option<String>,
     pub show_reasoning: bool,
     pub max_turns: usize,
+    pub mode: Mode,
 }
 
 pub enum Continuation {
@@ -112,6 +117,7 @@ fn drive(
                 ts: now_unix_millis(),
                 call_id: pending.call_id.clone(),
                 decision: ApprovalDecision::Approve,
+                auto_decided_by: None,
             })?;
             let content = execute_pending(&pending, executor)?;
             append_tool(session, &mut messages, &pending.call_id, content)?;
@@ -123,6 +129,7 @@ fn drive(
                 ts: now_unix_millis(),
                 call_id: pending.call_id.clone(),
                 decision: ApprovalDecision::Reject,
+                auto_decided_by: None,
             })?;
             let content = r#"{"error":"rejected","message":"user rejected this tool call"}"#;
             append_tool(
@@ -135,7 +142,8 @@ fn drive(
         }
     }
 
-    let tools = build_tool_defs();
+    let tools = build_tool_defs(cfg.mode);
+    let rules = permissions::load(&cfg.session_name)?;
 
     for _ in 0..cfg.max_turns {
         let request =
@@ -184,11 +192,11 @@ fn drive(
                     return Ok(Driven::AwaitingApproval);
                 }
                 ToolKind::Command => {
-                    let preview_text = render_command_preview(tc)?;
-                    eprintln!("[command] approval required");
-                    eprintln!("{preview_text}");
-                    save_pending(session, tc, PendingToolKind::Command, preview_text)?;
-                    return Ok(Driven::AwaitingApproval);
+                    match dispatch_command(tc, executor, cfg.mode, &rules, session, &mut messages)?
+                    {
+                        CommandDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
+                        CommandDispatch::Continue => {}
+                    }
                 }
                 ToolKind::Unknown => {
                     let content = tool_error_json(
@@ -217,11 +225,170 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
     Ok(messages)
 }
 
-fn build_tool_defs() -> Vec<ToolDef> {
+fn build_tool_defs(mode: Mode) -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
-    defs.push(PatchInvocation::definition());
+    if !matches!(mode, Mode::Plan) {
+        defs.push(PatchInvocation::definition());
+    }
     defs.push(CommandInvocation::definition());
     defs
+}
+
+enum CommandDispatch {
+    Awaiting,
+    Continue,
+}
+
+fn dispatch_command(
+    tc: &ToolCall,
+    executor: &ToolExecutor,
+    mode: Mode,
+    rules: &LoadedRules,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+) -> io::Result<CommandDispatch> {
+    let inv = match CommandInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            let content = tool_error_json("command_args", &format!("{err:?}"));
+            eprintln!("[command] parse err: {err:?}");
+            append_tool(session, messages, &tc.id, content)?;
+            return Ok(CommandDispatch::Continue);
+        }
+    };
+    let judgment = evaluate(mode, &rules.session, &rules.workspace, &inv.command_line);
+    match judgment {
+        Judgment::AutoApprove(dec) => {
+            eprintln!(
+                "[command] auto-approve via {} rule '{}': {}",
+                dec.scope.as_str(),
+                dec.prefix,
+                inv.command_line
+            );
+            append_auto_approval(session, &tc.id, ApprovalDecision::Approve, &dec)?;
+            let content = run_command_sync(&inv, executor)?;
+            append_tool(session, messages, &tc.id, content)?;
+            Ok(CommandDispatch::Continue)
+        }
+        Judgment::AutoDeny(dec) => {
+            eprintln!(
+                "[command] auto-deny via {} rule '{}': {}",
+                dec.scope.as_str(),
+                dec.prefix,
+                inv.command_line
+            );
+            append_auto_approval(session, &tc.id, ApprovalDecision::Reject, &dec)?;
+            let content = tool_error_json(
+                "denied_by_rule",
+                &format!(
+                    "auto-denied by {} rule prefix '{}'",
+                    dec.scope.as_str(),
+                    dec.prefix
+                ),
+            );
+            append_tool(session, messages, &tc.id, content)?;
+            Ok(CommandDispatch::Continue)
+        }
+        Judgment::PlanReject { reason } => {
+            eprintln!(
+                "[command] plan_mode reject ({}): {}",
+                reason.as_str(),
+                inv.command_line
+            );
+            let sidecar = AutoDecidedBy {
+                scope: "plan".to_string(),
+                prefix: String::new(),
+                reason: format!("plan_mode_reject:{}", reason.as_str()),
+            };
+            session.append(&SessionRecord::ToolApproval {
+                ts: now_unix_millis(),
+                call_id: tc.id.clone(),
+                decision: ApprovalDecision::Reject,
+                auto_decided_by: Some(sidecar),
+            })?;
+            let content = tool_error_json(
+                "plan_mode",
+                &format!(
+                    "plan mode: command rejected ({}). drop --plan to run manually.",
+                    reason.as_str()
+                ),
+            );
+            append_tool(session, messages, &tc.id, content)?;
+            Ok(CommandDispatch::Continue)
+        }
+        Judgment::Pending => {
+            let preview_text = render_command_preview_from(&inv);
+            let hit_safety = has_shell_operator(&inv.command_line);
+            eprintln!("[command] approval required");
+            eprintln!("{preview_text}");
+            emit_suggested_rule(&inv.command_line, hit_safety);
+            save_pending(session, tc, PendingToolKind::Command, preview_text)?;
+            Ok(CommandDispatch::Awaiting)
+        }
+    }
+}
+
+fn append_auto_approval(
+    session: &mut Session,
+    call_id: &str,
+    decision: ApprovalDecision,
+    dec: &AutoDecision,
+) -> io::Result<()> {
+    let sidecar = AutoDecidedBy {
+        scope: dec.scope.as_str().to_string(),
+        prefix: dec.prefix.clone(),
+        reason: dec.reason.as_str().to_string(),
+    };
+    session.append(&SessionRecord::ToolApproval {
+        ts: now_unix_millis(),
+        call_id: call_id.to_string(),
+        decision,
+        auto_decided_by: Some(sidecar),
+    })
+}
+
+fn emit_suggested_rule(command_line: &str, hit_safety: bool) {
+    if hit_safety {
+        eprintln!(
+            "note: contains shell operator; cannot be pre-approved via `attini session grant`."
+        );
+        return;
+    }
+    let tokens = tokenize(command_line);
+    if tokens.is_empty() {
+        return;
+    }
+    let take = tokens.len().min(2);
+    let prefix_display = tokens[..take]
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let quoted = shell_single_quote(&prefix_display);
+    eprintln!("suggested rule (persist separately after approve):");
+    eprintln!("  attini session grant {quoted}                # session-local");
+    eprintln!("  attini session grant {quoted} --workspace    # workspace-wide");
+}
+
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn render_command_preview_from(inv: &CommandInvocation) -> String {
+    format!(
+        "command preview: `{}` (timeout {}s)",
+        inv.command_line, inv.timeout_seconds
+    )
 }
 
 enum ToolKind {
@@ -316,15 +483,6 @@ fn render_patch_preview_text(p: &PatchPreview) -> String {
         out.push_str(path);
     }
     out
-}
-
-fn render_command_preview(tc: &ToolCall) -> io::Result<String> {
-    let inv = CommandInvocation::parse(&tc.arguments_json)
-        .map_err(|e| io::Error::other(format!("command args: {e:?}")))?;
-    Ok(format!(
-        "command preview: `{}` (timeout {}s)",
-        inv.command_line, inv.timeout_seconds
-    ))
 }
 
 fn save_pending(
