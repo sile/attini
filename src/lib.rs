@@ -8,6 +8,7 @@
 
 pub mod agent_cli;
 pub mod curl;
+pub mod memories;
 pub mod metrics;
 pub mod permissions;
 pub mod sansio;

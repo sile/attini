@@ -218,6 +218,9 @@ fn drive(
 
 fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
+    if let Some(mem) = crate::memories::load(&cfg.session_name)? {
+        messages.push(ChatMessage::System(mem));
+    }
     if let Some(sys) = &cfg.system_prompt {
         messages.push(ChatMessage::System(sys.clone()));
     }
