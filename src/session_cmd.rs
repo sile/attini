@@ -158,8 +158,8 @@ fn print_summary(s: &ConversationSummary) {
         s.user_messages, s.assistant_messages, s.tool_messages, s.assistant_tool_calls_total,
     );
     println!(
-        "  approvals: approve={} reject={}",
-        s.approvals_approve, s.approvals_reject
+        "  approvals: approve={} reject={} (auto_approve={} auto_deny={})",
+        s.approvals_approve, s.approvals_reject, s.approvals_auto_approve, s.approvals_auto_deny,
     );
     match (s.last_ts, &s.last_kind) {
         (Some(ts), Some(kind)) => println!("  last_record: ts={ts} kind={kind}"),

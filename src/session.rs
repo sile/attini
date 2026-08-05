@@ -215,6 +215,13 @@ pub struct ConversationSummary {
     pub tool_messages: u64,
     pub approvals_approve: u64,
     pub approvals_reject: u64,
+    /// Subset of `approvals_approve` whose record has an
+    /// `auto_decided_by` sidecar (rule-driven auto approval).
+    pub approvals_auto_approve: u64,
+    /// Subset of `approvals_reject` whose record has an
+    /// `auto_decided_by` sidecar (rule-driven auto deny or
+    /// plan-mode reject).
+    pub approvals_auto_deny: u64,
 }
 
 /// Walk `conversation.jsonl` and produce a summary. Missing file →
@@ -287,9 +294,24 @@ fn classify_record(line: &str, out: &mut ConversationSummary) -> Result<(), Stri
                 .and_then(|m| m.required())
                 .and_then(|m| m.to_unquoted_string_str())
                 .map_err(|e| e.to_string())?;
+            let has_auto_sidecar = value
+                .to_member("auto_decided_by")
+                .ok()
+                .and_then(|m| m.optional())
+                .is_some();
             match decision.as_ref() {
-                "approve" => out.approvals_approve += 1,
-                "reject" => out.approvals_reject += 1,
+                "approve" => {
+                    out.approvals_approve += 1;
+                    if has_auto_sidecar {
+                        out.approvals_auto_approve += 1;
+                    }
+                }
+                "reject" => {
+                    out.approvals_reject += 1;
+                    if has_auto_sidecar {
+                        out.approvals_auto_deny += 1;
+                    }
+                }
                 _ => {}
             }
         }
@@ -532,6 +554,10 @@ pub enum SessionRecord {
         ts: u64,
         call_id: String,
         decision: ApprovalDecision,
+        /// `Some` when the decision was made automatically (rule
+        /// match or plan-mode reject); `None` for user `--approve`
+        /// / `--reject`. Serialised as an optional sidecar object.
+        auto_decided_by: Option<AutoDecidedBy>,
     },
     /// Snapshot of transport / agent metric counters. Emitted
     /// once at invocation end.
@@ -575,6 +601,25 @@ impl ApprovalDecision {
             Self::Approve => "approve",
             Self::Reject => "reject",
         }
+    }
+}
+
+/// Sidecar attached to `SessionRecord::ToolApproval` when the
+/// decision was made automatically (rule match or plan-mode reject).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoDecidedBy {
+    pub scope: String,
+    pub prefix: String,
+    pub reason: String,
+}
+
+impl DisplayJson for AutoDecidedBy {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("scope", &self.scope)?;
+            f.member("prefix", &self.prefix)?;
+            f.member("reason", &self.reason)
+        })
     }
 }
 
@@ -646,11 +691,16 @@ impl DisplayJson for SessionRecord {
                 ts,
                 call_id,
                 decision,
+                auto_decided_by,
             } => f.object(|f| {
                 f.member("kind", "tool_approval")?;
                 f.member("ts", ts)?;
                 f.member("call_id", call_id)?;
-                f.member("decision", decision.as_str())
+                f.member("decision", decision.as_str())?;
+                if let Some(by) = auto_decided_by {
+                    f.member("auto_decided_by", by)?;
+                }
+                Ok(())
             }),
             Self::MetricsSnapshot { ts, counters } => f.object(|f| {
                 f.member("kind", "metrics_snapshot")?;
