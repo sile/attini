@@ -393,7 +393,7 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunErr
             "Read-only path prefix to grant. Workspace-relative or absolute; \
              stored as-given and canonicalised on load.",
         )
-        .example("../issues/attini/")
+        .example("../shared-docs/")
         .take(args)
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
@@ -424,7 +424,7 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunErr
 
 fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if !noargs::cmd("grant")
-        .doc("Append an auto-approve permissions rule to permissions.jsonc")
+        .doc("Append an auto-approve permissions rule to permissions.json")
         .take(args)
         .is_present()
     {
@@ -433,12 +433,12 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
-        .doc("Session name; writes to .attini/<NAME>/permissions.jsonc")
+        .doc("Session name; writes to .attini/<NAME>/permissions.json")
         .default("main")
         .take(args)
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
-        .doc("Write to workspace-wide .attini/permissions.jsonc instead of session-local (mutually exclusive with -s / --session)")
+        .doc("Write to workspace-wide .attini/permissions.json instead of session-local (mutually exclusive with -s / --session)")
         .take(args)
         .is_present();
     let prefix: String = noargs::arg("<PREFIX>")

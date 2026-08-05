@@ -292,7 +292,7 @@ fn apply_add_on_existing_rejects_at_phase1() {
 }
 
 // -----------------------------------------------------------------
-// 0037: patch tool must ignore extra_read_roots
+// patch tool must ignore extra_read_roots
 // -----------------------------------------------------------------
 
 #[test]

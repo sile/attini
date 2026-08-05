@@ -364,7 +364,7 @@ fn search_absolute_prefix_is_rejected() {
 }
 
 // -----------------------------------------------------------------
-// extra_read_roots (0037)
+// extra_read_roots
 // -----------------------------------------------------------------
 
 /// Build an executor whose extra_read_roots list contains the given
