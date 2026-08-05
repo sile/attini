@@ -2,7 +2,11 @@
 
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use nojson::DisplayJson;
 
@@ -360,16 +364,51 @@ fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<Str
     }
 }
 
+const COMMAND_KILL_GRACE_MS: u64 = 500;
+
 fn run_command_sync(inv: &CommandInvocation, executor: &ToolExecutor) -> io::Result<String> {
-    let output = Command::new("/bin/sh")
+    let started = Instant::now();
+    let timeout = Duration::from_secs(inv.timeout_seconds);
+    let child = Command::new("/bin/sh")
         .arg("-c")
         .arg(&inv.command_line)
         .current_dir(executor.root())
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let child_id = child.id() as libc::pid_t;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_killer = done.clone();
+    thread::spawn(move || {
+        thread::sleep(timeout);
+        if done_for_killer.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: `kill` with SIGTERM/SIGKILL to a pid we spawned; no
+        // memory invariants at play.
+        unsafe { libc::kill(child_id, libc::SIGTERM) };
+        thread::sleep(Duration::from_millis(COMMAND_KILL_GRACE_MS));
+        if done_for_killer.load(Ordering::Relaxed) {
+            return;
+        }
+        unsafe { libc::kill(child_id, libc::SIGKILL) };
+    });
+
+    let output = child.wait_with_output()?;
+    done.store(true, Ordering::Relaxed);
+    let elapsed = started.elapsed();
+    let termination_reason = if elapsed >= timeout || output.status.code().is_none() {
+        "timeout"
+    } else {
+        "exited"
+    };
     Ok(command_result_json(
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
-        output.status.code().unwrap_or(-1),
+        output.status.code(),
+        termination_reason,
+        elapsed,
     ))
 }
 
@@ -438,25 +477,41 @@ fn patch_result_json(applied: &[PathBuf]) -> String {
     nojson::Json(Payload { applied }).to_string()
 }
 
-fn command_result_json(stdout: &str, stderr: &str, exit_code: i32) -> String {
+fn command_result_json(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    termination_reason: &str,
+    elapsed: Duration,
+) -> String {
     struct Payload<'a> {
         stdout: &'a str,
         stderr: &'a str,
-        exit_code: i32,
+        exit_code: Option<i32>,
+        termination_reason: &'a str,
+        duration_ms: u64,
     }
     impl DisplayJson for Payload<'_> {
         fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
             f.object(|f| {
+                match self.exit_code {
+                    Some(code) => f.member("exit_code", code)?,
+                    None => f.member("exit_code", Option::<i32>::None)?,
+                }
+                f.member("termination_reason", self.termination_reason)?;
+                f.member("duration_ms", self.duration_ms)?;
                 f.member("stdout", self.stdout)?;
-                f.member("stderr", self.stderr)?;
-                f.member("exit_code", self.exit_code)
+                f.member("stderr", self.stderr)
             })
         }
     }
+    let duration_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
     nojson::Json(Payload {
         stdout,
         stderr,
         exit_code,
+        termination_reason,
+        duration_ms,
     })
     .to_string()
 }
