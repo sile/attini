@@ -379,7 +379,10 @@ fn absorb_metrics_line(
         .into_owned();
     match kind.as_str() {
         "metrics_snapshot" => {
-            let Some(counters) = value.to_member("counters").map_err(|e| e.to_string())?.optional()
+            let Some(counters) = value
+                .to_member("counters")
+                .map_err(|e| e.to_string())?
+                .optional()
             else {
                 return Ok(());
             };
@@ -430,16 +433,15 @@ fn absorb_metrics_line(
                 .saturating_add(get("prompt_cache_miss_tokens_total")?);
         }
         "token_usage" => {
-            let Some(usage) = value.to_member("usage").map_err(|e| e.to_string())?.optional()
+            let Some(usage) = value
+                .to_member("usage")
+                .map_err(|e| e.to_string())?
+                .optional()
             else {
                 return Ok(());
             };
             let get = |name: &str| -> Result<u64, String> {
-                match usage
-                    .to_member(name)
-                    .map_err(|e| e.to_string())?
-                    .optional()
-                {
+                match usage.to_member(name).map_err(|e| e.to_string())?.optional() {
                     Some(v) => v
                         .try_into()
                         .map_err(|e: nojson::JsonParseError| e.to_string()),

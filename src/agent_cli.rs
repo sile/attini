@@ -130,6 +130,10 @@ pub struct AgentConfig {
     pub show_reasoning: bool,
     pub max_turns: usize,
     pub mode: Mode,
+    /// Extra workspace-external read-only path prefixes granted via
+    /// `attini agent --read-path`. Combined with the persistent
+    /// entries from `permissions.json.extra_read_paths` on startup.
+    pub extra_read_paths_cli: Vec<PathBuf>,
 }
 
 pub enum Continuation {
@@ -144,7 +148,16 @@ pub enum Continuation {
 
 pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
     let mut session = Session::open(&cfg.session_name)?;
-    let executor = ToolExecutor::new(&cfg.workspace_root)?;
+    // Combine persistent extra_read_paths (from permissions.json) with
+    // CLI --read-path overrides for this invocation, canonicalise
+    // each, and hand the resulting Vec to the ToolExecutor. Any path
+    // that fails to canonicalise is warned + skipped so a single bad
+    // entry does not disable the whole grant list.
+    let loaded = permissions::load(&cfg.session_name)?;
+    let mut candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
+    candidates.extend(cfg.extra_read_paths_cli.iter().cloned());
+    let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
+    let executor = ToolExecutor::new(&cfg.workspace_root, extra_read_roots)?;
 
     let start_ts = now_unix_millis();
     session.append(&SessionRecord::InvocationStart {
@@ -361,6 +374,30 @@ fn drive(
         "agent loop exceeded max_turns={}",
         cfg.max_turns
     )))
+}
+
+fn canonicalise_extra_read_roots(
+    workspace_root: &std::path::Path,
+    candidates: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::<PathBuf>::new();
+    let mut out = Vec::new();
+    for p in candidates {
+        let absolute = if p.is_absolute() {
+            p.clone()
+        } else {
+            workspace_root.join(&p)
+        };
+        match absolute.canonicalize() {
+            Ok(canon) => {
+                if seen.insert(canon.clone()) {
+                    out.push(canon);
+                }
+            }
+            Err(e) => eprintln!("attini: extra_read_paths: skipping {}: {e}", p.display()),
+        }
+    }
+    out
 }
 
 fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Vec<ChatMessage>> {

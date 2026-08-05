@@ -109,6 +109,23 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         .default("main")
         .take(args)
         .then(|o| o.value().parse())?;
+    // --read-path is repeatable; noargs' opt consumes one occurrence
+    // per take(), so we loop until nothing is left.
+    let mut read_paths: Vec<std::path::PathBuf> = Vec::new();
+    loop {
+        let taken = noargs::opt("read-path")
+            .ty("PATH")
+            .doc(
+                "Extra workspace-external read-only path prefix for this invocation only. \
+                 Repeatable. Persistent grants go through `attini session grant-read`.",
+            )
+            .take(args);
+        if !taken.is_present() {
+            break;
+        }
+        let s: String = taken.then(|o| o.value().parse())?;
+        read_paths.push(std::path::PathBuf::from(s));
+    }
     let prompt: Option<String> = noargs::arg("[PROMPT]")
         .doc("User prompt (required unless --approve or --reject is given)")
         .example("List the files in src/")
@@ -172,6 +189,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         show_reasoning,
         max_turns: DEFAULT_MAX_TURNS,
         mode,
+        extra_read_paths_cli: read_paths,
     };
     let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(Some(exit))
@@ -213,12 +231,15 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if try_run_session_metrics(args)? {
         return Ok(true);
     }
+    if try_run_session_grant_read(args)? {
+        return Ok(true);
+    }
 
     if args.metadata().help_mode {
         return Ok(false);
     }
     Err(RunError::Runtime(
-        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, compact, prune, metrics)"
+        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, grant-read, compact, prune, metrics)"
             .to_string(),
     ))
 }
@@ -340,6 +361,65 @@ fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<bool, RunError> 
     }
     session_cmd::run_unlock(&name, force).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(true)
+}
+
+fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("grant-read")
+        .doc(
+            "Append a workspace-external read-only path to permissions.json. \
+             Read-only tools (list / read / search) will accept paths under this prefix.",
+        )
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; writes to .attini/<NAME>/permissions.json")
+        .default("main")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let workspace = noargs::flag("workspace")
+        .doc(
+            "Write to workspace-wide .attini/permissions.json instead of session-local \
+             (mutually exclusive with -s / --session)",
+        )
+        .take(args)
+        .is_present();
+    let path: String = noargs::arg("<PATH>")
+        .doc(
+            "Read-only path prefix to grant. Workspace-relative or absolute; \
+             stored as-given and canonicalised on load.",
+        )
+        .example("../issues/attini/")
+        .take(args)
+        .then(|a| a.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    if workspace && session_name != "main" {
+        return Err(RunError::Runtime(
+            "-s / --session and --workspace are mutually exclusive".to_string(),
+        ));
+    }
+    let scope = if workspace {
+        attini::permissions::GrantScope::Workspace
+    } else {
+        attini::permissions::GrantScope::Session(&session_name)
+    };
+    match attini::permissions::grant_read(scope, &path) {
+        Ok(attini::permissions::GrantReadOutcome::Appended(p)) => {
+            eprintln!("granted read: appended to {}", p.display());
+            Ok(true)
+        }
+        Ok(attini::permissions::GrantReadOutcome::AlreadyGranted(p)) => {
+            eprintln!("already granted (no-op): {}", p.display());
+            Ok(true)
+        }
+        Err(e) => Err(RunError::Runtime(e.to_string())),
+    }
 }
 
 fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
