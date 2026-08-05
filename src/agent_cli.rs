@@ -168,20 +168,20 @@ fn drive(
         for tc in &call_result.tool_calls {
             match classify(&tc.function_name) {
                 ToolKind::ReadOnly => {
-                    let content = execute_read_only(tc, executor);
-                    eprintln!("[tool: {} {}] done", tc.function_name, tc.id);
+                    let (summary, content) = run_read_only(tc, executor);
+                    eprintln!("{summary}");
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
                 ToolKind::Patch => {
                     let preview_text = render_patch_preview(tc, executor)?;
-                    eprintln!("[patch approval required for {}]", tc.id);
+                    eprintln!("[patch] approval required");
                     eprintln!("{preview_text}");
                     save_pending(session, tc, PendingToolKind::Patch, preview_text)?;
                     return Ok(Driven::AwaitingApproval);
                 }
                 ToolKind::Command => {
                     let preview_text = render_command_preview(tc)?;
-                    eprintln!("[command approval required for {}]", tc.id);
+                    eprintln!("[command] approval required");
                     eprintln!("{preview_text}");
                     save_pending(session, tc, PendingToolKind::Command, preview_text)?;
                     return Ok(Driven::AwaitingApproval);
@@ -191,7 +191,7 @@ fn drive(
                         "unknown_tool",
                         &format!("no such tool: {}", tc.function_name),
                     );
-                    eprintln!("[tool: {} rejected — unknown]", tc.function_name);
+                    eprintln!("[unknown tool] {}", tc.function_name);
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
             }
@@ -236,13 +236,57 @@ fn classify(name: &str) -> ToolKind {
     }
 }
 
-fn execute_read_only(tc: &ToolCall, executor: &ToolExecutor) -> String {
+fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> (String, String) {
     match ReadOnlyTool::parse(&tc.function_name, &tc.arguments_json) {
-        Ok(inv) => match executor.execute(inv) {
-            ToolOutcome::Ok(payload) => payload,
-            ToolOutcome::Err(err) => tool_error_json_from(&err),
+        Ok(inv) => {
+            let args_summary = summarize_read_only(&inv);
+            match executor.execute(inv) {
+                ToolOutcome::Ok(payload) => (format!("[{args_summary}] ok"), payload),
+                ToolOutcome::Err(err) => (
+                    format!("[{args_summary}] err: {}", short_err(&err)),
+                    tool_error_json_from(&err),
+                ),
+            }
+        }
+        Err(err) => (
+            format!("[{}] parse err: {}", tc.function_name, short_err(&err)),
+            tool_error_json_from(&err),
+        ),
+    }
+}
+
+fn summarize_read_only(inv: &ReadOnlyTool) -> String {
+    match inv {
+        ReadOnlyTool::List {
+            path, recursive, ..
+        } => {
+            if *recursive {
+                format!(r#"list "{path}" recursive"#)
+            } else {
+                format!(r#"list "{path}""#)
+            }
+        }
+        ReadOnlyTool::Read { path, line_range } => match line_range {
+            Some((start, end)) => format!(r#"read "{path}" lines {start}..{end}"#),
+            None => format!(r#"read "{path}""#),
         },
-        Err(err) => tool_error_json_from(&err),
+        ReadOnlyTool::Search {
+            pattern,
+            path_prefix,
+            ..
+        } => match path_prefix {
+            Some(prefix) => format!(r#"search "{pattern}" in "{prefix}""#),
+            None => format!(r#"search "{pattern}""#),
+        },
+    }
+}
+
+fn short_err(err: &ToolExecutionError) -> String {
+    let full = format!("{err:?}");
+    if let Some(idx) = full.find(['(', ' ']) {
+        full[..idx].to_string()
+    } else {
+        full
     }
 }
 
