@@ -61,8 +61,12 @@ async fn run() -> Result<RunOutcome, RunError> {
     }
     noargs::HELP_FLAG.take_help(&mut args);
 
-    try_run_chat(&mut args).await?;
-    try_run_tui(&mut args).await?;
+    if try_run_chat(&mut args).await? {
+        return Ok(RunOutcome::Ok);
+    }
+    if try_run_tui(&mut args).await? {
+        return Ok(RunOutcome::Ok);
+    }
     if let Some(exit) = try_run_agent(&mut args)? {
         return Ok(RunOutcome::Exit(exit));
     }
@@ -73,13 +77,13 @@ async fn run() -> Result<RunOutcome, RunError> {
     Ok(RunOutcome::Ok)
 }
 
-async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
+async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if !noargs::cmd("tui")
         .doc("Launch the interactive terminal UI")
         .take(args)
         .is_present()
     {
-        return Ok(());
+        return Ok(false);
     }
 
     let model: String = noargs::opt("model")
@@ -100,7 +104,7 @@ async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
         .present_and_then(|o| o.value().parse::<u64>())?;
 
     if args.metadata().help_mode {
-        return Ok(());
+        return Ok(false);
     }
 
     let metrics_snapshot_interval = match metrics_snapshot_interval_secs {
@@ -129,16 +133,16 @@ async fn try_run_tui(args: &mut noargs::RawArgs) -> Result<(), RunError> {
     tui::run(client, config)
         .await
         .map_err(|err| RunError::Runtime(err.to_string()))?;
-    Ok(())
+    Ok(true)
 }
 
-async fn try_run_chat(args: &mut noargs::RawArgs) -> Result<(), RunError> {
+async fn try_run_chat(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if !noargs::cmd("chat")
         .doc("Send a single prompt to DeepSeek and stream the response to stdout")
         .take(args)
         .is_present()
     {
-        return Ok(());
+        return Ok(false);
     }
 
     let model: String = noargs::opt("model")
@@ -163,7 +167,7 @@ async fn try_run_chat(args: &mut noargs::RawArgs) -> Result<(), RunError> {
         .then(|a| a.value().parse())?;
 
     if args.metadata().help_mode {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut messages = Vec::new();
@@ -176,7 +180,7 @@ async fn try_run_chat(args: &mut noargs::RawArgs) -> Result<(), RunError> {
     let client = DeepSeekClient::from_env()?;
     let mut rx = client.call(request);
     stream_response(&mut rx, show_reasoning).await?;
-    Ok(())
+    Ok(true)
 }
 
 fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
