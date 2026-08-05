@@ -429,8 +429,12 @@ fn read_tool_calls(value: nojson::RawJsonValue<'_, '_>) -> Result<Vec<ToolCall>,
     let mut out = Vec::new();
     for item in v.to_array().map_err(|e| e.to_string())? {
         let id = read_string(item, "id")?;
-        let function_name = read_string(item, "function_name")?;
-        let arguments_json = read_string(item, "arguments_json")?;
+        let function = item
+            .to_member("function")
+            .and_then(|m| m.required())
+            .map_err(|e| e.to_string())?;
+        let function_name = read_string(function, "name")?;
+        let arguments_json = read_string(function, "arguments")?;
         out.push(ToolCall {
             id,
             function_name,
@@ -562,5 +566,61 @@ mod tests {
             assert_eq!(PendingToolKind::parse(kind.as_str()), Some(kind));
         }
         assert!(PendingToolKind::parse("bogus").is_none());
+    }
+
+    #[test]
+    fn assistant_record_with_tool_calls_roundtrips_through_parse() {
+        let record = SessionRecord::Assistant {
+            ts: 42,
+            content: "hi".to_string(),
+            reasoning: Some("because".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                function_name: "read".to_string(),
+                arguments_json: r#"{"path":"src/foo.rs"}"#.to_string(),
+            }],
+        };
+        let line = nojson::Json(&record).to_string();
+        let parsed = parse_conversation_line(&line)
+            .expect("parse must succeed")
+            .expect("assistant record must yield a ChatMessage");
+        match parsed {
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => {
+                assert_eq!(content, "hi");
+                assert_eq!(reasoning_content.as_deref(), Some("because"));
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].id, "call_1");
+                assert_eq!(tool_calls[0].function_name, "read");
+                assert_eq!(tool_calls[0].arguments_json, r#"{"path":"src/foo.rs"}"#);
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_record_roundtrips_through_parse() {
+        let record = SessionRecord::Tool {
+            ts: 7,
+            call_id: "call_x".to_string(),
+            content: r#"{"ok":true}"#.to_string(),
+        };
+        let line = nojson::Json(&record).to_string();
+        let parsed = parse_conversation_line(&line)
+            .expect("parse must succeed")
+            .expect("tool record must yield a ChatMessage");
+        match parsed {
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "call_x");
+                assert_eq!(content, r#"{"ok":true}"#);
+            }
+            other => panic!("expected tool, got {other:?}"),
+        }
     }
 }
