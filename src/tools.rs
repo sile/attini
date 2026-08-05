@@ -6,12 +6,6 @@
 //! filesystem I/O happens here; the Sans I/O core is fed the
 //! resulting [`ToolOutcome`] / [`PatchPreview`] and cannot observe
 //! the executor's internal state.
-//!
-//! Command execution (asynchronous child processes) is delegated to
-//! the [`command`] submodule so its tokio-only dependencies stay off
-//! the read-only / patch paths.
-
-pub mod command;
 
 use std::fs;
 use std::io::{self, Read, Write};

@@ -15,4 +15,3 @@ pub mod agent;
 pub mod deepseek;
 pub mod permissions;
 pub mod sse;
-pub mod tui;

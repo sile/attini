@@ -22,7 +22,6 @@ use nojson::{Json, RawJsonValue};
 
 use crate::metrics::Counter;
 use crate::sansio::deepseek::{ChatMessage, ToolCall, ToolDef};
-use crate::sansio::tui::AgentView;
 
 /// Maximum bytes of tool-call arguments (accumulated across streaming
 /// fragments) the core will accept for a single tool call. Fragments
@@ -1294,16 +1293,10 @@ impl AgentCore {
         self.pending.as_ref().map(|p| p.id)
     }
 
-    /// Read-only projection consumed by pure functions such as
-    /// [`crate::sansio::tui::handle_key`].
-    pub fn view(&self) -> AgentView {
-        AgentView {
-            has_active_request: self.pending.is_some(),
-            pending_approval_call_id: self.first_pending_approval_call_id(),
-        }
-    }
-
-    fn first_pending_approval_call_id(&self) -> Option<String> {
+    /// Call id of the first tool call awaiting user approval, if
+    /// any. Returned as an owned `String` because callers typically
+    /// need to move the id into an `Event`.
+    pub fn pending_approval_call_id(&self) -> Option<String> {
         // Any tool call whose approval is `Pending` is ready to
         // accept the user's decision — patch bumps to `Pending` on
         // `PatchPreviewReady`, command bumps to `Pending` at
@@ -3134,7 +3127,7 @@ mod tests {
         )));
         assert_eq!(core.metrics().patch_calls_previewed.get(), 1);
         // no approval-visible call_id yet — preview not received
-        assert_eq!(core.view().pending_approval_call_id, None);
+        assert_eq!(core.pending_approval_call_id(), None);
     }
 
     #[test]
@@ -3162,7 +3155,7 @@ mod tests {
 
         assert_eq!(actions, vec![Action::Redraw]);
         assert_eq!(core.status(), Status::AwaitingApproval);
-        assert_eq!(core.view().pending_approval_call_id, Some("p1".to_string()));
+        assert_eq!(core.pending_approval_call_id(), Some("p1".to_string()));
         assert_eq!(core.metrics().patch_previews_committed.get(), 1);
 
         let active = core.active_tool_calls();
@@ -3207,7 +3200,7 @@ mod tests {
         assert_eq!(core.metrics().tool_call_approvals_committed.get(), 1);
         // Approved but not yet resolved — approval left, phase now ToolRunning.
         assert_eq!(core.status(), Status::ToolRunning);
-        assert!(core.view().pending_approval_call_id.is_none());
+        assert!(core.pending_approval_call_id().is_none());
     }
 
     #[test]
@@ -3366,7 +3359,7 @@ mod tests {
         assert_eq!(preview.command_line, "echo hi");
         assert_eq!(preview.timeout_seconds, 10);
         assert_eq!(preview.working_directory, "/tmp/wksp");
-        assert_eq!(core.view().pending_approval_call_id, Some("c1".to_string()));
+        assert_eq!(core.pending_approval_call_id(), Some("c1".to_string()));
     }
 
     #[test]
