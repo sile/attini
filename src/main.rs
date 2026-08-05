@@ -210,12 +210,15 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if try_run_session_prune(args)? {
         return Ok(true);
     }
+    if try_run_session_metrics(args)? {
+        return Ok(true);
+    }
 
     if args.metadata().help_mode {
         return Ok(false);
     }
     Err(RunError::Runtime(
-        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, compact, prune)"
+        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, compact, prune, metrics)"
             .to_string(),
     ))
 }
@@ -391,6 +394,44 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         }
         Err(e) => Err(RunError::Runtime(e.to_string())),
     }
+}
+
+fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("metrics")
+        .doc(
+            "Aggregate metrics from session records. \
+             Use -s NAME for a single session, --all for every session under .attini/.",
+        )
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; directory is .attini/<NAME>/")
+        .default("main")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let all = noargs::flag("all")
+        .doc("Aggregate across every session under .attini/ (ignores -s)")
+        .take(args)
+        .is_present();
+    let json = noargs::flag("json")
+        .doc("Emit the aggregate as a JSON object instead of a human-readable table")
+        .take(args)
+        .is_present();
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    let scope = if all {
+        session_cmd::MetricsScope::All
+    } else {
+        session_cmd::MetricsScope::Single(&session_name)
+    };
+    session_cmd::run_metrics(scope, json).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
 }
 
 fn try_run_session_prune(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
