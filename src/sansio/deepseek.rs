@@ -233,11 +233,20 @@ impl DisplayJson for ChatRequest {
             f.member("model", &self.model)?;
             f.member("messages", &self.messages)?;
             f.member("stream", true)?;
+            f.member("stream_options", &StreamOptions)?;
             if !self.tools.is_empty() {
                 f.member("tools", &self.tools)?;
             }
             Ok(())
         })
+    }
+}
+
+struct StreamOptions;
+
+impl DisplayJson for StreamOptions {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| f.member("include_usage", true))
     }
 }
 
@@ -261,6 +270,26 @@ pub struct StreamChunk {
     pub reasoning_delta: Option<String>,
     pub tool_call_deltas: Vec<StreamToolCallDelta>,
     pub finish_reason: Option<String>,
+    /// Token usage counters. OpenAI-compatible APIs return these only
+    /// on the final `usage`-only chunk (typically with an empty
+    /// `choices` array). Requested by setting `stream_options.include_usage`.
+    pub usage: Option<Usage>,
+}
+
+/// Token usage counters returned by an OpenAI-compatible chat
+/// completions response.
+///
+/// All fields are optional because different models and different
+/// modes populate different subsets. `prompt_tokens` is what
+/// compaction triggers on; the DeepSeek-specific cache hit / miss
+/// breakdown is preserved for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub prompt_cache_hit_tokens: Option<u64>,
+    pub prompt_cache_miss_tokens: Option<u64>,
 }
 
 /// Payload of one SSE `data:` frame from the streaming response.
@@ -290,12 +319,21 @@ impl<'text, 'raw> TryFrom<RawJsonValue<'text, 'raw>> for StreamChunk {
     type Error = JsonParseError;
 
     fn try_from(value: RawJsonValue<'text, 'raw>) -> Result<Self, Self::Error> {
-        let choice = match value.to_member("choices")?.optional() {
-            Some(choices) => choices
-                .to_array()?
-                .next()
-                .ok_or_else(|| value.invalid("choices array is empty"))?,
-            None => return Ok(StreamChunk::default()),
+        let usage = decode_optional_usage(value)?;
+        let choices = value.to_member("choices")?.optional();
+        let choice = match choices {
+            Some(choices) => choices.to_array()?.next(),
+            None => None,
+        };
+        // `choices: []` plus a top-level `usage` is how OpenAI-compatible
+        // APIs deliver the terminating usage chunk when `include_usage`
+        // is enabled. Treat the absence of a choice as a usage-only
+        // chunk instead of a parse error.
+        let Some(choice) = choice else {
+            return Ok(StreamChunk {
+                usage,
+                ..Default::default()
+            });
         };
         let delta = choice.to_member("delta")?.optional();
         let (content_delta, reasoning_delta, tool_call_deltas) = match delta {
@@ -312,7 +350,32 @@ impl<'text, 'raw> TryFrom<RawJsonValue<'text, 'raw>> for StreamChunk {
             reasoning_delta,
             tool_call_deltas,
             finish_reason,
+            usage,
         })
+    }
+}
+
+fn decode_optional_usage(value: RawJsonValue<'_, '_>) -> Result<Option<Usage>, JsonParseError> {
+    let Some(usage_value) = value.to_member("usage")?.optional() else {
+        return Ok(None);
+    };
+    if usage_value.as_raw_str().trim() == "null" {
+        return Ok(None);
+    }
+    Ok(Some(Usage {
+        prompt_tokens: optional_u64(usage_value, "prompt_tokens")?,
+        completion_tokens: optional_u64(usage_value, "completion_tokens")?,
+        total_tokens: optional_u64(usage_value, "total_tokens")?,
+        prompt_cache_hit_tokens: optional_u64(usage_value, "prompt_cache_hit_tokens")?,
+        prompt_cache_miss_tokens: optional_u64(usage_value, "prompt_cache_miss_tokens")?,
+    }))
+}
+
+fn optional_u64(parent: RawJsonValue<'_, '_>, name: &str) -> Result<Option<u64>, JsonParseError> {
+    match parent.to_member(name)?.optional() {
+        Some(v) if v.as_raw_str().trim() == "null" => Ok(None),
+        Some(v) => v.try_into().map(Some),
+        None => Ok(None),
     }
 }
 
@@ -374,7 +437,7 @@ mod tests {
         );
         assert_eq!(
             request.to_json_string(),
-            r#"{"model":"deepseek-v4-flash","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hello"}],"stream":true}"#
+            r#"{"model":"deepseek-v4-flash","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true}}"#
         );
     }
 
@@ -543,11 +606,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_choices_array_reports_error() {
+    fn empty_choices_array_with_usage_yields_usage_only_chunk() {
+        // OpenAI-compatible APIs deliver the terminating usage payload
+        // as a chunk with an empty `choices` array plus a top-level
+        // `usage` object. Historically we rejected this shape as
+        // malformed; enabling `stream_options.include_usage` now makes
+        // it the normal way to receive token counters.
+        let payload = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13,"prompt_cache_hit_tokens":8,"prompt_cache_miss_tokens":2}}"#;
+        let got = decode_stream_payload(payload).expect("usage-only chunk parses");
+        assert_eq!(
+            got,
+            StreamPayload::Chunk(StreamChunk {
+                usage: Some(Usage {
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(3),
+                    total_tokens: Some(13),
+                    prompt_cache_hit_tokens: Some(8),
+                    prompt_cache_miss_tokens: Some(2),
+                }),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn empty_choices_array_without_usage_yields_empty_chunk() {
         let payload = r#"{"choices":[]}"#;
-        let err = decode_stream_payload(payload).expect_err("empty array is an error");
-        let msg = err.to_string();
-        assert!(msg.contains("choices"), "unexpected error: {msg}");
+        let got = decode_stream_payload(payload).expect("empty chunk parses");
+        assert_eq!(got, StreamPayload::Chunk(StreamChunk::default()));
     }
 
     #[test]
@@ -567,13 +653,18 @@ mod tests {
         // Previously covered by `ignores_unknown_top_level_fields`; now
         // we explicitly assert that an empty tool_calls array parses
         // into an empty `tool_call_deltas` vector so callers can rely
-        // on the absence of any delta.
+        // on the absence of any delta. The top-level `usage` in this
+        // payload is also decoded when present.
         let payload = r#"{"choices":[{"index":0,"delta":{"content":"x","tool_calls":[]},"finish_reason":null,"logprobs":null}],"usage":{"total_tokens":1}}"#;
         let got = decode_stream_payload(payload).expect("decode");
         assert_eq!(
             got,
             StreamPayload::Chunk(StreamChunk {
                 content_delta: Some("x".to_string()),
+                usage: Some(Usage {
+                    total_tokens: Some(1),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })
         );

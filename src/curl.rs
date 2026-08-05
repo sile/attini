@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::sansio::deepseek::{
-    ChatMessage, ChatRequest, StreamChunk, StreamPayload, StreamToolCallDelta, ToolCall,
+    ChatMessage, ChatRequest, StreamChunk, StreamPayload, StreamToolCallDelta, ToolCall, Usage,
     decode_stream_payload,
 };
 use crate::sansio::sse::{SseDecoder, SseEvent};
@@ -18,6 +18,10 @@ pub struct CallResult {
     pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    /// Token counters from the response's terminating usage chunk.
+    /// `None` when the model or server did not emit one (e.g. the API
+    /// silently ignored `stream_options.include_usage`).
+    pub usage: Option<Usage>,
 }
 
 impl CallResult {
@@ -140,6 +144,7 @@ struct Assembly {
     reasoning: String,
     tool_slots: Vec<ToolSlot>,
     finish_reason: Option<String>,
+    usage: Option<Usage>,
 }
 
 #[derive(Default)]
@@ -169,6 +174,9 @@ impl Assembly {
         }
         if let Some(reason) = chunk.finish_reason {
             self.finish_reason = Some(reason);
+        }
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage);
         }
     }
 
@@ -220,6 +228,7 @@ impl Assembly {
             reasoning_content: reasoning,
             tool_calls,
             finish_reason: self.finish_reason,
+            usage: self.usage,
         }
     }
 }
