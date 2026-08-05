@@ -1,7 +1,7 @@
 //! Filesystem-facing side of the permission system: load rules from
-//! `.attini/{NAME}/permissions.jsonc` (session-local) and
-//! `.attini/permissions.jsonc` (workspace-wide), and implement
-//! `attini session grant` (safe text-preserving append).
+//! `.attini/{NAME}/permissions.json` (session-local) and
+//! `.attini/permissions.json` (workspace-wide), and implement
+//! `attini session grant` (text-preserving append).
 
 use std::fs;
 use std::io::{self, Write};
@@ -12,7 +12,7 @@ use nojson::RawJson;
 use crate::sansio::permissions::{Rule, RuleDecision};
 use crate::session::{SessionPaths, session_paths, session_root};
 
-pub const PERMISSIONS_FILENAME: &str = "permissions.jsonc";
+pub const PERMISSIONS_FILENAME: &str = "permissions.json";
 
 pub struct LoadedRules {
     pub session: Vec<Rule>,
@@ -49,8 +49,8 @@ fn load_from_path(path: &Path, scope_label: &str) -> Vec<Rule> {
             return Vec::new();
         }
     };
-    let json = match RawJson::parse_jsonc(&text) {
-        Ok((v, _comment_ranges)) => v,
+    let json = match RawJson::parse(&text) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!(
                 "attini: {scope_label} permissions parse error ({}): {e}. Rules ignored.",
@@ -185,7 +185,7 @@ impl std::fmt::Display for GrantError {
             Self::SessionMissing(p) => write!(f, "session directory not found: {}", p.display()),
             Self::ParseError(p, e) => write!(
                 f,
-                "existing {} is not valid JSONC: {e}. Fix or delete it before granting.",
+                "existing {} is not valid JSON: {e}. Fix or delete it before granting.",
                 p.display()
             ),
             Self::ExistingDenyConflict(p, prefix) => write!(
@@ -237,15 +237,17 @@ pub fn grant(scope: GrantScope<'_>, prefix: &str) -> Result<GrantOutcome, GrantE
         Err(e) => return Err(GrantError::Io(e)),
     };
 
-    // Validate + look for existing rule with same prefix.
-    let json = RawJson::parse_jsonc(&existing_text)
-        .map_err(|e| GrantError::ParseError(target.clone(), e.to_string()))?
-        .0;
+    // Validate, look for existing rule with same prefix, and
+    // remember the last item's byte-end offset for clean insertion.
+    let json = RawJson::parse(&existing_text)
+        .map_err(|e| GrantError::ParseError(target.clone(), e.to_string()))?;
     let root = json.value();
     let array = root
         .to_array()
         .map_err(|e| GrantError::ParseError(target.clone(), e.to_string()))?;
+    let mut last_item_end: Option<usize> = None;
     for item in array {
+        last_item_end = Some(item.position() + item.as_raw_str().len());
         let existing_prefix = match required_string(item, "prefix") {
             Ok(p) => p,
             Err(_) => continue, // Malformed rule; treat as absent.
@@ -253,7 +255,6 @@ pub fn grant(scope: GrantScope<'_>, prefix: &str) -> Result<GrantOutcome, GrantE
         if existing_prefix != prefix {
             continue;
         }
-        // Same prefix: branch on decision.
         let decision = optional_string(item, "decision").ok().flatten();
         return match decision.as_deref() {
             Some("approve") => Ok(GrantOutcome::AlreadyGranted(target)),
@@ -262,83 +263,37 @@ pub fn grant(scope: GrantScope<'_>, prefix: &str) -> Result<GrantOutcome, GrantE
         };
     }
 
-    // No conflict → append. Determine insertion position from the
-    // parsed root array's byte range (avoids naive `]` scanning).
-    let array_start = root.position();
-    let array_raw = root.as_raw_str();
-    let closing_bracket_relative = array_raw
-        .rfind(']')
-        .ok_or_else(|| GrantError::ParseError(target.clone(), "root has no closing ']'".into()))?;
-    let insertion_point = array_start + closing_bracket_relative;
-
-    // Look at the last non-whitespace / non-comment char before the `]`.
-    let head = &existing_text[..insertion_point];
-    let last_significant = last_significant_char(head);
-
     let new_rule_text = format!(
         "{{ \"prefix\": {}, \"decision\": \"approve\" }}",
         json_string_literal(&prefix)
     );
-    let insertion = match last_significant {
-        Some(',') | Some('[') => format!("\n  {new_rule_text}\n"),
-        Some(_) => format!(",\n  {new_rule_text}\n"),
-        None => format!("\n  {new_rule_text}\n"),
-    };
-
     let new_content = if is_new_file {
         format!("[\n  {new_rule_text}\n]\n")
     } else {
-        let mut buf = String::with_capacity(existing_text.len() + insertion.len());
-        buf.push_str(&existing_text[..insertion_point]);
-        buf.push_str(&insertion);
-        buf.push_str(&existing_text[insertion_point..]);
-        buf
+        match last_item_end {
+            Some(end) => {
+                // Insert `,\n  <new>` immediately after the last
+                // rule's `}`; the pre-existing whitespace + `]`
+                // tail is left alone so the file's formatting is
+                // preserved.
+                let mut buf = String::with_capacity(existing_text.len() + new_rule_text.len() + 8);
+                buf.push_str(&existing_text[..end]);
+                buf.push_str(",\n  ");
+                buf.push_str(&new_rule_text);
+                buf.push_str(&existing_text[end..]);
+                buf
+            }
+            None => {
+                // Empty array: rewrite the whole file. `parse`
+                // already validated that root is an array, so any
+                // whitespace inside `[]` is discarded here.
+                format!("[\n  {new_rule_text}\n]\n")
+            }
+        }
     };
 
     atomic_write(&target, new_content.as_bytes())?;
     Ok(GrantOutcome::Appended(target))
-}
-
-/// Scan `head` from the end, skipping whitespace, `// ...\n` line
-/// comments, and `/* ... */` block comments. Return the first
-/// non-comment / non-whitespace character encountered (as a char),
-/// or `None` if the entire head is whitespace/comments.
-fn last_significant_char(head: &str) -> Option<char> {
-    let bytes = head.as_bytes();
-    let mut i = bytes.len();
-    loop {
-        if i == 0 {
-            return None;
-        }
-        let c = bytes[i - 1];
-        if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
-            i -= 1;
-            continue;
-        }
-        // Try to skip a `/* ... */` block comment ending at position i.
-        if i >= 2 && bytes[i - 2] == b'*' && bytes[i - 1] == b'/' {
-            let mut j = i - 2;
-            while j >= 2 && !(bytes[j - 2] == b'/' && bytes[j - 1] == b'*') {
-                j -= 1;
-            }
-            if j >= 2 {
-                i = j - 2;
-                continue;
-            }
-            return Some('/'); // Malformed but return the '/' anyway.
-        }
-        // Try to skip a `// ...` line comment ending on this line.
-        // Walk back to line start and check for `//`.
-        let mut line_start = i;
-        while line_start > 0 && bytes[line_start - 1] != b'\n' {
-            line_start -= 1;
-        }
-        if let Some(pos) = head[line_start..i].find("//") {
-            i = line_start + pos;
-            continue;
-        }
-        return Some(c as char);
-    }
 }
 
 fn json_string_literal(s: &str) -> String {
