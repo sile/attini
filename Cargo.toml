@@ -11,4 +11,4 @@ nojson = "0.3"
 sha2 = "0.11"
 
 [dev-dependencies]
-noprop = { path = "../noprop" }
+noprop = "0.0.2"
