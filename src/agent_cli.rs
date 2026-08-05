@@ -31,6 +31,83 @@ pub const EXIT_AWAITING_APPROVAL: u8 = 10;
 
 pub const DEFAULT_MAX_TURNS: usize = 20;
 
+/// Counters collected during one invocation of `agent_cli::run` for
+/// later persistence into `MetricsSnapshotBody::entries`. Shared by
+/// mutable reference between `run()` and `drive()` so both the Ok
+/// and Err outcomes flush the same accumulated values.
+#[derive(Debug, Default)]
+pub struct Counters {
+    pub turns: u64,
+    pub tool_calls_by_kind: ToolCallsByKind,
+    pub tool_errors: u64,
+    pub prompt_tokens_billed_total: u64,
+    pub completion_tokens_total: u64,
+    pub prompt_cache_hit_tokens_total: u64,
+    pub prompt_cache_miss_tokens_total: u64,
+}
+
+/// Per-tool-name buckets for `Counters::tool_calls_by_kind`. Names are
+/// matched directly against `ToolCall::function_name`; anything not
+/// in the fixed set falls into `unknown` (mirrors the `Unknown`
+/// branch of the dispatch loop's `classify()` helper).
+#[derive(Debug, Default)]
+pub struct ToolCallsByKind {
+    pub list: u64,
+    pub read: u64,
+    pub search: u64,
+    pub patch: u64,
+    pub command: u64,
+    pub unknown: u64,
+}
+
+impl Counters {
+    /// Flatten into the `Vec<(String, u64)>` shape expected by
+    /// `MetricsSnapshotBody::entries`. Also takes `duration_ms`
+    /// separately because that value is known only in `run()`, not
+    /// during `drive()`.
+    pub fn to_metrics_entries(&self, duration_ms: u64) -> Vec<(String, u64)> {
+        vec![
+            ("turns".to_string(), self.turns),
+            ("tool_calls.list".to_string(), self.tool_calls_by_kind.list),
+            ("tool_calls.read".to_string(), self.tool_calls_by_kind.read),
+            (
+                "tool_calls.search".to_string(),
+                self.tool_calls_by_kind.search,
+            ),
+            (
+                "tool_calls.patch".to_string(),
+                self.tool_calls_by_kind.patch,
+            ),
+            (
+                "tool_calls.command".to_string(),
+                self.tool_calls_by_kind.command,
+            ),
+            (
+                "tool_calls.unknown".to_string(),
+                self.tool_calls_by_kind.unknown,
+            ),
+            ("tool_errors".to_string(), self.tool_errors),
+            ("duration_ms".to_string(), duration_ms),
+            (
+                "prompt_tokens_billed_total".to_string(),
+                self.prompt_tokens_billed_total,
+            ),
+            (
+                "completion_tokens_total".to_string(),
+                self.completion_tokens_total,
+            ),
+            (
+                "prompt_cache_hit_tokens_total".to_string(),
+                self.prompt_cache_hit_tokens_total,
+            ),
+            (
+                "prompt_cache_miss_tokens_total".to_string(),
+                self.prompt_cache_miss_tokens_total,
+            ),
+        ]
+    }
+}
+
 /// `prompt_tokens` threshold above which the next `Continuation::Prompt`
 /// invocation summarises before making the model call. Set to 1/4 of
 /// the DeepSeek 64 K context (`64 × 1024 / 4 = 16384`) so compaction
@@ -69,13 +146,15 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
     let mut session = Session::open(&cfg.session_name)?;
     let executor = ToolExecutor::new(&cfg.workspace_root)?;
 
+    let start_ts = now_unix_millis();
     session.append(&SessionRecord::InvocationStart {
-        ts: now_unix_millis(),
+        ts: start_ts,
         attini_version: env!("CARGO_PKG_VERSION").to_string(),
         model: cfg.model.clone(),
     })?;
 
-    let outcome = drive(&mut session, &executor, &cfg, cont);
+    let mut counters = Counters::default();
+    let outcome = drive(&mut session, &executor, &cfg, cont, &mut counters);
 
     let (reason, exit_code) = match &outcome {
         Ok(Driven::Completed) => (InvocationEndReason::Completed, EXIT_OK),
@@ -86,14 +165,15 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
         Err(_) => (InvocationEndReason::Error, EXIT_ERROR),
     };
 
+    let end_ts = now_unix_millis();
+    let duration_ms = end_ts.saturating_sub(start_ts);
     let _ = session.append(&SessionRecord::MetricsSnapshot {
-        ts: now_unix_millis(),
-        counters: MetricsSnapshotBody::default(),
+        ts: end_ts,
+        counters: MetricsSnapshotBody {
+            entries: counters.to_metrics_entries(duration_ms),
+        },
     });
-    let _ = session.append(&SessionRecord::InvocationEnd {
-        ts: now_unix_millis(),
-        reason,
-    });
+    let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
     match outcome {
         Ok(_) => Ok(ExitCode::from(exit_code)),
@@ -114,6 +194,7 @@ fn drive(
     executor: &ToolExecutor,
     cfg: &AgentConfig,
     cont: Continuation,
+    counters: &mut Counters,
 ) -> io::Result<Driven> {
     if matches!(cont, Continuation::Prompt(_)) {
         try_auto_compact(session, &cfg.model)?;
@@ -156,6 +237,7 @@ fn drive(
                 &pending.call_id,
                 content.to_string(),
             )?;
+            counters.tool_errors += 1;
             session.clear_pending()?;
         }
     }
@@ -189,6 +271,7 @@ fn drive(
             reasoning: call_result.reasoning_content.clone(),
             tool_calls: call_result.tool_calls.clone(),
         })?;
+        counters.turns += 1;
         if let Some(usage) = call_result.usage {
             session.append(&SessionRecord::TokenUsage {
                 ts: now_unix_millis(),
@@ -200,6 +283,18 @@ fn drive(
                     prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
                 },
             })?;
+            counters.prompt_tokens_billed_total = counters
+                .prompt_tokens_billed_total
+                .saturating_add(usage.prompt_tokens.unwrap_or(0));
+            counters.completion_tokens_total = counters
+                .completion_tokens_total
+                .saturating_add(usage.completion_tokens.unwrap_or(0));
+            counters.prompt_cache_hit_tokens_total = counters
+                .prompt_cache_hit_tokens_total
+                .saturating_add(usage.prompt_cache_hit_tokens.unwrap_or(0));
+            counters.prompt_cache_miss_tokens_total = counters
+                .prompt_cache_miss_tokens_total
+                .saturating_add(usage.prompt_cache_miss_tokens.unwrap_or(0));
         }
         messages.push(assistant);
 
@@ -208,10 +303,24 @@ fn drive(
         }
 
         for tc in &call_result.tool_calls {
+            // Fine-grained tool_calls_by_kind counting is done here
+            // (not via classify()) because classify() collapses
+            // list/read/search into ToolKind::ReadOnly for dispatch.
+            match tc.function_name.as_str() {
+                "list" => counters.tool_calls_by_kind.list += 1,
+                "read" => counters.tool_calls_by_kind.read += 1,
+                "search" => counters.tool_calls_by_kind.search += 1,
+                "patch" => counters.tool_calls_by_kind.patch += 1,
+                "command" => counters.tool_calls_by_kind.command += 1,
+                _ => counters.tool_calls_by_kind.unknown += 1,
+            }
             match classify(&tc.function_name) {
                 ToolKind::ReadOnly => {
-                    let (summary, content) = run_read_only(tc, executor);
+                    let (summary, content, errored) = run_read_only(tc, executor);
                     eprintln!("{summary}");
+                    if errored {
+                        counters.tool_errors += 1;
+                    }
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
                 ToolKind::Patch => {
@@ -222,8 +331,15 @@ fn drive(
                     return Ok(Driven::AwaitingApproval);
                 }
                 ToolKind::Command => {
-                    match dispatch_command(tc, executor, cfg.mode, &rules, session, &mut messages)?
-                    {
+                    match dispatch_command(
+                        tc,
+                        executor,
+                        cfg.mode,
+                        &rules,
+                        session,
+                        &mut messages,
+                        counters,
+                    )? {
                         CommandDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
                         CommandDispatch::Continue => {}
                     }
@@ -234,6 +350,7 @@ fn drive(
                         &format!("no such tool: {}", tc.function_name),
                     );
                     eprintln!("[unknown tool] {}", tc.function_name);
+                    counters.tool_errors += 1;
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
             }
@@ -424,12 +541,14 @@ fn dispatch_command(
     rules: &LoadedRules,
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
+    counters: &mut Counters,
 ) -> io::Result<CommandDispatch> {
     let inv = match CommandInvocation::parse(&tc.arguments_json) {
         Ok(inv) => inv,
         Err(err) => {
             let content = tool_error_json("command_args", &format!("{err:?}"));
             eprintln!("[command] parse err: {err:?}");
+            counters.tool_errors += 1;
             append_tool(session, messages, &tc.id, content)?;
             return Ok(CommandDispatch::Continue);
         }
@@ -464,6 +583,7 @@ fn dispatch_command(
                     dec.prefix
                 ),
             );
+            counters.tool_errors += 1;
             append_tool(session, messages, &tc.id, content)?;
             Ok(CommandDispatch::Continue)
         }
@@ -491,6 +611,7 @@ fn dispatch_command(
                     reason.as_str()
                 ),
             );
+            counters.tool_errors += 1;
             append_tool(session, messages, &tc.id, content)?;
             Ok(CommandDispatch::Continue)
         }
@@ -585,21 +706,27 @@ fn classify(name: &str) -> ToolKind {
     }
 }
 
-fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> (String, String) {
+/// Returns `(display_summary, tool_response_content, errored)`.
+/// `errored` is `true` iff the returned content is a `tool_error_json`
+/// payload (parse failure or executor error) so the caller can update
+/// `Counters::tool_errors` without re-parsing the string.
+fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> (String, String, bool) {
     match ReadOnlyTool::parse(&tc.function_name, &tc.arguments_json) {
         Ok(inv) => {
             let args_summary = summarize_read_only(&inv);
             match executor.execute(inv) {
-                ToolOutcome::Ok(payload) => (format!("[{args_summary}] ok"), payload),
+                ToolOutcome::Ok(payload) => (format!("[{args_summary}] ok"), payload, false),
                 ToolOutcome::Err(err) => (
                     format!("[{args_summary}] err: {}", short_err(&err)),
                     tool_error_json_from(&err),
+                    true,
                 ),
             }
         }
         Err(err) => (
             format!("[{}] parse err: {}", tc.function_name, short_err(&err)),
             tool_error_json_from(&err),
+            true,
         ),
     }
 }
