@@ -7,9 +7,12 @@
 //! resulting [`ToolOutcome`] / [`PatchPreview`] and cannot observe
 //! the executor's internal state.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use nojson::{DisplayJson, Json, JsonFormatter};
 use sha2::{Digest, Sha256};
@@ -21,7 +24,7 @@ use crate::sansio::agent::{
 };
 
 /// Workspace-scoped executor for [`ReadOnlyTool`] invocations.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ToolExecutor {
     /// Workspace root. Both read-only and patch tools use this as the
     /// primary boundary. Patch tool uses only this field.
@@ -31,6 +34,23 @@ pub struct ToolExecutor {
     /// canonicalise into any of these roots. Patch tool ignores this
     /// field entirely (write access to these paths is out of scope).
     extra_read_roots: Vec<PathBuf>,
+    /// Session name (`.attini/{name}/`). Used by the patch tool's
+    /// Layer 2 rule to identify this session's scratchpad directory.
+    session_name: String,
+    /// Git repository state captured at startup for the patch tool's
+    /// Layer 3 (tracked files) and Layer 4 (not-in-repo) checks.
+    git_state: GitState,
+}
+
+/// Git repository state as observed by `ToolExecutor::new`.
+/// `Repo` carries the workspace-relative canonical paths of files
+/// tracked by `git ls-files` at startup; `Add` success mutates the
+/// set within the invocation so subsequent `Update` on the same
+/// path is not rejected as untracked.
+#[derive(Debug)]
+enum GitState {
+    Repo { tracked: RefCell<HashSet<PathBuf>> },
+    NotARepo,
 }
 
 impl ToolExecutor {
@@ -40,11 +60,28 @@ impl ToolExecutor {
     /// compare against a stable prefix; `extra_read_roots` are
     /// expected to already be canonicalised by the caller (paths
     /// that fail to canonicalise should be warned + skipped upstream).
-    pub fn new(root: impl AsRef<Path>, extra_read_roots: Vec<PathBuf>) -> io::Result<Self> {
+    /// `session_name` names the session directory that hosts the
+    /// scratchpad free-write zone for Layer 2.
+    ///
+    /// Also probes git state at startup for Layer 3/4 of the patch
+    /// tool's write guards. When the workspace is inside a git
+    /// working tree, `git ls-files` runs once and its output is
+    /// normalised to workspace-relative canonical paths for O(1)
+    /// tracked-file lookup during patch. When it is not, Layer 4
+    /// takes over: writes outside scratchpad are refused, and a
+    /// warning is emitted on stderr once at startup.
+    pub fn new(
+        root: impl AsRef<Path>,
+        extra_read_roots: Vec<PathBuf>,
+        session_name: String,
+    ) -> io::Result<Self> {
         let root = root.as_ref().canonicalize()?;
+        let git_state = probe_git_state(&root);
         Ok(Self {
             root,
             extra_read_roots,
+            session_name,
+            git_state,
         })
     }
 
@@ -228,7 +265,16 @@ impl ToolExecutor {
         let mut applied: Vec<PathBuf> = Vec::with_capacity(prepared.len());
         for (idx, p) in prepared.iter().enumerate() {
             match fs::rename(&p.tmp, &p.target) {
-                Ok(()) => applied.push(p.target.clone()),
+                Ok(()) => {
+                    // Layer 3 in-invocation tracking: a successful
+                    // rename means the target now exists on disk. For
+                    // Adds this admits the just-created file into the
+                    // tracked set so a follow-up Update within the
+                    // same invocation is not rejected. For Updates the
+                    // insert is a no-op (already tracked).
+                    self.mark_added(&p.target);
+                    applied.push(p.target.clone());
+                }
                 Err(e) => {
                     for rest in &prepared[idx..] {
                         let _ = fs::remove_file(&rest.tmp);
@@ -270,6 +316,15 @@ impl ToolExecutor {
             .ok_or_else(|| PatchError::OutsideWorkspace {
                 path: rel.to_string(),
             })?;
+        // Layer 2 subdir pre-create (chicken-and-egg resolution):
+        // if the target textually lives under this session's
+        // scratchpad, create any missing parent directories before
+        // `resolve_within` tries to canonicalise. Layer 2 is
+        // re-verified in canonical form after resolve_within so
+        // symlink-based escapes still fail. Paths whose syntactic
+        // normalisation does not stay under scratchpad get no
+        // pre-create side effect.
+        self.maybe_pre_create_scratchpad_parent(rel_path)?;
         // Parent may itself be "" (root of workspace). resolve_within
         // handles "." as workspace root; adapt "" the same way.
         let parent_str = if parent.as_os_str().is_empty() {
@@ -294,7 +349,9 @@ impl ToolExecutor {
                 });
             }
         };
-        Ok(parent_resolved.join(file_name))
+        let target = parent_resolved.join(file_name);
+        self.check_patch_write(&target, rel, PatchOp::Add)?;
+        Ok(target)
     }
 
     fn resolve_update_target(&self, rel: &str) -> Result<PathBuf, PatchError> {
@@ -304,15 +361,48 @@ impl ToolExecutor {
                 path: rel.to_string(),
             });
         }
-        match resolve_within(&self.root, rel) {
-            Ok(p) => Ok(p),
-            Err(ToolExecutionError::OutsideWorkspace) => Err(PatchError::OutsideWorkspace {
-                path: rel.to_string(),
-            }),
-            Err(_) => Err(PatchError::UpdateOnMissingFile {
-                path: rel.to_string(),
-            }),
+        let resolved = match resolve_within(&self.root, rel) {
+            Ok(p) => p,
+            Err(ToolExecutionError::OutsideWorkspace) => {
+                return Err(PatchError::OutsideWorkspace {
+                    path: rel.to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(PatchError::UpdateOnMissingFile {
+                    path: rel.to_string(),
+                });
+            }
+        };
+        self.check_patch_write(&resolved, rel, PatchOp::Update)?;
+        Ok(resolved)
+    }
+
+    /// If `rel_path` syntactically normalises to a location under this
+    /// session's scratchpad, create any missing parent directories.
+    /// Otherwise do nothing (no side effect, no error). Called from
+    /// `resolve_add_target` before `resolve_within` would fail on
+    /// missing parents.
+    fn maybe_pre_create_scratchpad_parent(&self, rel_path: &Path) -> Result<(), PatchError> {
+        let sp_rel = Path::new(".attini")
+            .join(&self.session_name)
+            .join("scratchpad");
+        let joined = Path::new(".").join(rel_path);
+        let Some(normalised) = syntactic_normalize(&joined) else {
+            return Ok(());
+        };
+        if !normalised.starts_with(&sp_rel) {
+            return Ok(());
         }
+        let Some(parent_rel) = normalised.parent() else {
+            return Ok(());
+        };
+        let parent_abs = self.root.join(parent_rel);
+        fs::create_dir_all(&parent_abs).map_err(|e| PatchError::IoError {
+            path: rel_path.to_string_lossy().into_owned(),
+            message: e.to_string(),
+        })?;
+        Ok(())
     }
 
     fn execute_list(
@@ -458,6 +548,272 @@ impl ToolExecutor {
             })
             .to_string(),
         )
+    }
+}
+
+// -------------------------------------------------------------------
+// Patch tool write guards (issue 0038): four-layer check.
+//
+// Layer 1: hardcoded runtime-critical always-reject (canonical-form)
+// Layer 2: scratchpad always-allow (with subdir auto-create)
+// Layer 3: git tracking check (Update: tracked; Add: parent not ignored)
+// Layer 4: not-in-git-repo fallback (all Layer-3 candidates reject)
+// -------------------------------------------------------------------
+
+/// Probe whether `root` is inside a git working tree. If so, capture
+/// the tracked-file set as workspace-relative canonical paths.
+fn probe_git_state(root: &Path) -> GitState {
+    let toplevel = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => {
+            eprintln!(
+                "attini: workspace is not a git repository; patch tool will refuse writes outside scratchpad. Consider `git init` for full patch access."
+            );
+            return GitState::NotARepo;
+        }
+    };
+    // Sanity: repo toplevel must exist and canonicalise. If it does,
+    // we still keep the tracked set even when root is a subdir of the
+    // repo — Layer 3 only cares whether the target path is tracked.
+    let toplevel_str = String::from_utf8_lossy(&toplevel.stdout);
+    if toplevel_str.trim().is_empty() {
+        eprintln!(
+            "attini: `git rev-parse --show-toplevel` returned empty; patch tool will refuse writes outside scratchpad."
+        );
+        return GitState::NotARepo;
+    }
+    let ls_out = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("ls-files")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        Ok(_) | Err(_) => {
+            eprintln!(
+                "attini: `git ls-files` failed; patch tool will treat all files as untracked."
+            );
+            return GitState::Repo {
+                tracked: RefCell::new(HashSet::new()),
+            };
+        }
+    };
+    let mut tracked: HashSet<PathBuf> = HashSet::new();
+    for line in String::from_utf8_lossy(&ls_out.stdout).lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let joined = root.join(line);
+        let canon = match joined.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Ok(rel) = canon.strip_prefix(root) {
+            tracked.insert(rel.to_path_buf());
+        }
+    }
+    GitState::Repo {
+        tracked: RefCell::new(tracked),
+    }
+}
+
+/// Given a canonical absolute path known to be under `root`, return
+/// the workspace-relative canonical form. Returns `None` if the
+/// caller passed a path outside `root`.
+fn workspace_relative_canonical(canon: &Path, root: &Path) -> Option<PathBuf> {
+    canon.strip_prefix(root).ok().map(|p| p.to_path_buf())
+}
+
+/// Layer 1 pattern match on a workspace-relative canonical path.
+/// Returns `Some(reason)` describing why the path is runtime-critical,
+/// or `None` if it is not covered by Layer 1.
+fn layer1_reject_reason(rel: &Path) -> Option<&'static str> {
+    let comps: Vec<Component<'_>> = rel.components().collect();
+    let seg = |i: usize| -> Option<&str> {
+        comps.get(i).and_then(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+    };
+    match seg(0)? {
+        ".git" => Some("git metadata"),
+        ".attini" => {
+            let name1 = seg(1)?;
+            if comps.len() == 2 {
+                match name1 {
+                    "permissions.json" => Some("workspace permissions"),
+                    "memories.md" => Some("workspace memories"),
+                    _ => None,
+                }
+            } else if comps.len() == 3 {
+                match seg(2)? {
+                    "LOCK" => Some("session runtime state"),
+                    "conversation.jsonl" => Some("session runtime state"),
+                    "pending.json" => Some("session runtime state"),
+                    "permissions.json" => Some("session permissions"),
+                    "memories.md" => Some("session memories"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Textually resolve `.` and `..` components in `path` without
+/// touching the filesystem. Returns `None` if `..` would rise above
+/// the root (leading `..` on a relative path with no ancestors to
+/// pop).
+fn syntactic_normalize(path: &Path) -> Option<PathBuf> {
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {
+                    // Cannot pop the root; a `..` here stays as-is
+                    // (matches POSIX behaviour for `/../`).
+                }
+                _ => {
+                    out.push(Component::ParentDir);
+                }
+            },
+            other => out.push(other),
+        }
+    }
+    let mut buf = PathBuf::new();
+    for c in out {
+        buf.push(c.as_os_str());
+    }
+    Some(buf)
+}
+
+/// Absolute canonical prefix of this session's scratchpad. Callers
+/// use this to check whether a target path is Layer-2 eligible.
+fn scratchpad_root(root: &Path, session_name: &str) -> PathBuf {
+    root.join(".attini").join(session_name).join("scratchpad")
+}
+
+impl ToolExecutor {
+    /// Check whether an already-canonical absolute `canon` path is
+    /// allowed for patch write. Called after `resolve_within` has
+    /// verified the workspace boundary. Returns `Ok(())` on allow;
+    /// otherwise returns the specific `PatchError` variant that
+    /// caller should surface.
+    fn check_patch_write(
+        &self,
+        canon: &Path,
+        rel_hint: &str,
+        op: PatchOp,
+    ) -> Result<(), PatchError> {
+        let rel = match workspace_relative_canonical(canon, &self.root) {
+            Some(r) => r,
+            None => {
+                return Err(PatchError::OutsideWorkspace {
+                    path: rel_hint.to_string(),
+                });
+            }
+        };
+        // Layer 1
+        if let Some(reason) = layer1_reject_reason(&rel) {
+            return Err(PatchError::ExcludedPath {
+                path: display_workspace_relative(&rel),
+                reason: reason.to_string(),
+            });
+        }
+        // Layer 2 (canonical re-verification): if canon lives under
+        // this session's canonical scratchpad, allow unconditionally.
+        // Callers must have already ensured any needed subdir was
+        // created in the Add path (see resolve_add_target).
+        if let Ok(sp_canon) = scratchpad_root(&self.root, &self.session_name).canonicalize()
+            && canon.starts_with(&sp_canon)
+        {
+            return Ok(());
+        }
+        // Layer 3 / 4
+        match &self.git_state {
+            GitState::NotARepo => Err(PatchError::NotInGitRepo {
+                path: display_workspace_relative(&rel),
+            }),
+            GitState::Repo { tracked } => match op {
+                PatchOp::Update => {
+                    if tracked.borrow().contains(&rel) {
+                        Ok(())
+                    } else {
+                        Err(PatchError::UntrackedTarget {
+                            path: display_workspace_relative(&rel),
+                        })
+                    }
+                }
+                PatchOp::Add => {
+                    let parent_rel = rel.parent().unwrap_or(Path::new(""));
+                    if is_gitignored(&self.root, parent_rel) {
+                        Err(PatchError::IgnoredParent {
+                            path: display_workspace_relative(&rel),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        }
+    }
+
+    /// Record a successful Add so subsequent Update on the same path
+    /// within this invocation is not rejected as untracked.
+    fn mark_added(&self, canon: &Path) {
+        let GitState::Repo { tracked } = &self.git_state else {
+            return;
+        };
+        if let Some(rel) = workspace_relative_canonical(canon, &self.root) {
+            tracked.borrow_mut().insert(rel);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchOp {
+    Add,
+    Update,
+}
+
+fn display_workspace_relative(rel: &Path) -> String {
+    rel.to_string_lossy().into_owned()
+}
+
+/// Run `git -C <root> check-ignore --quiet <candidate>`. Exit 0 means
+/// the candidate is ignored; anything else (including "not ignored",
+/// missing git, or the candidate being empty) means not ignored so
+/// far as we can tell.
+fn is_gitignored(root: &Path, candidate: &Path) -> bool {
+    let target = if candidate.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        candidate
+    };
+    match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["check-ignore", "--quiet"])
+        .arg(target)
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
     }
 }
 

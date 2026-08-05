@@ -157,7 +157,11 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
     let mut candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
     candidates.extend(cfg.extra_read_paths_cli.iter().cloned());
     let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
-    let executor = ToolExecutor::new(&cfg.workspace_root, extra_read_roots)?;
+    let executor = ToolExecutor::new(
+        &cfg.workspace_root,
+        extra_read_roots,
+        cfg.session_name.clone(),
+    )?;
 
     let start_ts = now_unix_millis();
     session.append(&SessionRecord::InvocationStart {
