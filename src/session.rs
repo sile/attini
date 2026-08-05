@@ -4,17 +4,17 @@
 //! Each session lives under `.attini/{SESSION_NAME}/` relative to
 //! the current working directory:
 //!
-//! - `LOCK` — exclusive lock file created with `O_EXCL` on open.
-//!   Removed on graceful `Session::close`. A stale file (from a
-//!   crashed run) must be removed manually.
+//! - `LOCK` — exclusive lock file created with `O_EXCL` on open;
+//!   contains `{"pid": i32, "started_at_unix_ms": u64}` of the
+//!   holder. Removed on `Session::close` / `Drop`. Stale LOCKs
+//!   (holder PID dead or file corrupted) are auto-recovered by
+//!   one retry on the next `Session::open`.
 //! - `conversation.jsonl` — append-only history. One JSON object
 //!   per line, tagged by `kind`. User / assistant / tool records
 //!   are the source of truth for reconstructing conversation
 //!   context on subsequent invocations.
 //! - `pending.json` — present iff the previous invocation
 //!   suspended waiting for approval. Absent otherwise.
-//!
-//! Spike scope; not production-hardened.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -39,9 +39,10 @@ pub struct Session {
 
 impl Session {
     /// Open (or create) the session directory for `name` under
-    /// `.attini/` in the current working directory. Acquires the
-    /// exclusive lock; returns `Err` if another process already
-    /// holds it (or crashed with a stale LOCK).
+    /// `.attini/` in the current working directory. Takes the LOCK
+    /// via `O_EXCL` and writes the holder's PID / start time. If the
+    /// LOCK is stale (corrupted or holder dead), one retry is
+    /// attempted; otherwise returns `Err(AlreadyExists)` with a hint.
     pub fn open(name: &str) -> io::Result<Self> {
         if name.is_empty() {
             return Err(io::Error::new(
@@ -58,23 +59,7 @@ impl Session {
         let dir = PathBuf::from(".attini").join(name);
         fs::create_dir_all(&dir)?;
         let lock_path = dir.join("LOCK");
-        let lock = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::AlreadyExists {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "session {name:?} is locked ({}). Remove it manually if the previous invocation crashed.",
-                            lock_path.display()
-                        ),
-                    )
-                } else {
-                    e
-                }
-            })?;
+        let lock = acquire_lock_with_stale_retry(name, &lock_path)?;
         let conversation_path = dir.join("conversation.jsonl");
         let pending_path = dir.join("pending.json");
         let writer = OpenOptions::new()
@@ -176,6 +161,151 @@ impl Drop for Session {
         // Best-effort unlock. Explicit `close()` returns errors;
         // Drop swallows them.
         let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+// -------------------------------------------------------------------
+// LOCK acquisition (with stale detection)
+// -------------------------------------------------------------------
+
+fn acquire_lock_with_stale_retry(name: &str, lock_path: &Path) -> io::Result<File> {
+    match acquire_lock(lock_path) {
+        Ok(file) => Ok(file),
+        Err(AcquireError::Io(e)) => Err(e),
+        Err(AcquireError::Locked) => match classify_existing_lock(lock_path) {
+            LockStatus::PidAlive(pid) => Err(lock_conflict_error(name, lock_path, Some(pid))),
+            LockStatus::PidDead | LockStatus::Corrupted => {
+                let _ = fs::remove_file(lock_path);
+                match acquire_lock(lock_path) {
+                    Ok(file) => Ok(file),
+                    Err(AcquireError::Io(e)) => Err(e),
+                    Err(AcquireError::Locked) => Err(lock_conflict_error(name, lock_path, None)),
+                }
+            }
+        },
+    }
+}
+
+enum AcquireError {
+    Locked,
+    Io(io::Error),
+}
+
+fn acquire_lock(path: &Path) -> Result<File, AcquireError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                AcquireError::Locked
+            } else {
+                AcquireError::Io(e)
+            }
+        })?;
+    let body = LockBody {
+        pid: std::process::id() as i32,
+        started_at_unix_ms: now_unix_millis(),
+    };
+    let text = Json(&body).to_string();
+    file.write_all(text.as_bytes()).map_err(AcquireError::Io)?;
+    file.sync_all().map_err(AcquireError::Io)?;
+    Ok(file)
+}
+
+fn lock_conflict_error(name: &str, lock_path: &Path, holder_pid: Option<i32>) -> io::Error {
+    let pid_hint = match holder_pid {
+        Some(pid) => format!(" (holder pid {pid})"),
+        None => String::new(),
+    };
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "session {name:?} is locked{pid_hint}: {path}\n\
+             If no attini process is actually holding it, remove the LOCK manually: \
+             `rm {path}` (or `attini session unlock {name}` once that command lands).",
+            path = lock_path.display(),
+        ),
+    )
+}
+
+enum LockStatus {
+    Corrupted,
+    PidDead,
+    PidAlive(i32),
+}
+
+fn classify_existing_lock(path: &Path) -> LockStatus {
+    let text = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return LockStatus::Corrupted,
+    };
+    let (pid, _started_at) = match parse_lock_body(&text) {
+        Some(v) => v,
+        None => return LockStatus::Corrupted,
+    };
+    match probe_pid(pid) {
+        PidStatus::Dead => LockStatus::PidDead,
+        PidStatus::Alive | PidStatus::EPerm => LockStatus::PidAlive(pid),
+    }
+}
+
+fn parse_lock_body(text: &str) -> Option<(i32, u64)> {
+    let json = RawJson::parse(text).ok()?;
+    let value = json.value();
+    let pid_i64: i64 = value
+        .to_member("pid")
+        .ok()?
+        .required()
+        .ok()?
+        .try_into()
+        .ok()?;
+    let started_at_unix_ms: u64 = value
+        .to_member("started_at_unix_ms")
+        .ok()?
+        .required()
+        .ok()?
+        .try_into()
+        .ok()?;
+    let pid: i32 = pid_i64.try_into().ok()?;
+    if pid <= 0 {
+        return None;
+    }
+    Some((pid, started_at_unix_ms))
+}
+
+enum PidStatus {
+    Alive,
+    Dead,
+    EPerm,
+}
+
+fn probe_pid(pid: i32) -> PidStatus {
+    // SAFETY: `kill` with signal 0 does not send a signal; it only
+    // probes whether the process (or one with the same effective
+    // uid) exists. No memory safety concerns.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return PidStatus::Alive;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(errno) if errno == libc::ESRCH => PidStatus::Dead,
+        Some(errno) if errno == libc::EPERM => PidStatus::EPerm,
+        _ => PidStatus::Alive,
+    }
+}
+
+struct LockBody {
+    pid: i32,
+    started_at_unix_ms: u64,
+}
+
+impl DisplayJson for LockBody {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("pid", self.pid)?;
+            f.member("started_at_unix_ms", self.started_at_unix_ms)
+        })
     }
 }
 
