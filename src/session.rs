@@ -21,7 +21,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
+use nojson::{DisplayJson, Json, JsonFormatter, JsonParseError, RawJson};
 
 use crate::sansio::deepseek::{ChatMessage, ToolCall};
 
@@ -76,6 +76,12 @@ impl Session {
     /// so far, in order. Unknown record kinds are skipped
     /// (forward-compat). Malformed lines abort the load with an
     /// error since a corrupt history is not safely recoverable.
+    ///
+    /// Note: this loader ignores any `summary` records. Callers that
+    /// need compaction-aware loading should use
+    /// [`Session::load_summaries`] plus
+    /// [`Session::load_records_since_last_summary`] and combine the
+    /// two themselves.
     pub fn load_conversation(&self) -> io::Result<Vec<ChatMessage>> {
         let file = match File::open(&self.conversation_path) {
             Ok(f) => f,
@@ -100,6 +106,115 @@ impl Session {
             }
         }
         Ok(messages)
+    }
+
+    /// Return every summary text ever written to
+    /// `conversation.jsonl`, in time order. Callers concatenate
+    /// these as system messages before real records. Missing file
+    /// yields an empty vector.
+    pub fn load_summaries(&self) -> io::Result<Vec<SummaryRecord>> {
+        let file = match File::open(&self.conversation_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut summaries = Vec::new();
+        for (i, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_summary_line(&line) {
+                Ok(Some(s)) => summaries.push(s),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "malformed conversation record at line {}: {e}",
+                        i + 1
+                    )));
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    /// Return the real records (`user` / `assistant` / `tool`)
+    /// whose `ts` is greater than the `cutoff_ts` of the newest
+    /// summary. When there is no summary, every real record is
+    /// returned.
+    pub fn load_records_since_last_summary(&self) -> io::Result<Vec<ChatMessageWithTs>> {
+        let file = match File::open(&self.conversation_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut latest_cutoff: Option<u64> = None;
+        let mut records: Vec<ChatMessageWithTs> = Vec::new();
+        for (i, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_conversation_line_with_meta(&line) {
+                Ok(LineKind::Message { message, ts }) => {
+                    records.push(ChatMessageWithTs { message, ts });
+                }
+                Ok(LineKind::Summary { cutoff_ts }) => {
+                    latest_cutoff = Some(match latest_cutoff {
+                        Some(prev) => prev.max(cutoff_ts),
+                        None => cutoff_ts,
+                    });
+                }
+                Ok(LineKind::Other) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "malformed conversation record at line {}: {e}",
+                        i + 1
+                    )));
+                }
+            }
+        }
+        if let Some(cutoff) = latest_cutoff {
+            records.retain(|r| r.ts > cutoff);
+        }
+        Ok(records)
+    }
+
+    /// Latest `prompt_tokens` value recorded in `token_usage`
+    /// records so far. Used by the compaction trigger to decide
+    /// whether to summarise before the next invocation.
+    pub fn latest_prompt_tokens(&self) -> io::Result<Option<u64>> {
+        let file = match File::open(&self.conversation_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut latest: Option<u64> = None;
+        for (i, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_prompt_tokens(&line) {
+                Ok(Some(v)) => latest = Some(v),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "malformed conversation record at line {}: {e}",
+                        i + 1
+                    )));
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    pub fn conversation_path(&self) -> &Path {
+        &self.conversation_path
+    }
+
+    pub fn pending_path(&self) -> &Path {
+        &self.pending_path
     }
 
     /// Append a record to `conversation.jsonl` and flush.
@@ -222,6 +337,10 @@ pub struct ConversationSummary {
     /// `auto_decided_by` sidecar (rule-driven auto deny or
     /// plan-mode reject).
     pub approvals_auto_deny: u64,
+    pub summaries: u64,
+    pub last_prompt_tokens: Option<u64>,
+    pub last_prompt_cache_hit_tokens: Option<u64>,
+    pub last_prompt_cache_miss_tokens: Option<u64>,
 }
 
 /// Walk `conversation.jsonl` and produce a summary. Missing file →
@@ -288,6 +407,31 @@ fn classify_record(line: &str, out: &mut ConversationSummary) -> Result<(), Stri
             }
         }
         "tool" => out.tool_messages += 1,
+        "summary" => out.summaries += 1,
+        "token_usage" => {
+            if let Ok(usage_m) = value.to_member("usage")
+                && let Some(usage) = usage_m.optional()
+            {
+                out.last_prompt_tokens = usage
+                    .to_member("prompt_tokens")
+                    .ok()
+                    .and_then(|m| m.optional())
+                    .and_then(|v| v.try_into().ok())
+                    .or(out.last_prompt_tokens);
+                out.last_prompt_cache_hit_tokens = usage
+                    .to_member("prompt_cache_hit_tokens")
+                    .ok()
+                    .and_then(|m| m.optional())
+                    .and_then(|v| v.try_into().ok())
+                    .or(out.last_prompt_cache_hit_tokens);
+                out.last_prompt_cache_miss_tokens = usage
+                    .to_member("prompt_cache_miss_tokens")
+                    .ok()
+                    .and_then(|m| m.optional())
+                    .and_then(|v| v.try_into().ok())
+                    .or(out.last_prompt_cache_miss_tokens);
+            }
+        }
         "tool_approval" => {
             let decision = value
                 .to_member("decision")
@@ -565,6 +709,25 @@ pub enum SessionRecord {
         ts: u64,
         counters: MetricsSnapshotBody,
     },
+    /// Per-turn token usage reported by the model. Appended after
+    /// each successful assistant turn when the streaming response
+    /// carried a `usage` object. Compaction reads the latest
+    /// `prompt_tokens` from these records to decide whether to
+    /// summarise before the next invocation.
+    TokenUsage {
+        ts: u64,
+        body: TokenUsageBody,
+    },
+    /// A compaction summary that replaces the range of real records
+    /// from `since_ts` up to and including `cutoff_ts`. Multiple
+    /// summaries accumulate in time order; the shell reads them all
+    /// and only the real records after the latest `cutoff_ts`.
+    Summary {
+        ts: u64,
+        since_ts: u64,
+        cutoff_ts: u64,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,6 +805,42 @@ impl DisplayJson for MetricsSnapshotBody {
     }
 }
 
+/// Per-turn token usage payload for `SessionRecord::TokenUsage`.
+/// All fields are optional because different models populate
+/// different subsets; only `prompt_tokens` is required for
+/// compaction to trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsageBody {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub prompt_cache_hit_tokens: Option<u64>,
+    pub prompt_cache_miss_tokens: Option<u64>,
+}
+
+impl DisplayJson for TokenUsageBody {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            if let Some(v) = self.prompt_tokens {
+                f.member("prompt_tokens", v)?;
+            }
+            if let Some(v) = self.completion_tokens {
+                f.member("completion_tokens", v)?;
+            }
+            if let Some(v) = self.total_tokens {
+                f.member("total_tokens", v)?;
+            }
+            if let Some(v) = self.prompt_cache_hit_tokens {
+                f.member("prompt_cache_hit_tokens", v)?;
+            }
+            if let Some(v) = self.prompt_cache_miss_tokens {
+                f.member("prompt_cache_miss_tokens", v)?;
+            }
+            Ok(())
+        })
+    }
+}
+
 impl DisplayJson for SessionRecord {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         match self {
@@ -707,8 +906,150 @@ impl DisplayJson for SessionRecord {
                 f.member("ts", ts)?;
                 f.member("counters", counters)
             }),
+            Self::TokenUsage { ts, body } => f.object(|f| {
+                f.member("kind", "token_usage")?;
+                f.member("ts", ts)?;
+                f.member("usage", body)
+            }),
+            Self::Summary {
+                ts,
+                since_ts,
+                cutoff_ts,
+                text,
+            } => f.object(|f| {
+                f.member("kind", "summary")?;
+                f.member("ts", ts)?;
+                f.member("since_ts", since_ts)?;
+                f.member("cutoff_ts", cutoff_ts)?;
+                f.member("text", text)
+            }),
         }
     }
+}
+
+/// One `summary` record from `conversation.jsonl`, with the
+/// metadata compaction and inspection code needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryRecord {
+    pub ts: u64,
+    pub since_ts: u64,
+    pub cutoff_ts: u64,
+    pub text: String,
+}
+
+/// A conversation `ChatMessage` paired with the `ts` of the record
+/// it came from. Used by compaction to decide safe cutoff
+/// boundaries and to compute `since_ts` for a new summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessageWithTs {
+    pub message: ChatMessage,
+    pub ts: u64,
+}
+
+enum LineKind {
+    Message { message: ChatMessage, ts: u64 },
+    Summary { cutoff_ts: u64 },
+    Other,
+}
+
+fn parse_conversation_line_with_meta(line: &str) -> Result<LineKind, String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    match kind.as_str() {
+        "user" | "assistant" | "tool" => {
+            let ts: u64 = value
+                .to_member("ts")
+                .and_then(|m| m.required())
+                .and_then(|m| m.try_into())
+                .map_err(|e| e.to_string())?;
+            let message = parse_conversation_line(line)?.ok_or_else(|| {
+                "kind matched user/assistant/tool but parse_conversation_line returned None"
+                    .to_string()
+            })?;
+            Ok(LineKind::Message { message, ts })
+        }
+        "summary" => {
+            let cutoff_ts: u64 = value
+                .to_member("cutoff_ts")
+                .and_then(|m| m.required())
+                .and_then(|m| m.try_into())
+                .map_err(|e| e.to_string())?;
+            Ok(LineKind::Summary { cutoff_ts })
+        }
+        _ => Ok(LineKind::Other),
+    }
+}
+
+fn parse_summary_line(line: &str) -> Result<Option<SummaryRecord>, String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    if kind != "summary" {
+        return Ok(None);
+    }
+    let ts: u64 = value
+        .to_member("ts")
+        .and_then(|m| m.required())
+        .and_then(|m| m.try_into())
+        .map_err(|e| e.to_string())?;
+    let since_ts: u64 = value
+        .to_member("since_ts")
+        .and_then(|m| m.required())
+        .and_then(|m| m.try_into())
+        .map_err(|e| e.to_string())?;
+    let cutoff_ts: u64 = value
+        .to_member("cutoff_ts")
+        .and_then(|m| m.required())
+        .and_then(|m| m.try_into())
+        .map_err(|e| e.to_string())?;
+    let text = read_string(value, "text")?;
+    Ok(Some(SummaryRecord {
+        ts,
+        since_ts,
+        cutoff_ts,
+        text,
+    }))
+}
+
+fn parse_prompt_tokens(line: &str) -> Result<Option<u64>, String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    if kind != "token_usage" {
+        return Ok(None);
+    }
+    let Some(usage) = value
+        .to_member("usage")
+        .map_err(|e| e.to_string())?
+        .optional()
+    else {
+        return Ok(None);
+    };
+    let Some(pt) = usage
+        .to_member("prompt_tokens")
+        .map_err(|e| e.to_string())?
+        .optional()
+    else {
+        return Ok(None);
+    };
+    let n: u64 = pt.try_into().map_err(|e: JsonParseError| e.to_string())?;
+    Ok(Some(n))
 }
 
 /// Extract a [`ChatMessage`] from one JSON Lines record if the
@@ -984,6 +1325,138 @@ mod tests {
                 assert_eq!(content, r#"{"ok":true}"#);
             }
             other => panic!("expected tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summary_record_roundtrips_through_parse_summary_line() {
+        let record = SessionRecord::Summary {
+            ts: 100,
+            since_ts: 10,
+            cutoff_ts: 90,
+            text: "user asked for X".to_string(),
+        };
+        let line = nojson::Json(&record).to_string();
+        let parsed = parse_summary_line(&line)
+            .expect("parse ok")
+            .expect("summary yields SummaryRecord");
+        assert_eq!(parsed.ts, 100);
+        assert_eq!(parsed.since_ts, 10);
+        assert_eq!(parsed.cutoff_ts, 90);
+        assert_eq!(parsed.text, "user asked for X");
+    }
+
+    #[test]
+    fn summary_record_is_not_returned_by_parse_conversation_line() {
+        // Compaction API split: `load_conversation` (which uses
+        // `parse_conversation_line`) must not surface summary
+        // records as ChatMessages — those are exposed via
+        // `load_summaries` instead.
+        let record = SessionRecord::Summary {
+            ts: 100,
+            since_ts: 10,
+            cutoff_ts: 90,
+            text: "should not appear as ChatMessage".to_string(),
+        };
+        let line = nojson::Json(&record).to_string();
+        let parsed = parse_conversation_line(&line).expect("parse ok");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn token_usage_record_serialises_only_present_fields() {
+        let record = SessionRecord::TokenUsage {
+            ts: 42,
+            body: TokenUsageBody {
+                prompt_tokens: Some(1000),
+                completion_tokens: None,
+                total_tokens: Some(1050),
+                prompt_cache_hit_tokens: Some(800),
+                prompt_cache_miss_tokens: Some(200),
+            },
+        };
+        let line = nojson::Json(&record).to_string();
+        assert_eq!(
+            line,
+            r#"{"kind":"token_usage","ts":42,"usage":{"prompt_tokens":1000,"total_tokens":1050,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}}"#
+        );
+    }
+
+    #[test]
+    fn parse_prompt_tokens_returns_none_for_non_token_usage_lines() {
+        let record = SessionRecord::User {
+            ts: 1,
+            text: "hi".to_string(),
+        };
+        let line = nojson::Json(&record).to_string();
+        assert!(parse_prompt_tokens(&line).expect("parse ok").is_none());
+    }
+
+    #[test]
+    fn parse_prompt_tokens_extracts_value_from_token_usage_line() {
+        let record = SessionRecord::TokenUsage {
+            ts: 42,
+            body: TokenUsageBody {
+                prompt_tokens: Some(17_000),
+                ..Default::default()
+            },
+        };
+        let line = nojson::Json(&record).to_string();
+        assert_eq!(parse_prompt_tokens(&line).expect("parse ok"), Some(17_000));
+    }
+
+    #[test]
+    fn parse_prompt_tokens_tolerates_missing_prompt_tokens_field() {
+        let record = SessionRecord::TokenUsage {
+            ts: 42,
+            body: TokenUsageBody {
+                prompt_tokens: None,
+                total_tokens: Some(5),
+                ..Default::default()
+            },
+        };
+        let line = nojson::Json(&record).to_string();
+        assert!(parse_prompt_tokens(&line).expect("parse ok").is_none());
+    }
+
+    #[test]
+    fn parse_conversation_line_with_meta_carries_ts_for_user_records() {
+        let record = SessionRecord::User {
+            ts: 999,
+            text: "hi".to_string(),
+        };
+        let line = nojson::Json(&record).to_string();
+        match parse_conversation_line_with_meta(&line).expect("parse ok") {
+            LineKind::Message { ts, message } => {
+                assert_eq!(ts, 999);
+                assert!(matches!(message, ChatMessage::User(_)));
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_conversation_line_with_meta_recognises_summary_cutoff() {
+        let record = SessionRecord::Summary {
+            ts: 500,
+            since_ts: 100,
+            cutoff_ts: 450,
+            text: "…".to_string(),
+        };
+        let line = nojson::Json(&record).to_string();
+        match parse_conversation_line_with_meta(&line).expect("parse ok") {
+            LineKind::Summary { cutoff_ts } => assert_eq!(cutoff_ts, 450),
+            other => panic!("expected summary, got {other:?}"),
+        }
+    }
+
+    impl std::fmt::Debug for LineKind {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                LineKind::Message { ts, .. } => write!(f, "Message(ts={ts})"),
+                LineKind::Summary { cutoff_ts } => write!(f, "Summary(cutoff_ts={cutoff_ts})"),
+                LineKind::Other => write!(f, "Other"),
+            }
         }
     }
 }
