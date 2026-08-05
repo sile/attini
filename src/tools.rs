@@ -23,21 +23,37 @@ use crate::sansio::agent::{
 /// Workspace-scoped executor for [`ReadOnlyTool`] invocations.
 #[derive(Debug, Clone)]
 pub struct ToolExecutor {
+    /// Workspace root. Both read-only and patch tools use this as the
+    /// primary boundary. Patch tool uses only this field.
     root: PathBuf,
+    /// Additional read-only roots granted via `permissions.json` and
+    /// `attini agent --read-path`. Read-only tools accept paths that
+    /// canonicalise into any of these roots. Patch tool ignores this
+    /// field entirely (write access to these paths is out of scope).
+    extra_read_roots: Vec<PathBuf>,
 }
 
 impl ToolExecutor {
-    /// Create an executor rooted at `root`. The root is canonicalised
-    /// so later boundary checks compare against a stable prefix; any
-    /// entry whose canonical path is not a descendant of the root is
-    /// rejected as [`ToolExecutionError::OutsideWorkspace`].
-    pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
+    /// Create an executor rooted at `root` with additional read-only
+    /// roots granted from `permissions.json` / `--read-path`. The
+    /// workspace root is canonicalised so later boundary checks
+    /// compare against a stable prefix; `extra_read_roots` are
+    /// expected to already be canonicalised by the caller (paths
+    /// that fail to canonicalise should be warned + skipped upstream).
+    pub fn new(root: impl AsRef<Path>, extra_read_roots: Vec<PathBuf>) -> io::Result<Self> {
         let root = root.as_ref().canonicalize()?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            extra_read_roots,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn extra_read_roots(&self) -> &[PathBuf] {
+        &self.extra_read_roots
     }
 
     pub fn execute(&self, tool: ReadOnlyTool) -> ToolOutcome {
@@ -306,7 +322,7 @@ impl ToolExecutor {
         max_entries: usize,
         include_hidden: bool,
     ) -> ToolOutcome {
-        let dir = match resolve_within(&self.root, rel_path) {
+        let dir = match resolve_within_any(&self.root, &self.extra_read_roots, rel_path) {
             Ok(p) => p,
             Err(e) => return ToolOutcome::Err(e),
         };
@@ -336,7 +352,7 @@ impl ToolExecutor {
     }
 
     fn execute_read(&self, rel_path: &str, line_range: Option<(usize, usize)>) -> ToolOutcome {
-        let path = match resolve_within(&self.root, rel_path) {
+        let path = match resolve_within_any(&self.root, &self.extra_read_roots, rel_path) {
             Ok(p) => p,
             Err(e) => return ToolOutcome::Err(e),
         };
@@ -411,7 +427,7 @@ impl ToolExecutor {
             ));
         }
         let base = match path_prefix {
-            Some(p) => match resolve_within(&self.root, p) {
+            Some(p) => match resolve_within_any(&self.root, &self.extra_read_roots, p) {
                 Ok(p) => p,
                 Err(e) => return ToolOutcome::Err(e),
             },
@@ -461,6 +477,42 @@ fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, ToolExecutionError>
         return Err(ToolExecutionError::OutsideWorkspace);
     }
     Ok(canon)
+}
+
+/// Read-only resolver that accepts paths under `workspace_root` or
+/// any of the caller-granted `extra_read_roots`.
+///
+/// - Relative `input` is always joined against `workspace_root` only
+///   (not against the extra roots) so path traversal semantics stay
+///   consistent with what the model already knows.
+/// - Absolute `input` is canonicalised directly and accepted if it
+///   ends up inside any of the roots (workspace or extra).
+///
+/// Patch (write) tool must not use this helper — it stays on the
+/// single-root `resolve_within`.
+fn resolve_within_any(
+    workspace_root: &Path,
+    extra_read_roots: &[PathBuf],
+    input: &str,
+) -> Result<PathBuf, ToolExecutionError> {
+    let input_path = Path::new(input);
+    let candidate = if input_path.is_absolute() {
+        input_path.to_path_buf()
+    } else {
+        workspace_root.join(input_path)
+    };
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| ToolExecutionError::IoError(format!("{input}: {e}")))?;
+    if canon.starts_with(workspace_root) {
+        return Ok(canon);
+    }
+    for extra in extra_read_roots {
+        if canon.starts_with(extra) {
+            return Ok(canon);
+        }
+    }
+    Err(ToolExecutionError::OutsideWorkspace)
 }
 
 enum WalkOutcome {

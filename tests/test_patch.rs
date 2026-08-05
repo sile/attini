@@ -50,7 +50,7 @@ impl Drop for TempRoot {
 }
 
 fn exec(root: &TempRoot) -> ToolExecutor {
-    ToolExecutor::new(root.path()).expect("executor")
+    ToolExecutor::new(root.path(), Vec::new()).expect("executor")
 }
 
 fn add(path: &str, content: &str) -> PatchTool {
@@ -258,4 +258,89 @@ fn apply_add_on_existing_rejects_at_phase1() {
         .expect_err("add on existing");
     assert!(matches!(err, PatchError::AddOnExistingFile { .. }));
     assert_eq!(root.read("racy.txt"), b"other");
+}
+
+// -----------------------------------------------------------------
+// 0037: patch tool must ignore extra_read_roots
+// -----------------------------------------------------------------
+
+#[test]
+fn patch_add_absolute_path_inside_extra_read_root_is_rejected() {
+    // extra_read_roots grant read-only access. Patch (write) must
+    // NOT resolve them — write to an absolute path outside the
+    // workspace has to fail even if the target lives under an
+    // extra_read_root.
+    let root = TempRoot::new("patch-abs-extra-root");
+    let extra = TempRoot::new("patch-abs-extra-source");
+    let extra_canon = extra.path().canonicalize().expect("canon");
+    let executor =
+        ToolExecutor::new(root.path(), vec![extra_canon.clone()]).expect("executor with extras");
+    let target = extra
+        .path()
+        .join("hijack.md")
+        .to_string_lossy()
+        .into_owned();
+    let invocation = inv(vec![add(&target, "gotcha")]);
+    let err = executor
+        .preview_patch(&invocation)
+        .expect_err("absolute add must be rejected");
+    assert!(
+        matches!(err, PatchError::OutsideWorkspace { .. }),
+        "expected OutsideWorkspace, got {err:?}"
+    );
+    assert!(
+        !extra.path().join("hijack.md").exists(),
+        "patch must not have created the file"
+    );
+}
+
+#[test]
+fn patch_update_relative_traversal_into_extra_read_root_is_rejected() {
+    // A relative path with `..` that lands under an extra_read_root
+    // must also be rejected for write. resolve_within stays
+    // single-root; extra_read_roots do not open a write path.
+    let root = TempRoot::new("patch-traversal-workspace");
+    let extra_parent = TempRoot::new("patch-traversal-parent");
+    extra_parent.write("victim.md", b"original\n");
+    let extra_canon = extra_parent.path().canonicalize().expect("canon");
+    let executor = ToolExecutor::new(root.path(), vec![extra_canon]).expect("executor");
+    // Construct a workspace-relative path that resolves outside root.
+    let workspace_canon = root.path().canonicalize().expect("workspace canon");
+    let rel_to_victim = pathdiff_naive(&workspace_canon, &extra_parent.path().join("victim.md"));
+    let invocation = inv(vec![update(&rel_to_victim, "original\n", "hijacked\n")]);
+    let err = executor
+        .preview_patch(&invocation)
+        .expect_err("traversal update must be rejected");
+    assert!(
+        matches!(err, PatchError::OutsideWorkspace { .. }),
+        "expected OutsideWorkspace, got {err:?}"
+    );
+    assert_eq!(extra_parent.read("victim.md"), b"original\n");
+}
+
+/// Best-effort relative path constructor for the traversal test.
+/// Not for production use — assumes both inputs live under the same
+/// system temp dir so a simple `..` chain suffices.
+fn pathdiff_naive(from: &Path, to: &Path) -> String {
+    let from_components: Vec<_> = from.components().collect();
+    let to_components: Vec<_> = to.components().collect();
+    let common = from_components
+        .iter()
+        .zip(to_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = String::new();
+    for _ in common..from_components.len() {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str("..");
+    }
+    for c in &to_components[common..] {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(&c.as_os_str().to_string_lossy());
+    }
+    out
 }
