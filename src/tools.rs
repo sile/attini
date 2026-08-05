@@ -552,7 +552,7 @@ impl ToolExecutor {
 }
 
 // -------------------------------------------------------------------
-// Patch tool write guards (issue 0038): four-layer check.
+// Patch tool write guards: four-layer check.
 //
 // Layer 1: hardcoded runtime-critical always-reject (canonical-form)
 // Layer 2: scratchpad always-allow (with subdir auto-create)

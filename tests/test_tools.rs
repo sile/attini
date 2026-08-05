@@ -49,7 +49,7 @@ impl Drop for TempRoot {
 }
 
 fn executor(root: &TempRoot) -> ToolExecutor {
-    ToolExecutor::new(root.path(), Vec::new()).expect("executor")
+    ToolExecutor::new(root.path(), Vec::new(), "test".to_string()).expect("executor")
 }
 
 fn ok_body(outcome: ToolOutcome) -> String {
@@ -374,7 +374,7 @@ fn executor_with_extras(root: &TempRoot, extras: &[&TempRoot]) -> ToolExecutor {
         .iter()
         .map(|r| r.path().canonicalize().expect("canonicalise extra"))
         .collect();
-    ToolExecutor::new(root.path(), extras).expect("executor")
+    ToolExecutor::new(root.path(), extras, "test".to_string()).expect("executor")
 }
 
 #[test]

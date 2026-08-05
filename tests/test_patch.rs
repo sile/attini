@@ -50,7 +50,38 @@ impl Drop for TempRoot {
 }
 
 fn exec(root: &TempRoot) -> ToolExecutor {
-    ToolExecutor::new(root.path(), Vec::new()).expect("executor")
+    // Patch tool is now gated by git-tracking checks. Initialise the
+    // TempRoot as a git repo and `git add -A` any pre-existing files
+    // so Layer 3 sees them as tracked; anything the test writes after
+    // this call is Add-time under a non-ignored parent, which Layer 3
+    // also allows.
+    git_init_and_add_all(root.path());
+    ToolExecutor::new(root.path(), Vec::new(), "test".to_string()).expect("executor")
+}
+
+fn git_init_and_add_all(root: &Path) {
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["init", "-q"])
+        .status();
+    // Set a local identity so `git add` does not fail even if the
+    // environment lacks a global user.email / user.name.
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "user.email", "attini-test@example.com"])
+        .status();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "user.name", "Attini Test"])
+        .status();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["add", "-A"])
+        .status();
 }
 
 fn add(path: &str, content: &str) -> PatchTool {
@@ -273,8 +304,8 @@ fn patch_add_absolute_path_inside_extra_read_root_is_rejected() {
     let root = TempRoot::new("patch-abs-extra-root");
     let extra = TempRoot::new("patch-abs-extra-source");
     let extra_canon = extra.path().canonicalize().expect("canon");
-    let executor =
-        ToolExecutor::new(root.path(), vec![extra_canon.clone()]).expect("executor with extras");
+    let executor = ToolExecutor::new(root.path(), vec![extra_canon.clone()], "test".to_string())
+        .expect("executor with extras");
     let target = extra
         .path()
         .join("hijack.md")
@@ -303,7 +334,8 @@ fn patch_update_relative_traversal_into_extra_read_root_is_rejected() {
     let extra_parent = TempRoot::new("patch-traversal-parent");
     extra_parent.write("victim.md", b"original\n");
     let extra_canon = extra_parent.path().canonicalize().expect("canon");
-    let executor = ToolExecutor::new(root.path(), vec![extra_canon]).expect("executor");
+    let executor =
+        ToolExecutor::new(root.path(), vec![extra_canon], "test".to_string()).expect("executor");
     // Construct a workspace-relative path that resolves outside root.
     let workspace_canon = root.path().canonicalize().expect("workspace canon");
     let rel_to_victim = pathdiff_naive(&workspace_canon, &extra_parent.path().join("victim.md"));
@@ -316,6 +348,248 @@ fn patch_update_relative_traversal_into_extra_read_root_is_rejected() {
         "expected OutsideWorkspace, got {err:?}"
     );
     assert_eq!(extra_parent.read("victim.md"), b"original\n");
+}
+
+// -----------------------------------------------------------------
+// patch write guards (Layer 1-4)
+// -----------------------------------------------------------------
+
+/// Build an executor whose workspace is initialised as a git repo,
+/// with pre-existing files at `initial_tracked` staged so they enter
+/// the tracked set. Both a session-local scratchpad (`test` session,
+/// mirroring the test helper above) and any `.attini/{other}/` dirs
+/// requested by the caller are created after `git add -A` so they
+/// stay untracked (matches the runtime shape where `.attini/` is
+/// gitignored).
+fn exec_with_git(root: &TempRoot, other_sessions: &[&str]) -> ToolExecutor {
+    git_init_and_add_all(root.path());
+    // Create scratchpad (SessionPaths equivalent) after git init.
+    fs::create_dir_all(root.path().join(".attini/test/scratchpad")).expect("mkdir scratchpad");
+    for other in other_sessions {
+        fs::create_dir_all(root.path().join(format!(".attini/{other}"))).expect("mkdir other");
+    }
+    ToolExecutor::new(root.path(), Vec::new(), "test".to_string()).expect("executor")
+}
+
+#[test]
+fn layer1_rejects_git_metadata_add_bypasses_gitignore_check() {
+    // Regression for F1: `.git/hooks/new-hook` is not gitignored
+    // (git manages the .git dir specially), so Layer 3's
+    // check-ignore says "not ignored" and would allow Add. Layer 1
+    // must catch it first.
+    let root = TempRoot::new("layer1-git-add");
+    let executor = exec_with_git(&root, &[]);
+    fs::create_dir_all(root.path().join(".git/hooks")).expect("mkdir hooks");
+    let err = executor
+        .preview_patch(&inv(vec![add(".git/hooks/pre-commit", "#!/bin/sh")]))
+        .expect_err("reject");
+    assert!(
+        matches!(err, PatchError::ExcludedPath { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn layer1_rejects_syntactic_bypass_variants_of_git_metadata() {
+    // `./.git/HEAD` and `x/../.git/HEAD` canonicalise to the same
+    // workspace-relative path as `.git/HEAD`. Layer 1 matches on
+    // canonical form and must reject all three.
+    let root = TempRoot::new("layer1-syntactic");
+    root.write(".git/HEAD", b"ref\n");
+    // Some other file exists so `x/../.git/HEAD` has a real
+    // intermediate component to traverse through.
+    root.write("noise.txt", b"x");
+    let executor = exec_with_git(&root, &[]);
+    for variant in [".git/HEAD", "./.git/HEAD", "noise.txt/../.git/HEAD"] {
+        let err = executor
+            .preview_patch(&inv(vec![update(variant, "ref\n", "hijack\n")]))
+            .expect_err("reject");
+        assert!(
+            matches!(err, PatchError::ExcludedPath { .. }),
+            "variant {variant:?} did not hit Layer 1: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn layer1_rejects_other_session_runtime_state() {
+    // I1: `main` session's agent must not touch `work` session's
+    // LOCK / conversation.jsonl even if the target somehow becomes
+    // git-tracked.
+    let root = TempRoot::new("layer1-other-session");
+    root.write(".attini/work/LOCK", b"{\"pid\":123}");
+    let executor = exec_with_git(&root, &[]);
+    let err = executor
+        .preview_patch(&inv(vec![update(
+            ".attini/work/LOCK",
+            "{\"pid\":123}",
+            "x",
+        )]))
+        .expect_err("reject");
+    assert!(
+        matches!(err, PatchError::ExcludedPath { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn layer1_rejects_workspace_permissions_and_memories() {
+    let root = TempRoot::new("layer1-workspace-scoped");
+    root.write(".attini/permissions.json", b"{\"command_prefixes\":[]}");
+    root.write(".attini/memories.md", b"# global\n");
+    let executor = exec_with_git(&root, &[]);
+    for path in [".attini/permissions.json", ".attini/memories.md"] {
+        let err = executor
+            .preview_patch(&inv(vec![update(path, "# global\n", "hijack")]))
+            .expect_err(path);
+        assert!(
+            matches!(err, PatchError::ExcludedPath { .. }),
+            "path {path}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn layer2_allows_scratchpad_add_with_subdir_auto_create() {
+    let root = TempRoot::new("layer2-scratchpad-subdir");
+    let executor = exec_with_git(&root, &[]);
+    executor
+        .preview_patch(&inv(vec![add(
+            ".attini/test/scratchpad/plans/2026-08-05.md",
+            "# plan\n",
+        )]))
+        .expect("scratchpad subdir Add ok");
+}
+
+#[test]
+fn layer2_syntactic_bypass_does_not_leak_side_effect_outside_scratchpad() {
+    // Regression for N2-I1: `.attini/test/scratchpad/../../../malicious/foo.md`
+    // syntactically normalises to `malicious/foo.md`, so the Layer 2
+    // pre-create MUST NOT run (no `malicious/` directory created)
+    // and the Add falls through to Layer 3.
+    let root = TempRoot::new("layer2-syntactic-bypass");
+    let executor = exec_with_git(&root, &[]);
+    let outcome = executor.preview_patch(&inv(vec![add(
+        ".attini/test/scratchpad/../../../malicious/foo.md",
+        "gotcha",
+    )]));
+    let err = outcome.expect_err("bypass must be rejected");
+    // Either OutsideWorkspace or NotInGitRepo / IgnoredParent — the
+    // point is the side effect must not have created a directory.
+    assert!(
+        !root.path().join("malicious").exists(),
+        "Layer 2 pre-create leaked outside scratchpad ({err:?})"
+    );
+}
+
+#[test]
+fn layer2_other_session_scratchpad_is_not_layer2() {
+    // Layer 2 covers only the current session's scratchpad. Other
+    // session's scratchpad falls through to Layer 3 (which sees the
+    // path as untracked → reject on Update, gitignored parent →
+    // reject on Add if `.attini/` is gitignored, else allow on Add).
+    let root = TempRoot::new("layer2-other-session-scratchpad");
+    fs::create_dir_all(root.path().join(".attini/other/scratchpad"))
+        .expect("mkdir other scratchpad");
+    let executor = exec_with_git(&root, &["other"]);
+    root.write(".attini/other/scratchpad/notes.md", b"prev\n");
+    let err = executor
+        .preview_patch(&inv(vec![update(
+            ".attini/other/scratchpad/notes.md",
+            "prev\n",
+            "hijack",
+        )]))
+        .expect_err("other session scratchpad must not be Layer 2");
+    // File was created after git add, so tracked set does not
+    // contain it → UntrackedTarget for Update.
+    assert!(
+        matches!(err, PatchError::UntrackedTarget { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn layer3_update_rejects_untracked_file() {
+    let root = TempRoot::new("layer3-untracked");
+    let executor = exec_with_git(&root, &[]);
+    // Create AFTER git init → untracked.
+    root.write("untracked.md", b"before\n");
+    let err = executor
+        .preview_patch(&inv(vec![update("untracked.md", "before\n", "after\n")]))
+        .expect_err("reject");
+    assert!(
+        matches!(err, PatchError::UntrackedTarget { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn layer3_update_allows_tracked_file() {
+    let root = TempRoot::new("layer3-tracked");
+    root.write("tracked.md", b"before\n");
+    let executor = exec_with_git(&root, &[]); // git add -A picks up tracked.md
+    executor
+        .preview_patch(&inv(vec![update("tracked.md", "before\n", "after\n")]))
+        .expect("tracked Update ok");
+}
+
+#[test]
+fn layer3_add_rejects_when_parent_is_gitignored() {
+    let root = TempRoot::new("layer3-ignored-parent");
+    root.write(".gitignore", b"ignored/\n");
+    root.write("ignored/keep", b"placeholder"); // ensure dir exists
+    let executor = exec_with_git(&root, &[]);
+    let err = executor
+        .preview_patch(&inv(vec![add("ignored/new.md", "x")]))
+        .expect_err("reject");
+    assert!(
+        matches!(err, PatchError::IgnoredParent { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn layer3_in_invocation_add_then_update_is_allowed() {
+    // After a successful Add, the target enters the tracked set for
+    // the rest of the invocation so a follow-up Update on the same
+    // path is not rejected as untracked. Verified by doing an Add
+    // via apply_patch (Session::open would not be called in this
+    // test but the tracked set mutation is done in apply_patch).
+    let root = TempRoot::new("layer3-add-then-update");
+    let executor = exec_with_git(&root, &[]);
+    let add_inv = inv(vec![add("new.md", "hello\n")]);
+    let (hashes, _) = executor.preview_patch(&add_inv).expect("preview add");
+    executor.apply_patch(&add_inv, &hashes).expect("apply add");
+    // Now Update the just-added file. Would fail as UntrackedTarget
+    // if the tracked set were only initialised at startup.
+    let update_inv = inv(vec![update("new.md", "hello\n", "world\n")]);
+    let (hashes, _) = executor.preview_patch(&update_inv).expect("preview update");
+    executor
+        .apply_patch(&update_inv, &hashes)
+        .expect("apply update");
+    assert_eq!(root.read("new.md"), b"world\n");
+}
+
+#[test]
+fn layer4_not_in_git_repo_rejects_layer3_writes_but_allows_scratchpad() {
+    // No git init here — Layer 4 fallback kicks in.
+    let root = TempRoot::new("layer4-not-a-repo");
+    fs::create_dir_all(root.path().join(".attini/test/scratchpad")).expect("mkdir scratchpad");
+    let executor =
+        ToolExecutor::new(root.path(), Vec::new(), "test".to_string()).expect("executor");
+    // Any non-scratchpad Update / Add is rejected.
+    root.write("outside.md", b"pre\n");
+    let err = executor
+        .preview_patch(&inv(vec![update("outside.md", "pre\n", "post\n")]))
+        .expect_err("reject");
+    assert!(
+        matches!(err, PatchError::NotInGitRepo { .. }),
+        "got {err:?}"
+    );
+    // Scratchpad still writeable (Layer 2 is git-independent).
+    executor
+        .preview_patch(&inv(vec![add(".attini/test/scratchpad/note.md", "hi")]))
+        .expect("scratchpad ok even without git");
 }
 
 /// Best-effort relative path constructor for the traversal test.
