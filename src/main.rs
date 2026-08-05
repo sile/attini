@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS};
 use attini::deepseek::{DeepSeekClient, StreamEvent, TransportError};
 use attini::sansio::deepseek::{ChatMessage, ChatRequest};
+use attini::session_cmd;
 use attini::tui::{self, TuiConfig};
 use tokio::sync::mpsc;
 
@@ -69,6 +70,9 @@ async fn run() -> Result<RunOutcome, RunError> {
     }
     if let Some(exit) = try_run_agent(&mut args)? {
         return Ok(RunOutcome::Exit(exit));
+    }
+    if try_run_session(&mut args)? {
+        return Ok(RunOutcome::Ok);
     }
 
     if let Some(help) = args.finish()? {
@@ -274,6 +278,158 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
     };
     let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(Some(exit))
+}
+
+fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("session")
+        .doc("Inspect and manage attini agent sessions under .attini/")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+
+    if try_run_session_list(args)? {
+        return Ok(true);
+    }
+    if try_run_session_show(args)? {
+        return Ok(true);
+    }
+    if try_run_session_tail(args)? {
+        return Ok(true);
+    }
+    if try_run_session_rm(args)? {
+        return Ok(true);
+    }
+    if try_run_session_unlock(args)? {
+        return Ok(true);
+    }
+
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    Err(RunError::Runtime(
+        "attini session requires a sub-command (list, show, tail, rm, unlock)".to_string(),
+    ))
+}
+
+fn try_run_session_list(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("list")
+        .doc("List all sessions under .attini/ in the current directory")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    session_cmd::run_list().map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
+}
+
+fn try_run_session_show(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("show")
+        .doc("Show a summary of one session (invocations, message counts, pending)")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let name: String = noargs::arg("<SESSION>")
+        .doc("Session name; directory is .attini/<SESSION>/")
+        .example("main")
+        .take(args)
+        .then(|a| a.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    session_cmd::run_show(&name).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
+}
+
+fn try_run_session_tail(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("tail")
+        .doc("Print the tail of conversation.jsonl (LOCK not acquired)")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let follow = noargs::flag("follow")
+        .short('f')
+        .doc(
+            "Poll the file every 500ms and print appended lines (like `tail -f`). \
+              read-only observation mode; not related to `plan mode` permission preset.",
+        )
+        .take(args)
+        .is_present();
+    let lines: usize = noargs::opt("lines")
+        .short('n')
+        .ty("N")
+        .doc("Number of trailing lines to print before following (default 20)")
+        .default("20")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let name: String = noargs::arg("<SESSION>")
+        .doc("Session name")
+        .example("main")
+        .take(args)
+        .then(|a| a.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    session_cmd::run_tail(&name, follow, lines).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
+}
+
+fn try_run_session_rm(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("rm")
+        .doc("Remove a session directory (refuses if a live process is holding the LOCK)")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let yes = noargs::flag("yes")
+        .short('y')
+        .doc("Skip the confirmation prompt (required when stdin is not a TTY)")
+        .take(args)
+        .is_present();
+    let name: String = noargs::arg("<SESSION>")
+        .doc("Session name")
+        .example("main")
+        .take(args)
+        .then(|a| a.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    session_cmd::run_rm(&name, yes).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
+}
+
+fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("unlock")
+        .doc("Remove the LOCK file. Refuses if the holder PID is alive unless --force is set")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let force = noargs::flag("force")
+        .doc("Remove the LOCK even if the holder PID appears alive (PID reuse escape hatch)")
+        .take(args)
+        .is_present();
+    let name: String = noargs::arg("<SESSION>")
+        .doc("Session name")
+        .example("main")
+        .take(args)
+        .then(|a| a.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    session_cmd::run_unlock(&name, force).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
 }
 
 async fn stream_response(

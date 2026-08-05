@@ -12,6 +12,7 @@ pub mod deepseek;
 pub mod metrics;
 pub mod sansio;
 pub mod session;
+pub mod session_cmd;
 pub mod tools;
 pub mod tui;
 
