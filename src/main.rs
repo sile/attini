@@ -219,6 +219,14 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         .doc("Resume the session by rejecting its pending tool call")
         .take(args)
         .is_present();
+    let plan_mode = noargs::flag("plan")
+        .doc("Plan mode: hide the patch tool; only run commands matched by a `readonly: true` rule, reject everything else")
+        .take(args)
+        .is_present();
+    let local_only = noargs::flag("local-only")
+        .doc("Local-only mode: auto-run commands matched by a `network: false` rule; leave others for approval")
+        .take(args)
+        .is_present();
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
@@ -266,6 +274,19 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         }
     };
 
+    if plan_mode && local_only {
+        return Err(RunError::Runtime(
+            "--plan and --local-only are mutually exclusive".to_string(),
+        ));
+    }
+    let mode = if plan_mode {
+        attini::sansio::permissions::Mode::Plan
+    } else if local_only {
+        attini::sansio::permissions::Mode::LocalOnly
+    } else {
+        attini::sansio::permissions::Mode::Default
+    };
+
     let workspace_root = std::env::current_dir()
         .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
     let cfg = AgentConfig {
@@ -275,6 +296,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         system_prompt: system,
         show_reasoning,
         max_turns: DEFAULT_MAX_TURNS,
+        mode,
     };
     let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(Some(exit))
@@ -304,12 +326,15 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if try_run_session_unlock(args)? {
         return Ok(true);
     }
+    if try_run_session_grant(args)? {
+        return Ok(true);
+    }
 
     if args.metadata().help_mode {
         return Ok(false);
     }
     Err(RunError::Runtime(
-        "attini session requires a sub-command (list, show, tail, rm, unlock)".to_string(),
+        "attini session requires a sub-command (list, show, tail, rm, unlock, grant)".to_string(),
     ))
 }
 
@@ -430,6 +455,60 @@ fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<bool, RunError> 
     }
     session_cmd::run_unlock(&name, force).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(true)
+}
+
+fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("grant")
+        .doc("Append an auto-approve permissions rule to permissions.jsonc")
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; writes to .attini/<NAME>/permissions.jsonc")
+        .default("main")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let workspace = noargs::flag("workspace")
+        .doc("Write to workspace-wide .attini/permissions.jsonc instead of session-local (mutually exclusive with -s / --session)")
+        .take(args)
+        .is_present();
+    let prefix: String = noargs::arg("<PREFIX>")
+        .doc("Command prefix to auto-approve (word-boundary match; single-quote to preserve whitespace)")
+        .example("cargo test")
+        .take(args)
+        .then(|a| a.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    // -s explicitly given AND --workspace both present is ambiguous; we can't detect
+    // the "explicit" -s from noargs (default fills in), so we only reject the pair when
+    // --workspace is set and NAME is not the default. That's imperfect (user could set -s main
+    // + --workspace and we'd accept) but matches user intent for the common case.
+    if workspace && session_name != "main" {
+        return Err(RunError::Runtime(
+            "-s / --session and --workspace are mutually exclusive".to_string(),
+        ));
+    }
+    let scope = if workspace {
+        attini::permissions::GrantScope::Workspace
+    } else {
+        attini::permissions::GrantScope::Session(&session_name)
+    };
+    match attini::permissions::grant(scope, &prefix) {
+        Ok(attini::permissions::GrantOutcome::Appended(path)) => {
+            eprintln!("granted: appended to {}", path.display());
+            Ok(true)
+        }
+        Ok(attini::permissions::GrantOutcome::AlreadyGranted(path)) => {
+            eprintln!("already granted (no-op): {}", path.display());
+            Ok(true)
+        }
+        Err(e) => Err(RunError::Runtime(e.to_string())),
+    }
 }
 
 async fn stream_response(
