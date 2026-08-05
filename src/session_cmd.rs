@@ -1,5 +1,5 @@
 //! `attini session` subcommand implementations (list / show / tail
-//! / rm / unlock).
+//! / rm / unlock / compact).
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -7,8 +7,9 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::agent_cli;
 use crate::session::{
-    ConversationSummary, LockStatus, SessionPaths, inspect_lock, read_pending_summary,
+    ConversationSummary, LockStatus, Session, SessionPaths, inspect_lock, read_pending_summary,
     scan_conversation, session_paths, session_root,
 };
 
@@ -161,10 +162,60 @@ fn print_summary(s: &ConversationSummary) {
         "  approvals: approve={} reject={} (auto_approve={} auto_deny={})",
         s.approvals_approve, s.approvals_reject, s.approvals_auto_approve, s.approvals_auto_deny,
     );
+    println!("  summaries: {}", s.summaries);
+    match s.last_prompt_tokens {
+        Some(pt) => {
+            let hit = s
+                .last_prompt_cache_hit_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let miss = s
+                .last_prompt_cache_miss_tokens
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!("  token_usage: last prompt={pt} cache_hit={hit} cache_miss={miss}");
+        }
+        None => println!("  token_usage: (none)"),
+    }
     match (s.last_ts, &s.last_kind) {
         (Some(ts), Some(kind)) => println!("  last_record: ts={ts} kind={kind}"),
         _ => println!("  last_record: (none)"),
     }
+}
+
+pub fn run_compact(session_name: &str, model: &str) -> io::Result<()> {
+    let paths = session_paths(session_name)?;
+    if !paths.dir.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "session {session_name:?} not found ({})",
+                paths.dir.display()
+            ),
+        ));
+    }
+    if let LockStatus::PidAlive(pid) = inspect_lock(&paths.lock) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "session {session_name:?} is held by pid {pid}; refusing to compact a running session"
+            ),
+        ));
+    }
+    if paths.pending.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "session {session_name:?} has pending.json; resume it with --approve / --reject before compacting"
+            ),
+        ));
+    }
+    let mut session = Session::open(session_name)?;
+    let result = agent_cli::compact_conversation(&mut session, model);
+    // Close explicitly so LOCK unlink errors are surfaced, but drop
+    // ordering already covers the happy path.
+    let _ = session.close();
+    result
 }
 
 pub fn run_tail(name: &str, follow: bool, lines: usize) -> io::Result<()> {

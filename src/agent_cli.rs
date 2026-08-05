@@ -20,8 +20,8 @@ use crate::sansio::permissions::{
     AutoDecision, Judgment, Mode, evaluate, has_shell_operator, tokenize,
 };
 use crate::session::{
-    ApprovalDecision, AutoDecidedBy, InvocationEndReason, MetricsSnapshotBody, Pending,
-    PendingToolKind, Session, SessionRecord, now_unix_millis,
+    ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
+    Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
 };
 use crate::tools::ToolExecutor;
 
@@ -30,6 +30,20 @@ pub const EXIT_ERROR: u8 = 1;
 pub const EXIT_AWAITING_APPROVAL: u8 = 10;
 
 pub const DEFAULT_MAX_TURNS: usize = 20;
+
+/// `prompt_tokens` threshold above which the next `Continuation::Prompt`
+/// invocation summarises before making the model call. Set to 1/4 of
+/// the DeepSeek 64 K context (`64 × 1024 / 4 = 16384`) so compaction
+/// leaves room for the next turn's growth plus the memory tier, tool
+/// definitions, and the summarizer's own input.
+pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
+
+/// Target number of real records to retain past the summary cutoff
+/// when compacting. Actual retention may be a little higher: the
+/// cutoff snaps toward the tail until it lands on a User record or
+/// an Assistant record without pending `tool_calls`, so any pair
+/// of `assistant -> tool` records stays together.
+pub const KEEP_RECENT_RECORDS_TARGET: usize = 10;
 
 pub struct AgentConfig {
     pub session_name: String,
@@ -101,6 +115,10 @@ fn drive(
     cfg: &AgentConfig,
     cont: Continuation,
 ) -> io::Result<Driven> {
+    if matches!(cont, Continuation::Prompt(_)) {
+        try_auto_compact(session, &cfg.model)?;
+    }
+
     let mut messages = build_initial_messages(session, cfg)?;
 
     match cont {
@@ -171,6 +189,18 @@ fn drive(
             reasoning: call_result.reasoning_content.clone(),
             tool_calls: call_result.tool_calls.clone(),
         })?;
+        if let Some(usage) = call_result.usage {
+            session.append(&SessionRecord::TokenUsage {
+                ts: now_unix_millis(),
+                body: TokenUsageBody {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                    prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
+                    prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
+                },
+            })?;
+        }
         messages.push(assistant);
 
         if call_result.tool_calls.is_empty() {
@@ -221,11 +251,156 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
     if let Some(mem) = crate::memories::load(&cfg.session_name)? {
         messages.push(ChatMessage::System(mem));
     }
+    let summaries = session.load_summaries()?;
+    let total = summaries.len();
+    for (i, summary) in summaries.into_iter().enumerate() {
+        let header = if total > 1 {
+            format!(
+                "# Prior conversation summary (part {} of {})\n\n",
+                i + 1,
+                total
+            )
+        } else {
+            "# Prior conversation summary\n\n".to_string()
+        };
+        messages.push(ChatMessage::System(format!("{header}{}", summary.text)));
+    }
     if let Some(sys) = &cfg.system_prompt {
         messages.push(ChatMessage::System(sys.clone()));
     }
-    messages.extend(session.load_conversation()?);
+    for record in session.load_records_since_last_summary()? {
+        messages.push(record.message);
+    }
     Ok(messages)
+}
+
+// -------------------------------------------------------------------
+// Compaction: summarise older records and append a `summary` record
+// -------------------------------------------------------------------
+
+const SUMMARIZER_SYSTEM_PROMPT: &str = "You are summarizing a conversation between a user and a coding agent \
+so the agent can continue with a shorter context. Preserve:\n\
+\n\
+- Unfinished tasks and any next steps the user or agent laid out\n\
+- Decisions reached (chosen approaches; rejected alternatives with the reason)\n\
+- File paths and key symbols (functions, types) that were read, modified,\n\
+  or discussed\n\
+- Recent errors and their root cause, if any\n\
+\n\
+Aim for ~500 words of plain prose. Do not include markdown code fences \
+unless quoting a short critical excerpt. Do not comment on the \
+summarization itself; produce only the summary.";
+
+fn try_auto_compact(session: &mut Session, model: &str) -> io::Result<()> {
+    if session.load_pending()?.is_some() {
+        return Ok(());
+    }
+    let Some(latest) = session.latest_prompt_tokens()? else {
+        return Ok(());
+    };
+    if latest < COMPACTION_TRIGGER_TOKENS {
+        return Ok(());
+    }
+    eprintln!(
+        "[compaction] previous prompt was {latest} tokens (threshold {COMPACTION_TRIGGER_TOKENS}), summarising..."
+    );
+    if let Err(e) = compact_conversation(session, model) {
+        eprintln!("[compaction] failed, continuing with full history: {e}");
+    }
+    Ok(())
+}
+
+/// Run one compaction pass against `session`. Reads real records
+/// since the last summary, picks a safe cutoff so no
+/// `assistant -> tool` pair is split, sends the older records to
+/// the summarizer, and appends a `SessionRecord::Summary`.
+///
+/// Exposed to `session_cmd` for the manual `attini session compact`
+/// subcommand. Callers are expected to have already checked that
+/// the session is idle (no LOCK holder, no `pending.json`).
+pub fn compact_conversation(session: &mut Session, model: &str) -> io::Result<()> {
+    let records = session.load_records_since_last_summary()?;
+    let keep_start = safe_tail_start(&records, KEEP_RECENT_RECORDS_TARGET);
+    if keep_start == 0 {
+        eprintln!("[compaction] no records eligible for summarisation. skipping.");
+        return Ok(());
+    }
+    let to_summarise: Vec<ChatMessageWithTs> = records[..keep_start].to_vec();
+    let record_count = to_summarise.len();
+    let since_ts = to_summarise
+        .first()
+        .map(|r| r.ts)
+        .expect("keep_start > 0 so to_summarise is non-empty");
+    let cutoff_ts = to_summarise
+        .last()
+        .map(|r| r.ts)
+        .expect("keep_start > 0 so to_summarise is non-empty");
+
+    let text = run_summariser(model, to_summarise)?;
+    let words = text.split_whitespace().count();
+
+    session.append(&SessionRecord::Summary {
+        ts: now_unix_millis(),
+        since_ts,
+        cutoff_ts,
+        text,
+    })?;
+    eprintln!("[compaction] applied. summarised {record_count} records into ~{words} words.");
+    Ok(())
+}
+
+fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<String> {
+    let mut messages = vec![ChatMessage::System(SUMMARIZER_SYSTEM_PROMPT.to_string())];
+    messages.extend(records.into_iter().map(|r| r.message));
+    let request = ChatRequest::new(model.to_string(), messages);
+    let mut sink = io::sink();
+    let mut sinks = ProgressSinks {
+        content: &mut sink,
+        reasoning: None,
+    };
+    let result = curl::call(&request, &mut sinks)
+        .map_err(|e| io::Error::other(format!("summariser call failed: {e}")))?;
+    if result.content.trim().is_empty() {
+        return Err(io::Error::other("summariser returned empty content"));
+    }
+    Ok(result.content)
+}
+
+/// Given the real records that follow the last summary, return
+/// the index from which the tail is kept intact. Records at
+/// smaller indices are candidates for the new summary.
+///
+/// The cutoff never falls inside an `assistant -> tool` pair: it
+/// snaps toward the tail until it lands on a User record or an
+/// Assistant record without `tool_calls`. Returns `records.len()`
+/// (kept = nothing) if no safe boundary exists past the initial
+/// target — which happens when the tail is a single unresolved
+/// `assistant -> tool` pair, in which case leaving everything as
+/// candidates would still be wrong, so we bail and keep the whole
+/// tail by returning 0 as well.
+fn safe_tail_start(records: &[ChatMessageWithTs], target_keep: usize) -> usize {
+    let n = records.len();
+    if n <= target_keep {
+        return 0;
+    }
+    let mut i = n - target_keep;
+    while i < n {
+        if is_safe_boundary(&records[i].message) {
+            return i;
+        }
+        i += 1;
+    }
+    // No safe boundary in the tail — refuse to summarise anything
+    // this round rather than emit an orphan tool message.
+    0
+}
+
+fn is_safe_boundary(msg: &ChatMessage) -> bool {
+    match msg {
+        ChatMessage::User(_) => true,
+        ChatMessage::Assistant { tool_calls, .. } => tool_calls.is_empty(),
+        _ => false,
+    }
 }
 
 fn build_tool_defs(mode: Mode) -> Vec<ToolDef> {
@@ -675,4 +850,128 @@ fn command_result_json(
         duration_ms,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(ts: u64) -> ChatMessageWithTs {
+        ChatMessageWithTs {
+            message: ChatMessage::User(format!("u{ts}")),
+            ts,
+        }
+    }
+
+    fn assistant_plain(ts: u64) -> ChatMessageWithTs {
+        ChatMessageWithTs {
+            message: ChatMessage::assistant_text(format!("a{ts}")),
+            ts,
+        }
+    }
+
+    fn assistant_with_tool_call(ts: u64) -> ChatMessageWithTs {
+        ChatMessageWithTs {
+            message: ChatMessage::Assistant {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("call_{ts}"),
+                    function_name: "read".to_string(),
+                    arguments_json: "{}".to_string(),
+                }],
+            },
+            ts,
+        }
+    }
+
+    fn tool(ts: u64) -> ChatMessageWithTs {
+        ChatMessageWithTs {
+            message: ChatMessage::Tool {
+                tool_call_id: format!("call_{ts}"),
+                content: "{}".to_string(),
+            },
+            ts,
+        }
+    }
+
+    #[test]
+    fn safe_tail_start_returns_zero_when_short_history() {
+        let records = vec![user(1), assistant_plain(2)];
+        assert_eq!(safe_tail_start(&records, 10), 0);
+    }
+
+    #[test]
+    fn safe_tail_start_lands_on_user_record() {
+        // Target keep = 2 → naive cutoff at index 3 (assistant plain).
+        // That is already a safe boundary, so cutoff stays.
+        let records = vec![
+            user(1),
+            assistant_plain(2),
+            user(3),
+            assistant_plain(4),
+            user(5),
+        ];
+        assert_eq!(safe_tail_start(&records, 2), 3);
+    }
+
+    #[test]
+    fn safe_tail_start_advances_past_tool_record() {
+        // Target keep = 2 → naive cutoff at index 3 (tool), which is
+        // unsafe because it would orphan the tool from its assistant.
+        // The safe cutoff is the next user record at index 4.
+        let records = vec![
+            user(1),
+            assistant_plain(2),
+            assistant_with_tool_call(3),
+            tool(4),
+            user(5),
+        ];
+        assert_eq!(safe_tail_start(&records, 2), 4);
+    }
+
+    #[test]
+    fn safe_tail_start_advances_past_assistant_with_tool_calls() {
+        // Target keep = 2 → naive cutoff at index 2 (assistant with
+        // tool_calls). Cutting there would drop the tool_call context
+        // but keep the tool response, so it is unsafe. Move forward
+        // to the next safe boundary at index 4 (user).
+        let records = vec![
+            user(1),
+            user(2),
+            assistant_with_tool_call(3),
+            tool(4),
+            user(5),
+        ];
+        assert_eq!(safe_tail_start(&records, 3), 4);
+    }
+
+    #[test]
+    fn safe_tail_start_bails_when_no_safe_boundary_in_tail() {
+        // Tail is a single unresolved assistant→tool pair; no safe
+        // boundary between naive index (1) and end. Bail with 0 so
+        // we do not orphan tools this round.
+        let records = vec![user(1), assistant_with_tool_call(2), tool(3)];
+        assert_eq!(safe_tail_start(&records, 1), 0);
+    }
+
+    #[test]
+    fn is_safe_boundary_classifies_records_as_expected() {
+        assert!(is_safe_boundary(&ChatMessage::User("u".to_string())));
+        assert!(is_safe_boundary(&ChatMessage::assistant_text("a")));
+        assert!(!is_safe_boundary(&ChatMessage::Assistant {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "x".to_string(),
+                function_name: "read".to_string(),
+                arguments_json: "{}".to_string(),
+            }],
+        }));
+        assert!(!is_safe_boundary(&ChatMessage::Tool {
+            tool_call_id: "x".to_string(),
+            content: "{}".to_string(),
+        }));
+        assert!(!is_safe_boundary(&ChatMessage::System("s".to_string())));
+    }
 }

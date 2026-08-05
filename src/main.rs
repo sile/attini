@@ -204,12 +204,16 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if try_run_session_grant(args)? {
         return Ok(true);
     }
+    if try_run_session_compact(args)? {
+        return Ok(true);
+    }
 
     if args.metadata().help_mode {
         return Ok(false);
     }
     Err(RunError::Runtime(
-        "attini session requires a sub-command (list, show, tail, rm, unlock, grant)".to_string(),
+        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, compact)"
+            .to_string(),
     ))
 }
 
@@ -384,4 +388,36 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         }
         Err(e) => Err(RunError::Runtime(e.to_string())),
     }
+}
+
+fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+    if !noargs::cmd("compact")
+        .doc(
+            "Summarise older conversation records and append a summary record. \
+             Refuses if the session is held, is missing, or has pending.json.",
+        )
+        .take(args)
+        .is_present()
+    {
+        return Ok(false);
+    }
+    let model: String = noargs::opt("model")
+        .ty("NAME")
+        .doc("Model name used for the summariser")
+        .default(DEFAULT_MODEL)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; directory is .attini/<NAME>/")
+        .default("main")
+        .take(args)
+        .then(|o| o.value().parse())?;
+    if args.metadata().help_mode {
+        return Ok(false);
+    }
+    session_cmd::run_compact(&session_name, &model)
+        .map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
 }
