@@ -44,34 +44,19 @@ impl Session {
     /// LOCK is stale (corrupted or holder dead), one retry is
     /// attempted; otherwise returns `Err(AlreadyExists)` with a hint.
     pub fn open(name: &str) -> io::Result<Self> {
-        if name.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session name must not be empty",
-            ));
-        }
-        if name.contains(|c: char| c == '/' || c == '\\' || c.is_control()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session name must not contain path separators or control characters",
-            ));
-        }
-        let dir = PathBuf::from(".attini").join(name);
-        fs::create_dir_all(&dir)?;
-        let lock_path = dir.join("LOCK");
-        let lock = acquire_lock_with_stale_retry(name, &lock_path)?;
-        let conversation_path = dir.join("conversation.jsonl");
-        let pending_path = dir.join("pending.json");
+        let paths = session_paths(name)?;
+        fs::create_dir_all(&paths.dir)?;
+        let lock = acquire_lock_with_stale_retry(name, &paths.lock)?;
         let writer = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&conversation_path)?;
+            .open(&paths.conversation)?;
         Ok(Self {
-            dir,
-            lock_path,
+            dir: paths.dir,
+            lock_path: paths.lock,
             _lock: lock,
-            conversation_path,
-            pending_path,
+            conversation_path: paths.conversation,
+            pending_path: paths.pending,
             writer,
         })
     }
@@ -165,6 +150,186 @@ impl Drop for Session {
 }
 
 // -------------------------------------------------------------------
+// Path resolution (LOCK not acquired, directory not created)
+// -------------------------------------------------------------------
+
+/// Absolute paths for a session's on-disk artifacts. Computed
+/// without touching the filesystem so read-only commands can use
+/// these without side effects.
+#[derive(Debug, Clone)]
+pub struct SessionPaths {
+    pub dir: PathBuf,
+    pub conversation: PathBuf,
+    pub pending: PathBuf,
+    pub lock: PathBuf,
+}
+
+/// Root directory (`.attini/`) that holds every session in the CWD.
+pub fn session_root() -> PathBuf {
+    PathBuf::from(".attini")
+}
+
+/// Validate `name` and return the paths for its session. Does not
+/// create the directory nor take the LOCK.
+pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name must not be empty",
+        ));
+    }
+    if name.contains(|c: char| c == '/' || c == '\\' || c.is_control()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name must not contain path separators or control characters",
+        ));
+    }
+    let dir = session_root().join(name);
+    Ok(SessionPaths {
+        conversation: dir.join("conversation.jsonl"),
+        pending: dir.join("pending.json"),
+        lock: dir.join("LOCK"),
+        dir,
+    })
+}
+
+// -------------------------------------------------------------------
+// Read-only inspection helpers for the `attini session` subcommand
+// -------------------------------------------------------------------
+
+/// Aggregate counters over one `conversation.jsonl`. Used by both
+/// `attini session list` (total_records + last_ts) and
+/// `attini session show` (per-kind breakdown).
+#[derive(Debug, Clone, Default)]
+pub struct ConversationSummary {
+    pub total_records: u64,
+    pub last_ts: Option<u64>,
+    pub last_kind: Option<String>,
+    pub invocation_starts: u64,
+    pub invocation_ends_completed: u64,
+    pub invocation_ends_awaiting_approval: u64,
+    pub invocation_ends_error: u64,
+    pub user_messages: u64,
+    pub assistant_messages: u64,
+    pub assistant_tool_calls_total: u64,
+    pub tool_messages: u64,
+    pub approvals_approve: u64,
+    pub approvals_reject: u64,
+}
+
+/// Walk `conversation.jsonl` and produce a summary. Missing file →
+/// zero-initialised summary. Malformed lines abort with an error.
+pub fn scan_conversation(path: &Path) -> io::Result<ConversationSummary> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(ConversationSummary::default());
+        }
+        Err(e) => return Err(e),
+    };
+    let mut summary = ConversationSummary::default();
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        summary.total_records += 1;
+        classify_record(&line, &mut summary)
+            .map_err(|e| io::Error::other(format!("malformed record at line {}: {e}", i + 1)))?;
+    }
+    Ok(summary)
+}
+
+fn classify_record(line: &str, out: &mut ConversationSummary) -> Result<(), String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    if let Ok(m) = value.to_member("ts")
+        && let Some(v) = m.optional()
+        && let Ok(ts) = v.try_into()
+    {
+        out.last_ts = Some(ts);
+    }
+    match kind.as_str() {
+        "invocation_start" => out.invocation_starts += 1,
+        "invocation_end" => {
+            let reason = value
+                .to_member("reason")
+                .and_then(|m| m.required())
+                .and_then(|m| m.to_unquoted_string_str())
+                .map_err(|e| e.to_string())?;
+            match reason.as_ref() {
+                "completed" => out.invocation_ends_completed += 1,
+                "awaiting_approval" => out.invocation_ends_awaiting_approval += 1,
+                "error" => out.invocation_ends_error += 1,
+                _ => {}
+            }
+        }
+        "user" => out.user_messages += 1,
+        "assistant" => {
+            out.assistant_messages += 1;
+            if let Ok(m) = value.to_member("tool_calls")
+                && let Some(v) = m.optional()
+                && let Ok(arr) = v.to_array()
+            {
+                out.assistant_tool_calls_total += arr.count() as u64;
+            }
+        }
+        "tool" => out.tool_messages += 1,
+        "tool_approval" => {
+            let decision = value
+                .to_member("decision")
+                .and_then(|m| m.required())
+                .and_then(|m| m.to_unquoted_string_str())
+                .map_err(|e| e.to_string())?;
+            match decision.as_ref() {
+                "approve" => out.approvals_approve += 1,
+                "reject" => out.approvals_reject += 1,
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    out.last_kind = Some(kind);
+    Ok(())
+}
+
+/// A subset of `Pending` safe to show to the user (omits the full
+/// `arguments_json`, which for command tools would echo the entire
+/// shell command line and for patches the full replacement text).
+#[derive(Debug, Clone)]
+pub struct PendingSummary {
+    pub call_id: String,
+    pub tool_kind: PendingToolKind,
+    pub function_name: String,
+    pub preview: String,
+    pub ts: u64,
+}
+
+/// Read `pending.json` and return a summary. Missing file → `None`.
+pub fn read_pending_summary(path: &Path) -> io::Result<Option<PendingSummary>> {
+    let text = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let json = RawJson::parse(&text).map_err(|e| io::Error::other(format!("pending.json: {e}")))?;
+    let pending = Pending::from_json(json.value())?;
+    Ok(Some(PendingSummary {
+        call_id: pending.call_id,
+        tool_kind: pending.tool_kind,
+        function_name: pending.function_name,
+        preview: pending.preview,
+        ts: pending.ts,
+    }))
+}
+
+// -------------------------------------------------------------------
 // LOCK acquisition (with stale detection)
 // -------------------------------------------------------------------
 
@@ -172,9 +337,9 @@ fn acquire_lock_with_stale_retry(name: &str, lock_path: &Path) -> io::Result<Fil
     match acquire_lock(lock_path) {
         Ok(file) => Ok(file),
         Err(AcquireError::Io(e)) => Err(e),
-        Err(AcquireError::Locked) => match classify_existing_lock(lock_path) {
+        Err(AcquireError::Locked) => match inspect_lock(lock_path) {
             LockStatus::PidAlive(pid) => Err(lock_conflict_error(name, lock_path, Some(pid))),
-            LockStatus::PidDead | LockStatus::Corrupted => {
+            LockStatus::PidDead | LockStatus::Corrupted | LockStatus::None => {
                 let _ = fs::remove_file(lock_path);
                 match acquire_lock(lock_path) {
                     Ok(file) => Ok(file),
@@ -229,10 +394,28 @@ fn lock_conflict_error(name: &str, lock_path: &Path, holder_pid: Option<i32>) ->
     )
 }
 
-enum LockStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStatus {
+    /// No LOCK file present.
+    None,
+    /// LOCK file exists but its contents cannot be parsed / are
+    /// empty / carry an invalid PID.
     Corrupted,
+    /// LOCK file names a PID that no longer exists (`ESRCH`).
     PidDead,
+    /// LOCK file names a PID that is alive, or that `kill(pid, 0)`
+    /// reports as EPERM (safe side: treat as held).
     PidAlive(i32),
+}
+
+/// Non-mutating probe of a LOCK file. Does not create, open with
+/// exclusive access, or otherwise disturb the file.
+pub fn inspect_lock(path: &Path) -> LockStatus {
+    match fs::metadata(path) {
+        Ok(_) => classify_existing_lock(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => LockStatus::None,
+        Err(_) => LockStatus::Corrupted,
+    }
 }
 
 fn classify_existing_lock(path: &Path) -> LockStatus {
