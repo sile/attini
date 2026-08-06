@@ -1,11 +1,19 @@
 use std::process::ExitCode;
 
-use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS};
+use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS, RateLimit};
 use attini::session_cmd;
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_RUNTIME: u8 = 1;
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+
+// String forms of the tool-call cap defaults, exposed here because
+// noargs' `default()` needs a `&'static str`. Kept in sync with the
+// numeric constants in `attini::agent_cli` by
+// `default_string_constants_stay_in_sync`.
+const DEFAULT_TURN_TOOL_CALL_LIMIT_STR: &str = "20";
+const DEFAULT_TOOL_CALL_RATE_STR: &str = "60/60";
+const DEFAULT_SESSION_TOOL_CALL_MAX_STR: &str = "5000";
 
 fn main() -> ExitCode {
     match run() {
@@ -126,6 +134,34 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         let s: String = taken.then(|o| o.value().parse())?;
         read_paths.push(std::path::PathBuf::from(s));
     }
+    let turn_tool_call_limit: usize = noargs::opt("turn-tool-call-limit")
+        .ty("N")
+        .doc(
+            "Maximum tool calls admitted per model turn. Extras get a synthetic error \
+             result and the loop advances to the next turn.",
+        )
+        .default(DEFAULT_TURN_TOOL_CALL_LIMIT_STR)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let tool_call_rate_raw: String = noargs::opt("tool-call-rate")
+        .ty("CALLS/SECS|none")
+        .doc(
+            "Sliding-window rate cap on admitted tool calls, formatted as \
+             <calls>/<window_seconds>. Use `none` to disable.",
+        )
+        .default(DEFAULT_TOOL_CALL_RATE_STR)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let session_tool_call_max_raw: String = noargs::opt("session-tool-call-max")
+        .ty("N|none")
+        .doc(
+            "Invocation-scope backstop on admitted tool calls. Reaching it ends the \
+             invocation with reason=session_tool_call_exhausted. Use `none` to disable.",
+        )
+        .default(DEFAULT_SESSION_TOOL_CALL_MAX_STR)
+        .take(args)
+        .then(|o| o.value().parse())?;
+
     let prompt: Option<String> = noargs::arg("[PROMPT]")
         .doc("User prompt (required unless --approve or --reject is given)")
         .example("List the files in src/")
@@ -135,6 +171,9 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
     if args.metadata().help_mode {
         return Ok(None);
     }
+
+    let tool_call_rate = parse_tool_call_rate(&tool_call_rate_raw)?;
+    let session_tool_call_max = parse_session_tool_call_max(&session_tool_call_max_raw)?;
 
     if approve && reject {
         return Err(RunError::Runtime(
@@ -190,9 +229,60 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         max_turns: DEFAULT_MAX_TURNS,
         mode,
         extra_read_paths_cli: read_paths,
+        turn_tool_call_limit,
+        tool_call_rate,
+        session_tool_call_max,
     };
     let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(Some(exit))
+}
+
+fn parse_tool_call_rate(raw: &str) -> Result<Option<RateLimit>, RunError> {
+    if raw == "none" {
+        return Ok(None);
+    }
+    let (calls_str, window_str) = raw.split_once('/').ok_or_else(|| {
+        RunError::Runtime(format!(
+            "--tool-call-rate must be <calls>/<window_seconds> or `none` (got {raw:?})"
+        ))
+    })?;
+    let calls: usize = calls_str.parse().map_err(|e| {
+        RunError::Runtime(format!(
+            "--tool-call-rate calls part {calls_str:?} is not a non-negative integer: {e}"
+        ))
+    })?;
+    let window_secs: u64 = window_str.parse().map_err(|e| {
+        RunError::Runtime(format!(
+            "--tool-call-rate window part {window_str:?} is not a non-negative integer: {e}"
+        ))
+    })?;
+    if calls == 0 || window_secs == 0 {
+        return Err(RunError::Runtime(
+            "--tool-call-rate calls and window must both be positive (use `none` to disable)"
+                .to_string(),
+        ));
+    }
+    Ok(Some(RateLimit {
+        calls,
+        window: std::time::Duration::from_secs(window_secs),
+    }))
+}
+
+fn parse_session_tool_call_max(raw: &str) -> Result<Option<usize>, RunError> {
+    if raw == "none" {
+        return Ok(None);
+    }
+    let n: usize = raw.parse().map_err(|e| {
+        RunError::Runtime(format!(
+            "--session-tool-call-max must be a non-negative integer or `none` (got {raw:?}): {e}"
+        ))
+    })?;
+    if n == 0 {
+        return Err(RunError::Runtime(
+            "--session-tool-call-max must be positive (use `none` to disable)".to_string(),
+        ));
+    }
+    Ok(Some(n))
 }
 
 fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
@@ -591,4 +681,98 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<bool, RunError>
     session_cmd::run_compact(&session_name, &model)
         .map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attini::agent_cli::{
+        DEFAULT_SESSION_TOOL_CALL_MAX, DEFAULT_TOOL_CALL_RATE_CALLS,
+        DEFAULT_TOOL_CALL_RATE_WINDOW_SECS, DEFAULT_TURN_TOOL_CALL_LIMIT,
+    };
+
+    #[test]
+    fn default_string_constants_stay_in_sync() {
+        // The `.default()` argument of noargs::opt requires a
+        // `&'static str`, so the CLI mirrors the numeric defaults in
+        // `agent_cli` with these string constants. This test guards
+        // against them silently drifting apart.
+        assert_eq!(
+            DEFAULT_TURN_TOOL_CALL_LIMIT_STR,
+            DEFAULT_TURN_TOOL_CALL_LIMIT.to_string()
+        );
+        assert_eq!(
+            DEFAULT_TOOL_CALL_RATE_STR,
+            format!(
+                "{}/{}",
+                DEFAULT_TOOL_CALL_RATE_CALLS, DEFAULT_TOOL_CALL_RATE_WINDOW_SECS
+            )
+        );
+        assert_eq!(
+            DEFAULT_SESSION_TOOL_CALL_MAX_STR,
+            DEFAULT_SESSION_TOOL_CALL_MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn tool_call_rate_none_disables() {
+        match parse_tool_call_rate("none") {
+            Ok(None) => {}
+            other => panic!("expected Ok(None), got is_ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn tool_call_rate_valid_form_parses() {
+        match parse_tool_call_rate("30/15") {
+            Ok(Some(rl)) => {
+                assert_eq!(rl.calls, 30);
+                assert_eq!(rl.window, std::time::Duration::from_secs(15));
+            }
+            other => panic!("expected Ok(Some(...)), got is_ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn tool_call_rate_missing_slash_errors() {
+        assert!(parse_tool_call_rate("30").is_err());
+    }
+
+    #[test]
+    fn tool_call_rate_zero_parts_error() {
+        assert!(parse_tool_call_rate("0/60").is_err());
+        assert!(parse_tool_call_rate("60/0").is_err());
+    }
+
+    #[test]
+    fn tool_call_rate_non_integer_errors() {
+        assert!(parse_tool_call_rate("abc/60").is_err());
+        assert!(parse_tool_call_rate("60/xyz").is_err());
+    }
+
+    #[test]
+    fn session_tool_call_max_none_disables() {
+        match parse_session_tool_call_max("none") {
+            Ok(None) => {}
+            other => panic!("expected Ok(None), got is_ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn session_tool_call_max_positive_parses() {
+        match parse_session_tool_call_max("42") {
+            Ok(Some(n)) => assert_eq!(n, 42),
+            other => panic!("expected Ok(Some(42)), got is_ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn session_tool_call_max_zero_errors() {
+        assert!(parse_session_tool_call_max("0").is_err());
+    }
+
+    #[test]
+    fn session_tool_call_max_non_integer_errors() {
+        assert!(parse_session_tool_call_max("abc").is_err());
+    }
 }

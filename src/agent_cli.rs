@@ -1,5 +1,6 @@
 //! Sync single-turn agent loop for `attini agent`.
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -130,6 +131,28 @@ pub struct AgentConfig {
     /// `attini agent --read-path`. Combined with the persistent
     /// entries from `permissions.json.extra_read_paths` on startup.
     pub extra_read_paths_cli: Vec<PathBuf>,
+    /// Maximum tool calls admitted in a single model turn. Extras in
+    /// the same response get a synthetic error result and the loop
+    /// advances to the next turn.
+    pub turn_tool_call_limit: usize,
+    /// Sliding-window rate cap on admitted tool calls. `None`
+    /// disables the check.
+    pub tool_call_rate: Option<RateLimit>,
+    /// Invocation-scope backstop on admitted tool calls. Hitting it
+    /// stops the loop with [`InvocationEndReason::SessionToolCallExhausted`].
+    /// `None` disables the check.
+    pub session_tool_call_max: Option<usize>,
+}
+
+pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
+pub const DEFAULT_TOOL_CALL_RATE_CALLS: usize = 60;
+pub const DEFAULT_TOOL_CALL_RATE_WINDOW_SECS: u64 = 60;
+pub const DEFAULT_SESSION_TOOL_CALL_MAX: usize = 5000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub calls: usize,
+    pub window: Duration,
 }
 
 pub enum Continuation {
@@ -175,6 +198,9 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
             InvocationEndReason::AwaitingApproval,
             EXIT_AWAITING_APPROVAL,
         ),
+        Ok(Driven::SessionToolCallExhausted) => {
+            (InvocationEndReason::SessionToolCallExhausted, EXIT_ERROR)
+        }
         Err(_) => (InvocationEndReason::Error, EXIT_ERROR),
     };
 
@@ -200,6 +226,77 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
 enum Driven {
     Completed,
     AwaitingApproval,
+    /// Invocation-scope tool-call backstop tripped
+    /// ([`AgentConfig::session_tool_call_max`]).
+    SessionToolCallExhausted,
+}
+
+/// Enforces the three tool-call caps (per-turn, sliding rate window,
+/// invocation-scope backstop) in `drive`'s tool_calls dispatch loop.
+/// Counters increment only on admitted calls: rate-window and
+/// session-cumulative do not consume budget when a cap already
+/// rejected the call.
+struct ToolCallGate {
+    turn_limit: usize,
+    rate: Option<RateLimit>,
+    session_max: Option<usize>,
+    turn_count: usize,
+    rate_deque: VecDeque<Instant>,
+    session_count: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GateDecision {
+    Proceed,
+    TurnLimitExceeded,
+    RateLimitExceeded,
+    SessionExhausted,
+}
+
+impl ToolCallGate {
+    fn new(cfg: &AgentConfig) -> Self {
+        Self {
+            turn_limit: cfg.turn_tool_call_limit,
+            rate: cfg.tool_call_rate,
+            session_max: cfg.session_tool_call_max,
+            turn_count: 0,
+            rate_deque: VecDeque::new(),
+            session_count: 0,
+        }
+    }
+
+    fn begin_turn(&mut self) {
+        self.turn_count = 0;
+    }
+
+    /// Check whether one more tool call may proceed. On `Proceed`,
+    /// admit the call and record it (turn counter, session counter,
+    /// and rate window). On any rejection, do not consume budget.
+    fn admit(&mut self, now: Instant) -> GateDecision {
+        if self.turn_count >= self.turn_limit {
+            return GateDecision::TurnLimitExceeded;
+        }
+        if let Some(rate) = self.rate {
+            let cutoff = now.checked_sub(rate.window).unwrap_or(now);
+            while self.rate_deque.front().is_some_and(|t| *t < cutoff) {
+                self.rate_deque.pop_front();
+            }
+            if self.rate_deque.len() >= rate.calls {
+                return GateDecision::RateLimitExceeded;
+            }
+        }
+        if let Some(max) = self.session_max
+            && self.session_count >= max
+        {
+            return GateDecision::SessionExhausted;
+        }
+        self.turn_count += 1;
+        self.session_count += 1;
+        if self.rate.is_some() {
+            self.rate_deque.push_back(now);
+        }
+        GateDecision::Proceed
+    }
 }
 
 fn drive(
@@ -257,8 +354,10 @@ fn drive(
 
     let tools = build_tool_defs(cfg.mode);
     let rules = permissions::load(&cfg.session_name)?;
+    let mut gate = ToolCallGate::new(cfg);
 
     for _ in 0..cfg.max_turns {
+        gate.begin_turn();
         let request =
             ChatRequest::new(cfg.model.clone(), messages.clone()).with_tools(tools.clone());
         let mut stdout = io::stdout();
@@ -326,6 +425,53 @@ fn drive(
                 "patch" => counters.tool_calls_by_kind.patch += 1,
                 "command" => counters.tool_calls_by_kind.command += 1,
                 _ => counters.tool_calls_by_kind.unknown += 1,
+            }
+            match gate.admit(Instant::now()) {
+                GateDecision::Proceed => {}
+                GateDecision::TurnLimitExceeded => {
+                    let content = tool_error_json(
+                        "turn_tool_call_limit_exceeded",
+                        &format!(
+                            "turn_tool_call_limit={} exceeded in this turn",
+                            cfg.turn_tool_call_limit
+                        ),
+                    );
+                    eprintln!(
+                        "[cap] turn_tool_call_limit={} exceeded",
+                        cfg.turn_tool_call_limit
+                    );
+                    counters.tool_errors += 1;
+                    append_tool(session, &mut messages, &tc.id, content)?;
+                    continue;
+                }
+                GateDecision::RateLimitExceeded => {
+                    let rate = cfg
+                        .tool_call_rate
+                        .expect("rate cap must be Some to hit RateLimitExceeded");
+                    let content = tool_error_json(
+                        "tool_call_rate_exceeded",
+                        &format!(
+                            "tool_call_rate={}/{}s exceeded",
+                            rate.calls,
+                            rate.window.as_secs()
+                        ),
+                    );
+                    eprintln!(
+                        "[cap] tool_call_rate={}/{}s exceeded",
+                        rate.calls,
+                        rate.window.as_secs()
+                    );
+                    counters.tool_errors += 1;
+                    append_tool(session, &mut messages, &tc.id, content)?;
+                    continue;
+                }
+                GateDecision::SessionExhausted => {
+                    let max = cfg
+                        .session_tool_call_max
+                        .expect("session cap must be Some to hit SessionExhausted");
+                    eprintln!("[cap] session_tool_call_max={max} exhausted; ending invocation");
+                    return Ok(Driven::SessionToolCallExhausted);
+                }
             }
             match classify(&tc.function_name) {
                 ToolKind::ReadOnly => {
@@ -1179,5 +1325,174 @@ mod tests {
             content: "{}".to_string(),
         }));
         assert!(!is_safe_boundary(&ChatMessage::System("s".to_string())));
+    }
+
+    // -------------------------------------------------------------
+    // ToolCallGate
+    // -------------------------------------------------------------
+
+    fn gate_config(
+        turn_limit: usize,
+        rate: Option<RateLimit>,
+        session_max: Option<usize>,
+    ) -> AgentConfig {
+        AgentConfig {
+            session_name: String::new(),
+            model: String::new(),
+            workspace_root: PathBuf::new(),
+            system_prompt: None,
+            show_reasoning: false,
+            max_turns: 0,
+            mode: Mode::Default,
+            extra_read_paths_cli: Vec::new(),
+            turn_tool_call_limit: turn_limit,
+            tool_call_rate: rate,
+            session_tool_call_max: session_max,
+        }
+    }
+
+    #[test]
+    fn gate_turn_limit_admits_up_to_boundary_then_rejects() {
+        let cfg = gate_config(3, None, None);
+        let mut gate = ToolCallGate::new(&cfg);
+        gate.begin_turn();
+        let now = Instant::now();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::TurnLimitExceeded);
+    }
+
+    #[test]
+    fn gate_turn_limit_resets_after_begin_turn() {
+        let cfg = gate_config(2, None, None);
+        let mut gate = ToolCallGate::new(&cfg);
+        let now = Instant::now();
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::TurnLimitExceeded);
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+    }
+
+    #[test]
+    fn gate_rate_admits_up_to_boundary_within_window_then_rejects() {
+        let cfg = gate_config(
+            100,
+            Some(RateLimit {
+                calls: 2,
+                window: Duration::from_secs(10),
+            }),
+            None,
+        );
+        let mut gate = ToolCallGate::new(&cfg);
+        gate.begin_turn();
+        let t0 = Instant::now();
+        assert_eq!(gate.admit(t0), GateDecision::Proceed);
+        assert_eq!(gate.admit(t0), GateDecision::Proceed);
+        assert_eq!(gate.admit(t0), GateDecision::RateLimitExceeded);
+    }
+
+    #[test]
+    fn gate_rate_window_slides_and_admits_again() {
+        let cfg = gate_config(
+            100,
+            Some(RateLimit {
+                calls: 2,
+                window: Duration::from_secs(10),
+            }),
+            None,
+        );
+        let mut gate = ToolCallGate::new(&cfg);
+        gate.begin_turn();
+        let t0 = Instant::now();
+        assert_eq!(gate.admit(t0), GateDecision::Proceed);
+        assert_eq!(gate.admit(t0), GateDecision::Proceed);
+        assert_eq!(gate.admit(t0), GateDecision::RateLimitExceeded);
+        // Advance well past the window; the deque should drain.
+        let t1 = t0 + Duration::from_secs(11);
+        assert_eq!(gate.admit(t1), GateDecision::Proceed);
+    }
+
+    #[test]
+    fn gate_rate_rejection_does_not_consume_window_slot() {
+        // If a rejected call filled the deque, the next call after
+        // window sliding would immediately be rejected again. Verify
+        // rejected calls are not pushed.
+        let cfg = gate_config(
+            100,
+            Some(RateLimit {
+                calls: 1,
+                window: Duration::from_secs(10),
+            }),
+            None,
+        );
+        let mut gate = ToolCallGate::new(&cfg);
+        gate.begin_turn();
+        let t0 = Instant::now();
+        assert_eq!(gate.admit(t0), GateDecision::Proceed);
+        // Multiple rejections at t0 must not affect anything.
+        assert_eq!(gate.admit(t0), GateDecision::RateLimitExceeded);
+        assert_eq!(gate.admit(t0), GateDecision::RateLimitExceeded);
+        // After the window slides, exactly one admit is possible.
+        let t1 = t0 + Duration::from_secs(11);
+        assert_eq!(gate.admit(t1), GateDecision::Proceed);
+        assert_eq!(gate.admit(t1), GateDecision::RateLimitExceeded);
+    }
+
+    #[test]
+    fn gate_session_backstop_admits_up_to_max_then_exhausts() {
+        let cfg = gate_config(100, None, Some(3));
+        let mut gate = ToolCallGate::new(&cfg);
+        let now = Instant::now();
+        // Session count spans multiple turns.
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        assert_eq!(gate.admit(now), GateDecision::SessionExhausted);
+    }
+
+    #[test]
+    fn gate_none_options_disable_the_check() {
+        let cfg = gate_config(100, None, None);
+        let mut gate = ToolCallGate::new(&cfg);
+        gate.begin_turn();
+        let now = Instant::now();
+        for _ in 0..50 {
+            assert_eq!(gate.admit(now), GateDecision::Proceed);
+        }
+    }
+
+    #[test]
+    fn gate_rejection_does_not_consume_session_or_turn_budget() {
+        // Turn cap rejects, but session_count and rate_deque should
+        // not have advanced by the rejected call.
+        let cfg = gate_config(
+            1,
+            Some(RateLimit {
+                calls: 100,
+                window: Duration::from_secs(10),
+            }),
+            Some(3),
+        );
+        let mut gate = ToolCallGate::new(&cfg);
+        let now = Instant::now();
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        // Rejected by turn cap; must not count against session_max.
+        assert_eq!(gate.admit(now), GateDecision::TurnLimitExceeded);
+        assert_eq!(gate.admit(now), GateDecision::TurnLimitExceeded);
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::Proceed);
+        // Now session_count == 3, backstop rejects (turn cap would
+        // also apply on the 2nd of this turn but session runs first
+        // per the order).
+        gate.begin_turn();
+        assert_eq!(gate.admit(now), GateDecision::SessionExhausted);
     }
 }

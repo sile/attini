@@ -751,6 +751,10 @@ pub enum InvocationEndReason {
     AwaitingApproval,
     /// Something errored before completion.
     Error,
+    /// The invocation-scope tool-call backstop
+    /// (`AgentConfig::session_tool_call_max`) tripped and the loop
+    /// stopped without a final assistant message.
+    SessionToolCallExhausted,
 }
 
 impl InvocationEndReason {
@@ -759,6 +763,7 @@ impl InvocationEndReason {
             Self::Completed => "completed",
             Self::AwaitingApproval => "awaiting_approval",
             Self::Error => "error",
+            Self::SessionToolCallExhausted => "session_tool_call_exhausted",
         }
     }
 }
@@ -1273,6 +1278,10 @@ mod tests {
             "awaiting_approval"
         );
         assert_eq!(InvocationEndReason::Error.as_str(), "error");
+        assert_eq!(
+            InvocationEndReason::SessionToolCallExhausted.as_str(),
+            "session_tool_call_exhausted"
+        );
     }
 
     #[test]
