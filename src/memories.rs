@@ -65,11 +65,10 @@ fn global_path() -> PathBuf {
 }
 
 /// Best-effort home directory lookup via `$HOME`. Falls back to
-/// `None` if the variable is unset or empty; callers substitute
-/// `.` so a missing home just means the global tier is a no-op
-/// against `./.attini/memories.md` (which the project tier already
-/// looks at, so effectively skipped).
-fn home_dir() -> Option<PathBuf> {
+/// `None` if the variable is unset or empty; callers decide how to
+/// react (memory substitutes `.` and effectively no-ops the Global
+/// tier; skills skip the Global tier outright).
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)

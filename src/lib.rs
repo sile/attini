@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod sansio;
 pub mod session;
 pub mod session_cmd;
+pub mod skills;
 pub mod tools;
 
 pub use metrics::Counter;

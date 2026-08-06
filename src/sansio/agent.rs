@@ -433,6 +433,61 @@ const COMMAND_PARAMS_SCHEMA: &str = r#"{
 "required":["argv"]
 }"#;
 
+/// Request the shell to load a skill body by name and inject its
+/// contents (after `$ARGUMENTS` substitution) as the tool result.
+/// The set of installable skills is advertised at conversation start
+/// in a "Available skills" system message. The shell handles
+/// filesystem resolution; parsing / schema live here in sansio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillLoadInvocation {
+    /// Directory name of the skill under a skill root.
+    pub name: String,
+    /// Free-form argument string substituted into `$ARGUMENTS`
+    /// occurrences in the skill body. `None` behaves as `""`.
+    pub arguments: Option<String>,
+}
+
+impl SkillLoadInvocation {
+    /// Wire definition advertised to the model alongside
+    /// [`ReadOnlyTool::definitions`], [`PatchInvocation::definition`],
+    /// and [`CommandInvocation::definition`].
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "skill_load".to_string(),
+            description: "Load a skill body and follow its instructions. \
+                 Skill names are listed in the 'Available skills' system \
+                 message. The body is returned as the tool result with \
+                 `$ARGUMENTS` replaced by the `arguments` field (empty \
+                 string when omitted)."
+                .to_string(),
+            parameters_json: SKILL_LOAD_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    /// Parse the JSON `arguments` supplied by the model.
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+        let root = json.value();
+        let name = required_string(root, "name")?;
+        if name.trim().is_empty() {
+            return Err(ToolExecutionError::ArgumentsParseFailed(
+                "skill_load: name must not be empty".to_string(),
+            ));
+        }
+        let arguments = optional_string(root, "arguments")?;
+        Ok(Self { name, arguments })
+    }
+}
+
+const SKILL_LOAD_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"name":{"type":"string","description":"Skill name (directory name under a skill root)."},
+"arguments":{"type":"string","description":"Free-form argument text substituted into $ARGUMENTS in the skill body. Optional; omitted or empty produces no substitution content."}
+},
+"required":["name"]
+}"#;
+
 fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
     let value = root
         .to_member(name)
