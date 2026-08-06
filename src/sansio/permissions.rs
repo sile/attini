@@ -1,10 +1,12 @@
 //! Pure permission judgment for `command` tool invocations.
 //!
-//! Includes a minimal shell-word tokenizer, a safety check for shell
-//! metacharacters that make prefix matching unsafe, the rule type
-//! itself, and a mode-aware evaluator. No I/O — file loading and
-//! session record writing live in the impl-layer `crate::permissions`
-//! and `crate::agent_cli`.
+//! Rules are argv-prefix matchers (a rule matches when its
+//! `argv_prefix` equals the first N elements of the tool call's
+//! `argv`). Mode-aware evaluation returns [`Judgment::AutoApprove`],
+//! [`Judgment::AutoDeny`], [`Judgment::PlanReject`], or
+//! [`Judgment::Pending`]. No I/O — file loading and session record
+//! writing live in the impl-layer `crate::permissions` and
+//! `crate::agent_cli`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -21,7 +23,7 @@ pub enum RuleDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
-    pub prefix: String,
+    pub argv_prefix: Vec<String>,
     /// Default `false` (conservative: assume the command may write).
     pub readonly: bool,
     /// Default `true` (conservative: assume the command may use the
@@ -33,9 +35,9 @@ pub struct Rule {
 }
 
 impl Rule {
-    pub fn new_grant_approve(prefix: impl Into<String>) -> Self {
+    pub fn new_grant_approve(argv_prefix: Vec<String>) -> Self {
         Self {
-            prefix: prefix.into(),
+            argv_prefix,
             readonly: false,
             network: true,
             decision: Some(RuleDecision::Approve),
@@ -76,7 +78,7 @@ pub enum Judgment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoDecision {
     pub scope: RuleScope,
-    pub prefix: String,
+    pub argv_prefix: Vec<String>,
     pub reason: AutoReason,
 }
 
@@ -97,10 +99,6 @@ impl AutoReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanRejectReason {
-    /// The command_line contained a shell operator (chain / pipe /
-    /// redirect / subshell / background). Plan mode cannot verify
-    /// safety across shell boundaries.
-    ShellOperator,
     /// No rule matched and unmatched commands are conservatively
     /// treated as write-capable.
     NoRule,
@@ -111,95 +109,10 @@ pub enum PlanRejectReason {
 impl PlanRejectReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ShellOperator => "shell_operator",
             Self::NoRule => "no_rule",
             Self::NotReadonly => "not_readonly",
         }
     }
-}
-
-/// Tokenize `s` with a minimal shell-word rule:
-/// - Split on whitespace runs.
-/// - `"..."` and `'...'` are single tokens (quotes stripped).
-/// - No escape / variable / brace / glob handling.
-///
-/// Returns tokens in order. Empty input → empty vector.
-pub fn tokenize(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    for c in s.chars() {
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-            } else {
-                current.push(c);
-            }
-        } else if in_double {
-            if c == '"' {
-                in_double = false;
-            } else {
-                current.push(c);
-            }
-        } else if c == '\'' {
-            in_single = true;
-        } else if c == '"' {
-            in_double = true;
-        } else if c.is_whitespace() {
-            if !current.is_empty() {
-                out.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(c);
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-/// Return true when the command_line contains any shell operator
-/// that makes prefix matching unsafe (chain / pipe / redirect /
-/// subshell / background). Detection is done outside quoted spans
-/// so `echo 'a && b'` is *not* flagged.
-pub fn has_shell_operator(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_single {
-            if c == b'\'' {
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if in_double {
-            if c == b'"' {
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'\'' => in_single = true,
-            b'"' => in_double = true,
-            b'|' | b';' | b'<' | b'>' | b'`' => return true,
-            b'&' => {
-                // `&&` or word-boundary `&` (background); `&>` is bash-only
-                // but treat as operator anyway.
-                return true;
-            }
-            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'(' => return true,
-            _ => {}
-        }
-        i += 1;
-    }
-    false
 }
 
 /// Rule iteration order for evaluation: `session_rules` first, then
@@ -208,24 +121,14 @@ pub fn evaluate(
     mode: Mode,
     session_rules: &[Rule],
     workspace_rules: &[Rule],
-    command_line: &str,
+    argv: &[String],
 ) -> Judgment {
-    if has_shell_operator(command_line) {
-        return match mode {
-            Mode::Plan => Judgment::PlanReject {
-                reason: PlanRejectReason::ShellOperator,
-            },
-            Mode::Default | Mode::LocalOnly => Judgment::Pending,
-        };
-    }
-
-    let cmd_tokens = tokenize(command_line);
     for (scope, rules) in [
         (RuleScope::Session, session_rules),
         (RuleScope::Workspace, workspace_rules),
     ] {
         for rule in rules {
-            if !rule_matches(rule, &cmd_tokens) {
+            if !rule_matches(rule, argv) {
                 continue;
             }
             return judge_matched(mode, rule, scope);
@@ -240,17 +143,16 @@ pub fn evaluate(
     }
 }
 
-fn rule_matches(rule: &Rule, cmd_tokens: &[String]) -> bool {
-    let rule_tokens = tokenize(&rule.prefix);
-    if rule_tokens.is_empty() {
+fn rule_matches(rule: &Rule, argv: &[String]) -> bool {
+    if rule.argv_prefix.is_empty() {
         return false;
     }
-    if rule_tokens.len() > cmd_tokens.len() {
+    if rule.argv_prefix.len() > argv.len() {
         return false;
     }
-    rule_tokens
+    rule.argv_prefix
         .iter()
-        .zip(cmd_tokens.iter())
+        .zip(argv.iter())
         .all(|(a, b)| a == b)
 }
 
@@ -259,7 +161,7 @@ fn judge_matched(mode: Mode, rule: &Rule, scope: RuleScope) -> Judgment {
     if rule.decision == Some(RuleDecision::Deny) {
         return Judgment::AutoDeny(AutoDecision {
             scope,
-            prefix: rule.prefix.clone(),
+            argv_prefix: rule.argv_prefix.clone(),
             reason: AutoReason::RuleDeny,
         });
     }
@@ -267,7 +169,7 @@ fn judge_matched(mode: Mode, rule: &Rule, scope: RuleScope) -> Judgment {
         Mode::Default => match rule.decision {
             Some(RuleDecision::Approve) => Judgment::AutoApprove(AutoDecision {
                 scope,
-                prefix: rule.prefix.clone(),
+                argv_prefix: rule.argv_prefix.clone(),
                 reason: AutoReason::RuleApprove,
             }),
             None => Judgment::Pending,
@@ -277,7 +179,7 @@ fn judge_matched(mode: Mode, rule: &Rule, scope: RuleScope) -> Judgment {
             if rule.readonly {
                 Judgment::AutoApprove(AutoDecision {
                     scope,
-                    prefix: rule.prefix.clone(),
+                    argv_prefix: rule.argv_prefix.clone(),
                     reason: AutoReason::RuleApprove,
                 })
             } else {
@@ -290,7 +192,7 @@ fn judge_matched(mode: Mode, rule: &Rule, scope: RuleScope) -> Judgment {
             if !rule.network {
                 Judgment::AutoApprove(AutoDecision {
                     scope,
-                    prefix: rule.prefix.clone(),
+                    argv_prefix: rule.argv_prefix.clone(),
                     reason: AutoReason::RuleApprove,
                 })
             } else {
@@ -304,53 +206,25 @@ fn judge_matched(mode: Mode, rule: &Rule, scope: RuleScope) -> Judgment {
 mod tests {
     use super::*;
 
-    #[test]
-    fn tokenize_basic() {
-        assert_eq!(tokenize("cargo test"), vec!["cargo", "test"]);
-        assert_eq!(
-            tokenize("cargo  test  --workspace"),
-            vec!["cargo", "test", "--workspace"]
-        );
-        assert_eq!(tokenize("\"cargo\" test"), vec!["cargo", "test"]);
-        assert_eq!(tokenize("'cargo' test"), vec!["cargo", "test"]);
-        assert_eq!(tokenize(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn safety_check_hits_shell_operators() {
-        assert!(has_shell_operator("a && b"));
-        assert!(has_shell_operator("a || b"));
-        assert!(has_shell_operator("a ; b"));
-        assert!(has_shell_operator("a | b"));
-        assert!(has_shell_operator("a > file"));
-        assert!(has_shell_operator("a < file"));
-        assert!(has_shell_operator("`whoami`"));
-        assert!(has_shell_operator("$(whoami)"));
-        assert!(has_shell_operator("sleep 30 &"));
-    }
-
-    #[test]
-    fn safety_check_ignores_operators_in_quotes() {
-        assert!(!has_shell_operator("echo 'a && b'"));
-        assert!(!has_shell_operator("echo \"a | b\""));
-    }
-
-    #[test]
-    fn safety_check_leaves_plain_commands_alone() {
-        assert!(!has_shell_operator("cargo test --workspace"));
-        assert!(!has_shell_operator("ls -la"));
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
     fn evaluate_default_approve_rule_matches() {
         let rule = Rule {
-            prefix: "cargo test".to_string(),
+            argv_prefix: argv(&["cargo", "test"]),
             readonly: false,
             network: false,
             decision: Some(RuleDecision::Approve),
         };
-        match evaluate(Mode::Default, &[rule], &[], "cargo test --workspace") {
-            Judgment::AutoApprove(d) => assert_eq!(d.prefix, "cargo test"),
+        match evaluate(
+            Mode::Default,
+            &[rule],
+            &[],
+            &argv(&["cargo", "test", "--workspace"]),
+        ) {
+            Judgment::AutoApprove(d) => assert_eq!(d.argv_prefix, argv(&["cargo", "test"])),
             other => panic!("expected AutoApprove, got {other:?}"),
         }
     }
@@ -358,13 +232,13 @@ mod tests {
     #[test]
     fn evaluate_default_attribute_only_rule_pends() {
         let rule = Rule {
-            prefix: "ls".to_string(),
+            argv_prefix: argv(&["ls"]),
             readonly: true,
             network: false,
             decision: None,
         };
         assert!(matches!(
-            evaluate(Mode::Default, &[rule], &[], "ls -la"),
+            evaluate(Mode::Default, &[rule], &[], &argv(&["ls", "-la"])),
             Judgment::Pending
         ));
     }
@@ -372,14 +246,19 @@ mod tests {
     #[test]
     fn evaluate_deny_wins_across_modes() {
         let rule = Rule {
-            prefix: "rm -rf".to_string(),
+            argv_prefix: argv(&["rm", "-rf"]),
             readonly: false,
             network: false,
             decision: Some(RuleDecision::Deny),
         };
         for mode in [Mode::Default, Mode::Plan, Mode::LocalOnly] {
             assert!(matches!(
-                evaluate(mode, std::slice::from_ref(&rule), &[], "rm -rf tmp"),
+                evaluate(
+                    mode,
+                    std::slice::from_ref(&rule),
+                    &[],
+                    &argv(&["rm", "-rf", "tmp"])
+                ),
                 Judgment::AutoDeny(_)
             ));
         }
@@ -388,13 +267,13 @@ mod tests {
     #[test]
     fn evaluate_plan_mode_readonly_matches_auto_approves() {
         let rule = Rule {
-            prefix: "ls".to_string(),
+            argv_prefix: argv(&["ls"]),
             readonly: true,
             network: false,
             decision: None,
         };
         assert!(matches!(
-            evaluate(Mode::Plan, &[rule], &[], "ls src"),
+            evaluate(Mode::Plan, &[rule], &[], &argv(&["ls", "src"])),
             Judgment::AutoApprove(_)
         ));
     }
@@ -402,7 +281,7 @@ mod tests {
     #[test]
     fn evaluate_plan_mode_no_match_rejects() {
         assert!(matches!(
-            evaluate(Mode::Plan, &[], &[], "rm -rf tmp"),
+            evaluate(Mode::Plan, &[], &[], &argv(&["rm", "-rf", "tmp"])),
             Judgment::PlanReject {
                 reason: PlanRejectReason::NoRule
             }
@@ -410,25 +289,20 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_plan_mode_safety_hit_rejects() {
-        assert!(matches!(
-            evaluate(Mode::Plan, &[], &[], "ls && rm -rf tmp"),
-            Judgment::PlanReject {
-                reason: PlanRejectReason::ShellOperator
-            }
-        ));
-    }
-
-    #[test]
     fn evaluate_local_only_network_false_auto_approves() {
         let rule = Rule {
-            prefix: "cargo build".to_string(),
+            argv_prefix: argv(&["cargo", "build"]),
             readonly: false,
             network: false,
             decision: None,
         };
         assert!(matches!(
-            evaluate(Mode::LocalOnly, &[rule], &[], "cargo build --release"),
+            evaluate(
+                Mode::LocalOnly,
+                &[rule],
+                &[],
+                &argv(&["cargo", "build", "--release"])
+            ),
             Judgment::AutoApprove(_)
         ));
     }
@@ -436,13 +310,18 @@ mod tests {
     #[test]
     fn evaluate_local_only_network_true_pends() {
         let rule = Rule {
-            prefix: "curl".to_string(),
+            argv_prefix: argv(&["curl"]),
             readonly: true,
             network: true,
             decision: None,
         };
         assert!(matches!(
-            evaluate(Mode::LocalOnly, &[rule], &[], "curl example.com"),
+            evaluate(
+                Mode::LocalOnly,
+                &[rule],
+                &[],
+                &argv(&["curl", "example.com"])
+            ),
             Judgment::Pending
         ));
     }
@@ -450,21 +329,110 @@ mod tests {
     #[test]
     fn evaluate_session_wins_over_workspace() {
         let ws = Rule {
-            prefix: "cargo test".to_string(),
+            argv_prefix: argv(&["cargo", "test"]),
             readonly: false,
             network: false,
             decision: Some(RuleDecision::Deny),
         };
         let sess = Rule {
-            prefix: "cargo test".to_string(),
+            argv_prefix: argv(&["cargo", "test"]),
             readonly: false,
             network: false,
             decision: Some(RuleDecision::Approve),
         };
         // Session-first: approve wins even though workspace says deny.
-        match evaluate(Mode::Default, &[sess], &[ws], "cargo test") {
+        match evaluate(Mode::Default, &[sess], &[ws], &argv(&["cargo", "test"])) {
             Judgment::AutoApprove(d) => assert_eq!(d.scope, RuleScope::Session),
             other => panic!("expected AutoApprove(session), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_rule_prefix_longer_than_argv_does_not_match() {
+        let rule = Rule {
+            argv_prefix: argv(&["cargo", "test", "--all"]),
+            readonly: false,
+            network: false,
+            decision: Some(RuleDecision::Approve),
+        };
+        assert!(matches!(
+            evaluate(Mode::Default, &[rule], &[], &argv(&["cargo", "test"])),
+            Judgment::Pending
+        ));
+    }
+
+    #[test]
+    fn evaluate_element_wise_mismatch_does_not_match() {
+        let rule = Rule {
+            argv_prefix: argv(&["cargo", "test"]),
+            readonly: false,
+            network: false,
+            decision: Some(RuleDecision::Approve),
+        };
+        assert!(matches!(
+            evaluate(Mode::Default, &[rule], &[], &argv(&["cargo", "check"])),
+            Judgment::Pending
+        ));
+    }
+
+    #[test]
+    fn evaluate_empty_argv_prefix_never_matches() {
+        let rule = Rule {
+            argv_prefix: Vec::new(),
+            readonly: false,
+            network: false,
+            decision: Some(RuleDecision::Approve),
+        };
+        assert!(matches!(
+            evaluate(Mode::Default, &[rule], &[], &argv(&["ls"])),
+            Judgment::Pending
+        ));
+    }
+
+    #[test]
+    fn evaluate_bash_dash_c_without_matching_rule_pends() {
+        // The `["bash", "-c", "..."]` escape hatch does not get an
+        // auto-approval unless a rule with `argv_prefix: ["bash", "-c"]`
+        // (or a broader ["bash"] prefix) is present. Without it, the
+        // call falls through to normal pending approval — proving that
+        // pipes / redirects / globs cannot silently ride in on an
+        // unrelated approved prefix.
+        let cargo_test_rule = approve_rule(&["cargo", "test"]);
+        assert!(matches!(
+            evaluate(
+                Mode::Default,
+                &[cargo_test_rule],
+                &[],
+                &argv(&["bash", "-c", "ls | head"]),
+            ),
+            Judgment::Pending
+        ));
+    }
+
+    #[test]
+    fn evaluate_bash_dash_c_with_matching_rule_auto_approves() {
+        // Conversely, when the user has explicitly granted
+        // `["bash", "-c"]`, calls of that shape auto-approve. This
+        // documents the escape-hatch contract: opt-in per rule, not
+        // implicit.
+        let bash_c_rule = approve_rule(&["bash", "-c"]);
+        match evaluate(
+            Mode::Default,
+            &[bash_c_rule],
+            &[],
+            &argv(&["bash", "-c", "ls | head"]),
+        ) {
+            Judgment::AutoApprove(d) => assert_eq!(d.argv_prefix, argv(&["bash", "-c"])),
+            other => panic!("expected AutoApprove for approved bash -c, got {other:?}"),
+        }
+    }
+
+    fn approve_rule(prefix: &[&str]) -> Rule {
+        Rule {
+            argv_prefix: argv(prefix),
+            readonly: false,
+            network: true,
+            decision: Some(RuleDecision::Approve),
         }
     }
 }

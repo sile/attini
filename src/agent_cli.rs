@@ -13,12 +13,11 @@ use nojson::DisplayJson;
 use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::sansio::agent::{
-    CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool, ToolExecutionError, ToolOutcome,
+    CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
+    ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
-use crate::sansio::permissions::{
-    AutoDecision, Judgment, Mode, evaluate, has_shell_operator, tokenize,
-};
+use crate::sansio::permissions::{AutoDecision, Judgment, Mode, evaluate};
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
     Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
@@ -594,34 +593,46 @@ fn dispatch_command(
             return Ok(CommandDispatch::Continue);
         }
     };
-    let judgment = evaluate(mode, &rules.session, &rules.workspace, &inv.command_line);
+    let judgment = evaluate(mode, &rules.session, &rules.workspace, &inv.argv);
+    let display = shell_escape_argv(&inv.argv);
     match judgment {
         Judgment::AutoApprove(dec) => {
+            let dec_display = shell_escape_argv(&dec.argv_prefix);
             eprintln!(
                 "[command] auto-approve via {} rule '{}': {}",
                 dec.scope.as_str(),
-                dec.prefix,
-                inv.command_line
+                dec_display,
+                display
             );
             append_auto_approval(session, &tc.id, ApprovalDecision::Approve, &dec)?;
-            let content = run_command_sync(&inv, executor)?;
+            let content = match run_command_sync(&inv, executor) {
+                Ok(s) => s,
+                Err(err) => {
+                    let (code, msg) = err.to_code_and_message();
+                    counters.tool_errors += 1;
+                    let payload = tool_error_json(code, &msg);
+                    append_tool(session, messages, &tc.id, payload)?;
+                    return Ok(CommandDispatch::Continue);
+                }
+            };
             append_tool(session, messages, &tc.id, content)?;
             Ok(CommandDispatch::Continue)
         }
         Judgment::AutoDeny(dec) => {
+            let dec_display = shell_escape_argv(&dec.argv_prefix);
             eprintln!(
                 "[command] auto-deny via {} rule '{}': {}",
                 dec.scope.as_str(),
-                dec.prefix,
-                inv.command_line
+                dec_display,
+                display
             );
             append_auto_approval(session, &tc.id, ApprovalDecision::Reject, &dec)?;
             let content = tool_error_json(
                 "denied_by_rule",
                 &format!(
-                    "auto-denied by {} rule prefix '{}'",
+                    "auto-denied by {} rule argv_prefix {:?}",
                     dec.scope.as_str(),
-                    dec.prefix
+                    dec.argv_prefix
                 ),
             );
             counters.tool_errors += 1;
@@ -632,11 +643,11 @@ fn dispatch_command(
             eprintln!(
                 "[command] plan_mode reject ({}): {}",
                 reason.as_str(),
-                inv.command_line
+                display
             );
             let sidecar = AutoDecidedBy {
                 scope: "plan".to_string(),
-                prefix: String::new(),
+                argv_prefix: Vec::new(),
                 reason: format!("plan_mode_reject:{}", reason.as_str()),
             };
             session.append(&SessionRecord::ToolApproval {
@@ -658,10 +669,9 @@ fn dispatch_command(
         }
         Judgment::Pending => {
             let preview_text = render_command_preview_from(&inv);
-            let hit_safety = has_shell_operator(&inv.command_line);
             eprintln!("[command] approval required");
             eprintln!("{preview_text}");
-            emit_suggested_rule(&inv.command_line, hit_safety);
+            emit_suggested_rule(&inv.argv);
             save_pending(session, tc, PendingToolKind::Command, preview_text)?;
             Ok(CommandDispatch::Awaiting)
         }
@@ -676,7 +686,7 @@ fn append_auto_approval(
 ) -> io::Result<()> {
     let sidecar = AutoDecidedBy {
         scope: dec.scope.as_str().to_string(),
-        prefix: dec.prefix.clone(),
+        argv_prefix: dec.argv_prefix.clone(),
         reason: dec.reason.as_str().to_string(),
     };
     session.append(&SessionRecord::ToolApproval {
@@ -687,29 +697,25 @@ fn append_auto_approval(
     })
 }
 
-fn emit_suggested_rule(command_line: &str, hit_safety: bool) {
-    if hit_safety {
-        eprintln!(
-            "note: contains shell operator; cannot be pre-approved via `attini session grant`."
-        );
+/// Suggest the two `attini session grant` invocations that would
+/// pre-approve the argv-prefix of the pending command. `argv` is
+/// truncated to at most two elements (typical pattern: `program
+/// subcommand`) so the rule stays a general prefix rather than
+/// baking every flag in.
+fn emit_suggested_rule(argv: &[String]) {
+    if argv.is_empty() {
         return;
     }
-    let tokens = tokenize(command_line);
-    if tokens.is_empty() {
-        return;
-    }
-    let take = tokens.len().min(2);
-    let prefix_display = tokens[..take]
-        .iter()
-        .map(|t| t.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let quoted = shell_single_quote(&prefix_display);
+    let take = argv.len().min(2);
+    let prefix_display = shell_escape_argv(&argv[..take]);
     eprintln!("suggested rule (persist separately after approve):");
-    eprintln!("  attini session grant {quoted}                # session-local");
-    eprintln!("  attini session grant {quoted} --workspace    # workspace-wide");
+    eprintln!("  attini session grant {prefix_display}                # session-local");
+    eprintln!("  attini session grant {prefix_display} --workspace    # workspace-wide");
 }
 
+/// Unconditionally wrap `s` in POSIX single-quotes, escaping any
+/// interior single-quotes with the `'\\''` sequence. Used by
+/// [`shell_escape_argv`] as the quoting primitive.
 fn shell_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -724,10 +730,61 @@ fn shell_single_quote(s: &str) -> String {
     out
 }
 
+/// Format an argv slice as a shell-escaped single-line command for
+/// human display (preview text, suggested-rule hint, log lines).
+/// Simple tokens are emitted raw; empty strings and tokens
+/// containing whitespace or POSIX shell metacharacters are
+/// single-quoted. The output is not eval-safe in every corner but is
+/// unambiguous for the argv patterns coding agents typically
+/// produce.
+fn shell_escape_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|s| {
+            if s.is_empty() || s.chars().any(needs_shell_quote) {
+                shell_single_quote(s)
+            } else {
+                s.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn needs_shell_quote(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t'
+            | '\n'
+            | '|'
+            | '&'
+            | ';'
+            | '('
+            | ')'
+            | '$'
+            | '`'
+            | '>'
+            | '<'
+            | '\\'
+            | '"'
+            | '\''
+            | '*'
+            | '?'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '!'
+            | '#'
+            | '~'
+            | '='
+    )
+}
+
 fn render_command_preview_from(inv: &CommandInvocation) -> String {
     format!(
-        "command preview: `{}` (timeout {}s)",
-        inv.command_line, inv.timeout_seconds
+        "command preview: {} (timeout {}s)",
+        shell_escape_argv(&inv.argv),
+        inv.timeout_seconds
     )
 }
 
@@ -863,23 +920,35 @@ fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<Str
         PendingToolKind::Command => {
             let inv = CommandInvocation::parse(&pending.arguments_json)
                 .map_err(|e| io::Error::other(format!("command args: {e:?}")))?;
-            run_command_sync(&inv, executor)
+            match run_command_sync(&inv, executor) {
+                Ok(s) => Ok(s),
+                Err(err) => {
+                    let (code, msg) = err.to_code_and_message();
+                    Ok(tool_error_json(code, &msg))
+                }
+            }
         }
     }
 }
 
 const COMMAND_KILL_GRACE_MS: u64 = 500;
 
-fn run_command_sync(inv: &CommandInvocation, executor: &ToolExecutor) -> io::Result<String> {
+fn run_command_sync(
+    inv: &CommandInvocation,
+    executor: &ToolExecutor,
+) -> Result<String, CommandError> {
     let started = Instant::now();
     let timeout = Duration::from_secs(inv.timeout_seconds);
-    let child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(&inv.command_line)
+    // argv is guaranteed non-empty by CommandInvocation::parse.
+    let child = Command::new(&inv.argv[0])
+        .args(&inv.argv[1..])
         .current_dir(executor.root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .map_err(|e| CommandError::SpawnFailed {
+            message: e.to_string(),
+        })?;
     let child_id = child.id() as libc::pid_t;
 
     let done = Arc::new(AtomicBool::new(false));
@@ -899,7 +968,11 @@ fn run_command_sync(inv: &CommandInvocation, executor: &ToolExecutor) -> io::Res
         unsafe { libc::kill(child_id, libc::SIGKILL) };
     });
 
-    let output = child.wait_with_output()?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| CommandError::SpawnFailed {
+            message: e.to_string(),
+        })?;
     done.store(true, Ordering::Relaxed);
     let elapsed = started.elapsed();
     let termination_reason = if elapsed >= timeout || output.status.code().is_none() {

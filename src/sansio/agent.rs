@@ -394,15 +394,19 @@ const PATCH_PARAMS_SCHEMA: &str = r#"{
 "required":["edits"]
 }"#;
 
-/// A single shell command the model wants the shell to run. Parsed
-/// from the `command` tool call's arguments and dispatched only
-/// after user approval.
+/// A single command the model wants to run. Parsed from the
+/// `command` tool call's arguments and dispatched only after user
+/// approval. `argv[0]` is exec'd directly (no shell); pipes /
+/// redirects / globs must be handled by each program's native
+/// flags or by explicitly invoking `["bash", "-c", "..."]` as
+/// argv, which stays approval-gated unless a matching `bash -c`
+/// rule pre-approves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandInvocation {
-    /// String passed verbatim to `/bin/sh -c`. Approval-gated because
-    /// shell metacharacters make the effective set of side effects
-    /// wide.
-    pub command_line: String,
+    /// Command and arguments, exec'd directly without a shell. The
+    /// first element names the program (PATH-resolved by
+    /// `Command::new`); the rest are argv[1..].
+    pub argv: Vec<String>,
     /// Real-clock cap; `<= COMMAND_MAX_TIMEOUT_SECONDS`.
     pub timeout_seconds: u64,
 }
@@ -413,10 +417,10 @@ impl CommandInvocation {
     pub fn definition() -> ToolDef {
         ToolDef {
             name: "command".to_string(),
-            description: "Run a shell command in the workspace. Every command \
-                 needs user approval before it starts. Output and \
-                 runtime are capped; non-zero exit status is returned \
-                 as a normal result (not an error)."
+            description: "Run a command in the workspace by executing argv[0] with argv[1..] \
+                 directly (no shell). Every call requires user approval unless a matching \
+                 argv_prefix rule pre-approves it. Output and runtime are capped; non-zero \
+                 exit status is returned as a normal result (not an error)."
                 .to_string(),
             parameters_json: COMMAND_PARAMS_SCHEMA.to_string(),
         }
@@ -426,9 +430,9 @@ impl CommandInvocation {
     pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
         let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
         let root = json.value();
-        let command_line = required_string(root, "command_line")?;
-        if command_line.is_empty() {
-            return Err(ToolExecutionError::Command(CommandError::EmptyCommandLine));
+        let argv = required_string_array(root, "argv")?;
+        if argv.is_empty() {
+            return Err(ToolExecutionError::Command(CommandError::EmptyArgv));
         }
         let timeout_seconds = match optional_u64(root, "timeout_seconds")? {
             Some(0) => {
@@ -445,7 +449,7 @@ impl CommandInvocation {
             None => DEFAULT_COMMAND_TIMEOUT_SECONDS,
         };
         Ok(Self {
-            command_line,
+            argv,
             timeout_seconds,
         })
     }
@@ -454,10 +458,10 @@ impl CommandInvocation {
 const COMMAND_PARAMS_SCHEMA: &str = r#"{
 "type":"object",
 "properties":{
-"command_line":{"type":"string","description":"Shell command line passed to /bin/sh -c. Requires user approval before running."},
-"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":60,"description":"Real-clock timeout in seconds. Exceeding it terminates the process group and yields termination_reason=timeout."}
+"argv":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Command and arguments to exec directly (no shell interpretation). Use each program's own flags for pipe / redirect / glob equivalents (for example --max-count instead of piping to head). For a shell pipe or chain, invoke it explicitly as [\"bash\", \"-c\", \"...\"]; that will still require user approval unless a matching argv_prefix rule pre-approves it."},
+"timeout_seconds":{"type":"integer","minimum":1,"maximum":300,"default":60,"description":"Real-clock timeout in seconds. Exceeding it terminates the process and yields termination_reason=timeout."}
 },
-"required":["command_line"]
+"required":["argv"]
 }"#;
 
 fn optional_u64(root: RawJsonValue<'_, '_>, name: &str) -> Result<Option<u64>, ToolExecutionError> {
@@ -474,6 +478,24 @@ fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, Too
         .required()
         .map_err(map_parse_err)?;
     value.try_into().map_err(map_parse_err)
+}
+
+fn required_string_array(
+    root: RawJsonValue<'_, '_>,
+    name: &str,
+) -> Result<Vec<String>, ToolExecutionError> {
+    let value = root
+        .to_member(name)
+        .map_err(map_parse_err)?
+        .required()
+        .map_err(map_parse_err)?;
+    let array = value.to_array().map_err(map_parse_err)?;
+    let mut out = Vec::new();
+    for item in array {
+        let s: String = item.try_into().map_err(map_parse_err)?;
+        out.push(s);
+    }
+    Ok(out)
 }
 
 fn optional_string(
@@ -692,13 +714,13 @@ impl PatchError {
 pub enum CommandError {
     /// User rejected the approval preview.
     Rejected,
-    /// `fork`/`exec` failed (shell not on PATH, ENOMEM, EPERM, ...).
+    /// `exec` failed (`argv[0]` not on PATH, ENOMEM, EPERM, ...).
     SpawnFailed { message: String },
     /// `timeout_seconds` was 0 or above
     /// [`COMMAND_MAX_TIMEOUT_SECONDS`].
     TimeoutOutOfRange { seconds: u64 },
-    /// `command_line` was an empty string.
-    EmptyCommandLine,
+    /// `argv` was an empty array.
+    EmptyArgv,
 }
 
 impl CommandError {
@@ -710,7 +732,7 @@ impl CommandError {
             ),
             Self::SpawnFailed { message } => (
                 "command_spawn_failed",
-                format!("failed to spawn shell: {message}"),
+                format!("failed to spawn command: {message}"),
             ),
             Self::TimeoutOutOfRange { seconds } => (
                 "command_timeout_out_of_range",
@@ -718,10 +740,7 @@ impl CommandError {
                     "timeout_seconds={seconds} is out of range (1..={COMMAND_MAX_TIMEOUT_SECONDS})"
                 ),
             ),
-            Self::EmptyCommandLine => (
-                "command_empty_command_line",
-                "command_line must not be empty".to_string(),
-            ),
+            Self::EmptyArgv => ("command_empty_argv", "argv must not be empty".to_string()),
         }
     }
 }
@@ -766,7 +785,7 @@ pub enum ApprovalState {
 /// timeout to display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandPreview {
-    pub command_line: String,
+    pub argv: Vec<String>,
     pub timeout_seconds: u64,
     /// Directory the shell will spawn the child in. Copied from
     /// [`AgentCore::set_workspace_display`] so the pure Sans I/O core
@@ -1660,7 +1679,7 @@ impl AgentCore {
                 match CommandInvocation::parse(&call.arguments_json) {
                     Ok(invocation) => {
                         let preview = CommandPreview {
-                            command_line: invocation.command_line.clone(),
+                            argv: invocation.argv.clone(),
                             timeout_seconds: invocation.timeout_seconds,
                             working_directory: self.workspace_display.clone(),
                         };
@@ -3064,37 +3083,33 @@ mod tests {
         let def = CommandInvocation::definition();
         assert_eq!(def.name, "command");
         assert!(def.description.contains("approval"));
-        assert!(def.parameters_json.contains("command_line"));
+        assert!(def.parameters_json.contains("argv"));
         assert!(def.parameters_json.contains("timeout_seconds"));
     }
 
     #[test]
     fn command_parse_applies_default_timeout_when_omitted() {
-        let inv = CommandInvocation::parse(r#"{"command_line":"ls -la"}"#).expect("parses");
-        assert_eq!(inv.command_line, "ls -la");
+        let inv = CommandInvocation::parse(r#"{"argv":["ls","-la"]}"#).expect("parses");
+        assert_eq!(inv.argv, vec!["ls".to_string(), "-la".to_string()]);
         assert_eq!(inv.timeout_seconds, DEFAULT_COMMAND_TIMEOUT_SECONDS);
     }
 
     #[test]
     fn command_parse_accepts_explicit_timeout() {
-        let inv =
-            CommandInvocation::parse(r#"{"command_line":"cargo test","timeout_seconds":120}"#)
-                .expect("parses");
+        let inv = CommandInvocation::parse(r#"{"argv":["cargo","test"],"timeout_seconds":120}"#)
+            .expect("parses");
         assert_eq!(inv.timeout_seconds, 120);
     }
 
     #[test]
-    fn command_parse_rejects_empty_command_line() {
-        let err = CommandInvocation::parse(r#"{"command_line":""}"#).expect_err("empty rejected");
-        assert_eq!(
-            err,
-            ToolExecutionError::Command(CommandError::EmptyCommandLine)
-        );
+    fn command_parse_rejects_empty_argv() {
+        let err = CommandInvocation::parse(r#"{"argv":[]}"#).expect_err("empty rejected");
+        assert_eq!(err, ToolExecutionError::Command(CommandError::EmptyArgv));
     }
 
     #[test]
     fn command_parse_rejects_zero_timeout() {
-        let err = CommandInvocation::parse(r#"{"command_line":"ls","timeout_seconds":0}"#)
+        let err = CommandInvocation::parse(r#"{"argv":["ls"],"timeout_seconds":0}"#)
             .expect_err("zero timeout rejected");
         assert_eq!(
             err,
@@ -3105,7 +3120,7 @@ mod tests {
     #[test]
     fn command_parse_rejects_timeout_over_max() {
         let json = format!(
-            r#"{{"command_line":"ls","timeout_seconds":{}}}"#,
+            r#"{{"argv":["ls"],"timeout_seconds":{}}}"#,
             COMMAND_MAX_TIMEOUT_SECONDS + 1
         );
         let err = CommandInvocation::parse(&json).expect_err("over-max rejected");
@@ -3368,7 +3383,7 @@ mod tests {
     }
 
     fn valid_command_json() -> &'static str {
-        r#"{"command_line":"echo hi","timeout_seconds":10}"#
+        r#"{"argv":["echo","hi"],"timeout_seconds":10}"#
     }
 
     #[test]
@@ -3394,7 +3409,7 @@ mod tests {
             .command_preview
             .as_ref()
             .expect("preview populated");
-        assert_eq!(preview.command_line, "echo hi");
+        assert_eq!(preview.argv, vec!["echo".to_string(), "hi".to_string()]);
         assert_eq!(preview.timeout_seconds, 10);
         assert_eq!(preview.working_directory, "/tmp/wksp");
         assert_eq!(core.pending_approval_call_id(), Some("c1".to_string()));
@@ -3417,7 +3432,7 @@ mod tests {
                 a,
                 Action::ExecuteCommand { call_id, invocation, .. }
                     if call_id == "c1"
-                        && invocation.command_line == "echo hi"
+                        && invocation.argv == vec!["echo".to_string(), "hi".to_string()]
                         && invocation.timeout_seconds == 10
             )
         });

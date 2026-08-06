@@ -783,7 +783,7 @@ impl ApprovalDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoDecidedBy {
     pub scope: String,
-    pub prefix: String,
+    pub argv_prefix: Vec<String>,
     pub reason: String,
 }
 
@@ -791,7 +791,7 @@ impl DisplayJson for AutoDecidedBy {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
             f.member("scope", &self.scope)?;
-            f.member("prefix", &self.prefix)?;
+            f.member("argv_prefix", &self.argv_prefix)?;
             f.member("reason", &self.reason)
         })
     }

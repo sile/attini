@@ -176,12 +176,13 @@ where
 }
 
 fn parse_rule(value: nojson::RawJsonValue<'_, '_>) -> Result<Rule, String> {
-    let prefix = required_string(value, "prefix").map_err(|e| format!("prefix: {e}"))?;
-    if prefix.trim().is_empty() {
-        return Err("prefix is empty or whitespace only".to_string());
+    let argv_prefix =
+        required_string_array(value, "argv_prefix").map_err(|e| format!("argv_prefix: {e}"))?;
+    if argv_prefix.is_empty() {
+        return Err("argv_prefix is empty".to_string());
     }
-    if crate::sansio::permissions::tokenize(&prefix).is_empty() {
-        return Err("prefix tokenizes to zero tokens".to_string());
+    if argv_prefix.iter().any(|s| s.is_empty()) {
+        return Err("argv_prefix contains an empty element".to_string());
     }
     let readonly = optional_bool(value, "readonly")
         .map_err(|e| format!("readonly: {e}"))?
@@ -202,21 +203,31 @@ fn parse_rule(value: nojson::RawJsonValue<'_, '_>) -> Result<Rule, String> {
         },
     };
     Ok(Rule {
-        prefix,
+        argv_prefix,
         readonly,
         network,
         decision,
     })
 }
 
-fn required_string(value: nojson::RawJsonValue<'_, '_>, key: &str) -> Result<String, String> {
-    let v = value
+fn required_string_array(
+    value: nojson::RawJsonValue<'_, '_>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let member = value
         .to_member(key)
         .and_then(|m| m.required())
         .map_err(|e| e.to_string())?;
-    v.to_unquoted_string_str()
-        .map(|s| s.into_owned())
-        .map_err(|e| e.to_string())
+    let array = member.to_array().map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for item in array {
+        let s: String = item
+            .to_unquoted_string_str()
+            .map_err(|e| e.to_string())?
+            .into_owned();
+        out.push(s);
+    }
+    Ok(out)
 }
 
 fn optional_string(
@@ -266,7 +277,7 @@ struct Permissions {
 /// the runtime evaluator's view and would drop attribute-only rows).
 #[derive(Debug, Clone)]
 struct CommandPrefixEntry {
-    prefix: String,
+    argv_prefix: Vec<String>,
     decision: Option<String>,
     readonly: Option<bool>,
     network: Option<bool>,
@@ -275,7 +286,7 @@ struct CommandPrefixEntry {
 impl DisplayJson for CommandPrefixEntry {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
-            f.member("prefix", &self.prefix)?;
+            f.member("argv_prefix", &self.argv_prefix)?;
             if let Some(d) = &self.decision {
                 f.member("decision", d)?;
             }
@@ -314,10 +325,19 @@ fn read_permissions_file(path: &Path) -> Result<Permissions, GrantError> {
         .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
     let root = json.value();
     if let Ok(array) = root.to_array() {
-        // Legacy: array of rule objects.
+        // Legacy: top-level array of rule objects (pre-object-schema
+        // shape, one `{"prefix": "..."}` per entry). Modern rules never
+        // appear at the top level. Silently drop them so the next
+        // write migrates the file to the new object schema.
         let mut cp = Vec::new();
         for item in array {
-            cp.push(read_command_prefix_entry(item)?);
+            match read_command_prefix_entry(item) {
+                Ok(entry) => cp.push(entry),
+                Err(e) => eprintln!(
+                    "attini: {} contains a legacy rule entry that will be dropped on next write ({e})",
+                    path.display()
+                ),
+            }
         }
         return Ok(Permissions {
             command_prefixes: cp,
@@ -333,7 +353,13 @@ fn read_permissions_file(path: &Path) -> Result<Permissions, GrantError> {
             .to_array()
             .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
         for item in array {
-            cp.push(read_command_prefix_entry(item)?);
+            match read_command_prefix_entry(item) {
+                Ok(entry) => cp.push(entry),
+                Err(e) => eprintln!(
+                    "attini: {} contains a legacy rule entry that will be dropped on next write ({e})",
+                    path.display()
+                ),
+            }
         }
     }
     let paths_member = root
@@ -362,8 +388,8 @@ fn read_command_prefix_entry(
     value: nojson::RawJsonValue<'_, '_>,
 ) -> Result<CommandPrefixEntry, GrantError> {
     let path_hint = || PathBuf::from("<in memory>");
-    let prefix = required_string(value, "prefix")
-        .map_err(|e| GrantError::ParseError(path_hint(), format!("prefix: {e}")))?;
+    let argv_prefix = required_string_array(value, "argv_prefix")
+        .map_err(|e| GrantError::ParseError(path_hint(), format!("argv_prefix: {e}")))?;
     let decision =
         optional_string(value, "decision").map_err(|e| GrantError::ParseError(path_hint(), e))?;
     let readonly =
@@ -371,7 +397,7 @@ fn read_command_prefix_entry(
     let network =
         optional_bool(value, "network").map_err(|e| GrantError::ParseError(path_hint(), e))?;
     Ok(CommandPrefixEntry {
-        prefix,
+        argv_prefix,
         decision,
         readonly,
         network,
@@ -394,11 +420,11 @@ pub enum GrantOutcome {
 
 #[derive(Debug)]
 pub enum GrantError {
-    PrefixEmpty,
+    ArgvEmpty,
     SessionMissing(PathBuf),
     ParseError(PathBuf, String),
-    ExistingDenyConflict(PathBuf, String),
-    ExistingAttributeOnlyConflict(PathBuf, String),
+    ExistingDenyConflict(PathBuf, Vec<String>),
+    ExistingAttributeOnlyConflict(PathBuf, Vec<String>),
     Io(io::Error),
 }
 
@@ -411,21 +437,21 @@ impl From<io::Error> for GrantError {
 impl std::fmt::Display for GrantError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PrefixEmpty => write!(f, "PREFIX is empty or tokenizes to zero tokens"),
+            Self::ArgvEmpty => write!(f, "argv_prefix is empty or contains an empty element"),
             Self::SessionMissing(p) => write!(f, "session directory not found: {}", p.display()),
             Self::ParseError(p, e) => write!(
                 f,
                 "existing {} is not valid JSON: {e}. Fix or delete it before granting.",
                 p.display()
             ),
-            Self::ExistingDenyConflict(p, prefix) => write!(
+            Self::ExistingDenyConflict(p, argv_prefix) => write!(
                 f,
-                "rule for prefix {prefix:?} already exists as `deny` in {}; edit manually to resolve",
+                "rule for argv_prefix {argv_prefix:?} already exists as `deny` in {}; edit manually to resolve",
                 p.display()
             ),
-            Self::ExistingAttributeOnlyConflict(p, prefix) => write!(
+            Self::ExistingAttributeOnlyConflict(p, argv_prefix) => write!(
                 f,
-                "rule for prefix {prefix:?} already exists in {} without a `decision` field; append `\"decision\": \"approve\"` to it manually so evaluation order is preserved",
+                "rule for argv_prefix {argv_prefix:?} already exists in {} without a `decision` field; append `\"decision\": \"approve\"` to it manually so evaluation order is preserved",
                 p.display()
             ),
             Self::Io(e) => write!(f, "{e}"),
@@ -457,25 +483,28 @@ fn resolve_target(scope: GrantScope<'_>) -> Result<PathBuf, GrantError> {
     }
 }
 
-pub fn grant(scope: GrantScope<'_>, prefix: &str) -> Result<GrantOutcome, GrantError> {
-    let prefix = prefix.trim().to_string();
-    if prefix.is_empty() || crate::sansio::permissions::tokenize(&prefix).is_empty() {
-        return Err(GrantError::PrefixEmpty);
+pub fn grant(scope: GrantScope<'_>, argv_prefix: &[String]) -> Result<GrantOutcome, GrantError> {
+    if argv_prefix.is_empty() || argv_prefix.iter().any(|s| s.is_empty()) {
+        return Err(GrantError::ArgvEmpty);
     }
+    let argv_prefix: Vec<String> = argv_prefix.to_vec();
     let target = resolve_target(scope)?;
     let mut permissions = read_permissions_file(&target)?;
     for entry in &permissions.command_prefixes {
-        if entry.prefix != prefix {
+        if entry.argv_prefix != argv_prefix {
             continue;
         }
         return match entry.decision.as_deref() {
             Some("approve") => Ok(GrantOutcome::AlreadyGranted(target)),
-            Some("deny") => Err(GrantError::ExistingDenyConflict(target, prefix)),
-            _ => Err(GrantError::ExistingAttributeOnlyConflict(target, prefix)),
+            Some("deny") => Err(GrantError::ExistingDenyConflict(target, argv_prefix)),
+            _ => Err(GrantError::ExistingAttributeOnlyConflict(
+                target,
+                argv_prefix,
+            )),
         };
     }
     permissions.command_prefixes.push(CommandPrefixEntry {
-        prefix,
+        argv_prefix,
         decision: Some("approve".to_string()),
         readonly: None,
         network: None,
@@ -537,7 +566,7 @@ pub fn grant_read(
         // The three shapes below aren't produced by resolve_target;
         // fold them into ParseError to keep the caller-visible type
         // simple.
-        GrantError::PrefixEmpty
+        GrantError::ArgvEmpty
         | GrantError::ExistingDenyConflict(_, _)
         | GrantError::ExistingAttributeOnlyConflict(_, _) => {
             GrantReadError::ParseError(PathBuf::new(), "unexpected grant error".to_string())
@@ -594,14 +623,16 @@ mod tests {
     }
 
     #[test]
-    fn load_reads_legacy_array_schema_as_command_prefixes_only() {
+    fn load_legacy_array_of_string_prefix_entries_yields_empty_rules() {
+        // Legacy schema (root array + string prefix) is unsupported;
+        // load_from_path warns + skips each entry and returns an
+        // empty rule set. The next write-through will silently
+        // migrate the file to the new object schema.
         let dir = tempdir("legacy_array");
         let path = dir.join("permissions.json");
         fs::write(&path, r#"[{"prefix":"cargo test","decision":"approve"}]"#).expect("write");
         let (rules, paths_list) = load_from_path(&path, "workspace");
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].prefix, "cargo test");
-        assert!(matches!(rules[0].decision, Some(RuleDecision::Approve)));
+        assert!(rules.is_empty());
         assert!(paths_list.is_empty());
     }
 
@@ -611,11 +642,15 @@ mod tests {
         let path = dir.join("permissions.json");
         fs::write(
             &path,
-            r#"{"command_prefixes":[{"prefix":"cargo test","decision":"approve"}],"extra_read_paths":["../docs/","/opt/shared"]}"#,
+            r#"{"command_prefixes":[{"argv_prefix":["cargo","test"],"decision":"approve"}],"extra_read_paths":["../docs/","/opt/shared"]}"#,
         )
         .expect("write");
         let (rules, paths_list) = load_from_path(&path, "workspace");
         assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].argv_prefix,
+            vec!["cargo".to_string(), "test".to_string()]
+        );
         assert_eq!(
             paths_list,
             vec!["../docs/".to_string(), "/opt/shared".to_string()]
@@ -638,7 +673,7 @@ mod tests {
         let path = dir.join("permissions.json");
         fs::write(
             &path,
-            r#"{"command_prefixes":[{"prefix":"cargo test","decision":"approve"}]}"#,
+            r#"{"command_prefixes":[{"argv_prefix":["cargo","test"],"decision":"approve"}]}"#,
         )
         .expect("write");
         let (rules, paths_list) = load_from_path(&path, "workspace");
@@ -647,12 +682,29 @@ mod tests {
     }
 
     #[test]
+    fn load_legacy_string_prefix_entry_in_object_schema_is_dropped() {
+        // Same silent-drop behaviour when a stray `{"prefix":"..."}`
+        // entry appears inside a new-schema object.
+        let dir = tempdir("legacy_entry_in_object");
+        let path = dir.join("permissions.json");
+        fs::write(
+            &path,
+            r#"{"command_prefixes":[{"prefix":"cargo test","decision":"approve"},{"argv_prefix":["ls"],"decision":"approve"}]}"#,
+        )
+        .expect("write");
+        let (rules, _) = load_from_path(&path, "workspace");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].argv_prefix, vec!["ls".to_string()]);
+    }
+
+    #[test]
     fn write_produces_object_schema_regardless_of_prior_shape() {
         let dir = tempdir("write_object");
         let path = dir.join("permissions.json");
         // Start from legacy array.
         fs::write(&path, r#"[{"prefix":"cargo test","decision":"approve"}]"#).expect("write");
-        // Read → mutate → write.
+        // Read → mutate → write. Legacy entries are dropped during
+        // read (silent migration); the write emits the new schema.
         let mut perms = read_permissions_file(&path).expect("read");
         perms.extra_read_paths.push("../docs/".to_string());
         write_permissions_file(&path, &perms).expect("write");
@@ -664,6 +716,12 @@ mod tests {
         assert!(written.contains("command_prefixes"));
         assert!(written.contains("extra_read_paths"));
         assert!(written.contains("../docs/"));
+        // Legacy `"prefix"` entry has been silently dropped (the new
+        // schema uses `argv_prefix` / `command_prefixes`, not `prefix`).
+        assert!(
+            !written.contains(r#""prefix":"#),
+            "expected legacy `\"prefix\":` field to be absent, got: {written}"
+        );
     }
 
     #[test]

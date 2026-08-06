@@ -424,7 +424,11 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunErr
 
 fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if !noargs::cmd("grant")
-        .doc("Append an auto-approve permissions rule to permissions.json")
+        .doc(
+            "Append an auto-approve permissions rule (argv_prefix) to permissions.json. \
+             Positional args form the argv-prefix: `attini session grant cargo test` grants \
+             any command whose argv starts with [\"cargo\", \"test\"].",
+        )
         .take(args)
         .is_present()
     {
@@ -441,11 +445,24 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .doc("Write to workspace-wide .attini/permissions.json instead of session-local (mutually exclusive with -s / --session)")
         .take(args)
         .is_present();
-    let prefix: String = noargs::arg("<PREFIX>")
-        .doc("Command prefix to auto-approve (word-boundary match; single-quote to preserve whitespace)")
-        .example("cargo test")
+    // argv-prefix as variadic positional args: read until args is exhausted.
+    let head: String = noargs::arg("<ARG0>")
+        .doc("First element of the argv_prefix to auto-approve (the program name).")
+        .example("cargo")
         .take(args)
         .then(|a| a.value().parse())?;
+    let mut argv_prefix: Vec<String> = vec![head];
+    loop {
+        let taken = noargs::arg("[ARG]")
+            .doc("Further argv_prefix elements; repeat for a longer prefix.")
+            .example("test")
+            .take(args);
+        if !taken.is_present() {
+            break;
+        }
+        let s: String = taken.then(|a| a.value().parse())?;
+        argv_prefix.push(s);
+    }
     if args.metadata().help_mode {
         return Ok(false);
     }
@@ -463,7 +480,7 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     } else {
         attini::permissions::GrantScope::Session(&session_name)
     };
-    match attini::permissions::grant(scope, &prefix) {
+    match attini::permissions::grant(scope, &argv_prefix) {
         Ok(attini::permissions::GrantOutcome::Appended(path)) => {
             eprintln!("granted: appended to {}", path.display());
             Ok(true)

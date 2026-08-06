@@ -151,7 +151,7 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             id: Some(format!("cmd_{}", noprop::sample_usize_in(ctx, 0..=4))),
             function_name: Some("command".to_string()),
             arguments_fragment: Some(
-                r#"{"command_line":"echo pbt","timeout_seconds":5}"#.to_string(),
+                r#"{"argv":["echo","pbt"],"timeout_seconds":5}"#.to_string(),
             ),
         },
         "finish" => Event::Finish {
