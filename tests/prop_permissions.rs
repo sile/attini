@@ -39,7 +39,9 @@ fn rule_shorter_than_argv_with_matching_head_auto_approves() -> noprop::Result<(
                 assert_eq!(d.argv_prefix, prefix);
                 Ok(())
             }
-            other => panic!("expected AutoApprove for argv {argv:?} vs prefix {prefix:?}, got {other:?}"),
+            other => {
+                panic!("expected AutoApprove for argv {argv:?} vs prefix {prefix:?}, got {other:?}")
+            }
         }
     })
 }

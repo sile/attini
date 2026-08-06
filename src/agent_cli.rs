@@ -3,9 +3,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use nojson::DisplayJson;
@@ -781,11 +778,7 @@ fn needs_shell_quote(c: char) -> bool {
 }
 
 fn render_command_preview_from(inv: &CommandInvocation) -> String {
-    format!(
-        "command preview: {} (timeout {}s)",
-        shell_escape_argv(&inv.argv),
-        inv.timeout_seconds
-    )
+    format!("command preview: {}", shell_escape_argv(&inv.argv))
 }
 
 enum ToolKind {
@@ -931,54 +924,26 @@ fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<Str
     }
 }
 
-const COMMAND_KILL_GRACE_MS: u64 = 500;
-
 fn run_command_sync(
     inv: &CommandInvocation,
     executor: &ToolExecutor,
 ) -> Result<String, CommandError> {
     let started = Instant::now();
-    let timeout = Duration::from_secs(inv.timeout_seconds);
     // argv is guaranteed non-empty by CommandInvocation::parse.
-    let child = Command::new(&inv.argv[0])
+    let output = Command::new(&inv.argv[0])
         .args(&inv.argv[1..])
         .current_dir(executor.root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .map_err(|e| CommandError::SpawnFailed {
             message: e.to_string(),
         })?;
-    let child_id = child.id() as libc::pid_t;
-
-    let done = Arc::new(AtomicBool::new(false));
-    let done_for_killer = done.clone();
-    thread::spawn(move || {
-        thread::sleep(timeout);
-        if done_for_killer.load(Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: `kill` with SIGTERM/SIGKILL to a pid we spawned; no
-        // memory invariants at play.
-        unsafe { libc::kill(child_id, libc::SIGTERM) };
-        thread::sleep(Duration::from_millis(COMMAND_KILL_GRACE_MS));
-        if done_for_killer.load(Ordering::Relaxed) {
-            return;
-        }
-        unsafe { libc::kill(child_id, libc::SIGKILL) };
-    });
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| CommandError::SpawnFailed {
-            message: e.to_string(),
-        })?;
-    done.store(true, Ordering::Relaxed);
     let elapsed = started.elapsed();
-    let termination_reason = if elapsed >= timeout || output.status.code().is_none() {
-        "timeout"
-    } else {
+    let termination_reason = if output.status.code().is_some() {
         "exited"
+    } else {
+        "signaled"
     };
     Ok(command_result_json(
         &String::from_utf8_lossy(&output.stdout),
