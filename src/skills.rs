@@ -262,14 +262,6 @@ fn strip_matched_quotes(s: &str) -> &str {
     s
 }
 
-/// Substitute `$ARGUMENTS` in the body with `args`. Uses plain
-/// `str::replace`, so word boundaries are not guaranteed —
-/// `$ARGUMENTSFOO` would also match. Skill authors are responsible
-/// for keeping the marker unambiguous.
-pub fn substitute_arguments(body: &str, args: &str) -> String {
-    body.replace("$ARGUMENTS", args)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,53 +346,6 @@ mod tests {
     fn extract_description_takes_first_of_multiple_occurrences() {
         let text = "---\ndescription: first\ndescription: second\n---\nbody";
         assert_eq!(extract_description(text), Some("first".to_string()));
-    }
-
-    // -----------------------------------------------------------------
-    // substitute_arguments
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn substitute_arguments_replaces_marker() {
-        assert_eq!(
-            substitute_arguments("Run: $ARGUMENTS please", "cargo test"),
-            "Run: cargo test please".to_string()
-        );
-    }
-
-    #[test]
-    fn substitute_arguments_uses_empty_string_when_args_empty() {
-        assert_eq!(
-            substitute_arguments("A $ARGUMENTS B", ""),
-            "A  B".to_string()
-        );
-    }
-
-    #[test]
-    fn substitute_arguments_no_op_when_marker_absent() {
-        assert_eq!(
-            substitute_arguments("plain body", "ignored"),
-            "plain body".to_string()
-        );
-    }
-
-    #[test]
-    fn substitute_arguments_replaces_all_occurrences() {
-        assert_eq!(
-            substitute_arguments("$ARGUMENTS and $ARGUMENTS", "x"),
-            "x and x".to_string()
-        );
-    }
-
-    #[test]
-    fn substitute_arguments_touches_prefix_collision_by_design() {
-        // Documented behavior: word boundary is not guaranteed;
-        // `$ARGUMENTSX` starts with the marker and is (mis-)touched.
-        assert_eq!(
-            substitute_arguments("$ARGUMENTSX", "Y"),
-            "YX".to_string(),
-            "prefix collision is intentional per skill spec"
-        );
     }
 
     // -----------------------------------------------------------------

@@ -433,18 +433,15 @@ const COMMAND_PARAMS_SCHEMA: &str = r#"{
 "required":["argv"]
 }"#;
 
-/// Request the shell to load a skill body by name and inject its
-/// contents (after `$ARGUMENTS` substitution) as the tool result.
-/// The set of installable skills is advertised at conversation start
-/// in a "Available skills" system message. The shell handles
-/// filesystem resolution; parsing / schema live here in sansio.
+/// Request the shell to load a skill body by name and return its
+/// contents verbatim as the tool result. The set of installable
+/// skills is advertised at conversation start in an "Available
+/// skills" system message. The shell handles filesystem resolution;
+/// parsing / schema live here in sansio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillLoadInvocation {
     /// Directory name of the skill under a skill root.
     pub name: String,
-    /// Free-form argument string substituted into `$ARGUMENTS`
-    /// occurrences in the skill body. `None` behaves as `""`.
-    pub arguments: Option<String>,
 }
 
 impl SkillLoadInvocation {
@@ -456,9 +453,9 @@ impl SkillLoadInvocation {
             name: "skill_load".to_string(),
             description: "Load a skill body and follow its instructions. \
                  Skill names are listed in the 'Available skills' system \
-                 message. The body is returned as the tool result with \
-                 `$ARGUMENTS` replaced by the `arguments` field (empty \
-                 string when omitted)."
+                 message. The full SKILL.md body is returned verbatim as \
+                 the tool result; if the skill needs arguments, the user \
+                 provides them in the same turn's message."
                 .to_string(),
             parameters_json: SKILL_LOAD_PARAMS_SCHEMA.to_string(),
         }
@@ -474,16 +471,14 @@ impl SkillLoadInvocation {
                 "skill_load: name must not be empty".to_string(),
             ));
         }
-        let arguments = optional_string(root, "arguments")?;
-        Ok(Self { name, arguments })
+        Ok(Self { name })
     }
 }
 
 const SKILL_LOAD_PARAMS_SCHEMA: &str = r#"{
 "type":"object",
 "properties":{
-"name":{"type":"string","description":"Skill name (directory name under a skill root)."},
-"arguments":{"type":"string","description":"Free-form argument text substituted into $ARGUMENTS in the skill body. Optional; omitted or empty produces no substitution content."}
+"name":{"type":"string","description":"Skill name (directory name under a skill root)."}
 },
 "required":["name"]
 }"#;

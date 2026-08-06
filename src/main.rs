@@ -170,14 +170,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         )
         .take(args)
         .present_and_then(|o| o.value().parse())?;
-    let skill_arg: Option<String> = noargs::opt("skill-arg")
-        .ty("VALUE")
-        .doc(
-            "Text substituted into every `$ARGUMENTS` occurrence in the skill body. \
-             Requires --skill.",
-        )
-        .take(args)
-        .present_and_then(|o| o.value().parse())?;
 
     let prompt: Option<String> = noargs::arg("[PROMPT]")
         .doc("User prompt (required unless --approve or --reject is given)")
@@ -195,11 +187,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
     if approve && reject {
         return Err(RunError::Runtime(
             "--approve and --reject are mutually exclusive".to_string(),
-        ));
-    }
-    if skill_arg.is_some() && skill_name.is_none() {
-        return Err(RunError::Runtime(
-            "--skill-arg requires --skill".to_string(),
         ));
     }
     if skill_name.is_some() && (approve || reject) {
@@ -260,7 +247,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         tool_call_rate,
         session_tool_call_max,
         skill_name,
-        skill_arg,
     };
     let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(Some(exit))

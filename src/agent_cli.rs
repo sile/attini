@@ -149,14 +149,10 @@ pub struct AgentConfig {
     /// `None` disables the check.
     pub session_tool_call_max: Option<usize>,
     /// Optional CLI-selected skill. When set, the resolved SKILL.md
-    /// body (with `$ARGUMENTS` substituted from `skill_arg`) is
-    /// prepended as a system message before the first turn. Applies
-    /// only to fresh invocations; combining with `--approve` /
-    /// `--reject` is rejected in `main.rs`.
+    /// body is prepended as a system message before the first turn.
+    /// Applies only to fresh invocations; combining with `--approve`
+    /// / `--reject` is rejected in `main.rs`.
     pub skill_name: Option<String>,
-    /// Argument text substituted into `$ARGUMENTS` in the CLI-loaded
-    /// skill body. `None` behaves as `""`.
-    pub skill_arg: Option<String>,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -593,7 +589,7 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
         messages.push(ChatMessage::System(sys.clone()));
     }
     if let Some(name) = &cfg.skill_name {
-        let body = load_cli_skill_body(name, cfg.skill_arg.as_deref())?;
+        let body = load_cli_skill_body(name)?;
         messages.push(ChatMessage::System(body));
     }
     for record in session.load_records_since_last_summary()? {
@@ -625,29 +621,27 @@ fn render_available_skills(entries: &[SkillEntry]) -> String {
     out
 }
 
-/// Resolve, load, and `$ARGUMENTS`-substitute a CLI-selected skill.
-/// Called at the start of a fresh `attini agent --skill NAME`
-/// invocation. Any failure (missing / too large / bad UTF-8) is
-/// surfaced as a startup `io::Error` so the user sees the reason
-/// immediately, rather than the model getting a mysterious empty
-/// system message.
-fn load_cli_skill_body(name: &str, args: Option<&str>) -> io::Result<String> {
+/// Resolve and load a CLI-selected skill. Called at the start of a
+/// fresh `attini agent --skill NAME` invocation. Any failure
+/// (missing / too large / bad UTF-8) is surfaced as a startup
+/// `io::Error` so the user sees the reason immediately, rather than
+/// the model getting a mysterious empty system message.
+fn load_cli_skill_body(name: &str) -> io::Result<String> {
     let Some(dir) = skills::resolve_skill_dir(name) else {
         return Err(io::Error::other(format!(
             "--skill {name}: no SKILL.md found under any skill root"
         )));
     };
     let skill_md = dir.join("SKILL.md");
-    let body = skills::load_body(&skill_md).map_err(|e| {
+    skills::load_body(&skill_md).map_err(|e| {
         let (_, msg) = e.to_code_and_message();
         io::Error::other(format!("--skill {name}: {msg}"))
-    })?;
-    Ok(skills::substitute_arguments(&body, args.unwrap_or("")))
+    })
 }
 
-/// Dispatch a `skill_load` tool call: parse, resolve, load,
-/// substitute, return the tool_result content (either the skill body
-/// or a `tool_error_json`). Increments `tool_errors` on failure.
+/// Dispatch a `skill_load` tool call: parse, resolve, load, return
+/// the tool_result content (either the skill body verbatim or a
+/// `tool_error_json`). Increments `tool_errors` on failure.
 fn run_skill_load(tc: &ToolCall, counters: &mut Counters) -> String {
     let inv = match SkillLoadInvocation::parse(&tc.arguments_json) {
         Ok(inv) => inv,
@@ -668,9 +662,8 @@ fn run_skill_load(tc: &ToolCall, counters: &mut Counters) -> String {
     let skill_md = dir.join("SKILL.md");
     match skills::load_body(&skill_md) {
         Ok(body) => {
-            let args = inv.arguments.as_deref().unwrap_or("");
             eprintln!("[skill_load] {}", inv.name);
-            skills::substitute_arguments(&body, args)
+            body
         }
         Err(e) => {
             counters.tool_errors += 1;
@@ -1459,7 +1452,6 @@ mod tests {
             tool_call_rate: rate,
             session_tool_call_max: session_max,
             skill_name: None,
-            skill_arg: None,
         }
     }
 
