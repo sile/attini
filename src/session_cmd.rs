@@ -279,6 +279,8 @@ struct MetricsAggregate {
     completion_tokens_total: u64,
     prompt_cache_hit_tokens_total: u64,
     prompt_cache_miss_tokens_total: u64,
+    compaction_attempts: u64,
+    compaction_failures: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -431,6 +433,12 @@ fn absorb_metrics_line(
             agg.prompt_cache_miss_tokens_total = agg
                 .prompt_cache_miss_tokens_total
                 .saturating_add(get("prompt_cache_miss_tokens_total")?);
+            agg.compaction_attempts = agg
+                .compaction_attempts
+                .saturating_add(get("compaction_attempts")?);
+            agg.compaction_failures = agg
+                .compaction_failures
+                .saturating_add(get("compaction_failures")?);
         }
         "token_usage" => {
             let Some(usage) = value
@@ -510,6 +518,10 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
     );
     println!("    completion={}", mx.completion_tokens_total);
     println!(
+        "  compaction: attempts={} failures={}",
+        mx.compaction_attempts, mx.compaction_failures,
+    );
+    println!(
         "  duration_ms: total={} avg_per_invocation={}",
         mx.duration_ms_total,
         avg_duration_ms(m),
@@ -525,6 +537,7 @@ fn print_all_metrics_human(sessions: &[PerSessionMetrics]) {
         "ERRS",
         "APPROVE/REJECT",
         "PROMPT_TOK",
+        "COMPACT (attempt/fail)",
         "DURATION_MS",
     ];
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -539,6 +552,7 @@ fn print_all_metrics_human(sessions: &[PerSessionMetrics]) {
             mx.tool_errors.to_string(),
             format!("{}/{}", s.approvals_approve, s.approvals_reject),
             mx.prompt_tokens_billed_total.to_string(),
+            format!("{}/{}", mx.compaction_attempts, mx.compaction_failures),
             mx.duration_ms_total.to_string(),
         ]);
     }
@@ -551,6 +565,10 @@ fn print_all_metrics_human(sessions: &[PerSessionMetrics]) {
         total.tool_errors.to_string(),
         format!("{}/{}", total.approvals_approve, total.approvals_reject),
         total.prompt_tokens_billed_total.to_string(),
+        format!(
+            "{}/{}",
+            total.compaction_attempts, total.compaction_failures
+        ),
         total.duration_ms_total.to_string(),
     ];
 
@@ -595,6 +613,8 @@ struct TotalsAggregate {
     approvals_reject: u64,
     prompt_tokens_billed_total: u64,
     duration_ms_total: u64,
+    compaction_attempts: u64,
+    compaction_failures: u64,
 }
 
 fn compute_totals(sessions: &[PerSessionMetrics]) -> TotalsAggregate {
@@ -623,6 +643,12 @@ fn compute_totals(sessions: &[PerSessionMetrics]) -> TotalsAggregate {
         t.duration_ms_total = t
             .duration_ms_total
             .saturating_add(m.metrics.duration_ms_total);
+        t.compaction_attempts = t
+            .compaction_attempts
+            .saturating_add(m.metrics.compaction_attempts);
+        t.compaction_failures = t
+            .compaction_failures
+            .saturating_add(m.metrics.compaction_failures);
     }
     t
 }
@@ -665,6 +691,13 @@ impl DisplayJson for SessionMetricsJson<'_> {
                     completion_total: mx.completion_tokens_total,
                     prompt_cache_hit_total: mx.prompt_cache_hit_tokens_total,
                     prompt_cache_miss_total: mx.prompt_cache_miss_tokens_total,
+                },
+            )?;
+            f.member(
+                "compaction",
+                &CompactionJson {
+                    attempts: mx.compaction_attempts,
+                    failures: mx.compaction_failures,
                 },
             )?;
             f.member(
@@ -733,11 +766,31 @@ impl DisplayJson for TotalsJson<'_> {
                 },
             )?;
             f.member(
+                "compaction",
+                &CompactionJson {
+                    attempts: t.compaction_attempts,
+                    failures: t.compaction_failures,
+                },
+            )?;
+            f.member(
                 "duration_ms",
                 &TotalDurationJson {
                     total: t.duration_ms_total,
                 },
             )
+        })
+    }
+}
+
+struct CompactionJson {
+    attempts: u64,
+    failures: u64,
+}
+impl DisplayJson for CompactionJson {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("attempts", self.attempts)?;
+            f.member("failures", self.failures)
         })
     }
 }
@@ -1400,6 +1453,8 @@ mod tests {
                 tool_errors: 2,
                 duration_ms_total: 1000,
                 prompt_tokens_billed_total: 5000,
+                compaction_attempts: 4,
+                compaction_failures: 1,
                 ..Default::default()
             },
         };
@@ -1419,6 +1474,8 @@ mod tests {
                 tool_errors: 0,
                 duration_ms_total: 500,
                 prompt_tokens_billed_total: 1000,
+                compaction_attempts: 2,
+                compaction_failures: 2,
                 ..Default::default()
             },
         };
@@ -1432,5 +1489,28 @@ mod tests {
         assert_eq!(t.approvals_reject, 1);
         assert_eq!(t.prompt_tokens_billed_total, 6000);
         assert_eq!(t.duration_ms_total, 1500);
+        assert_eq!(t.compaction_attempts, 6);
+        assert_eq!(t.compaction_failures, 3);
+    }
+
+    #[test]
+    fn absorb_metrics_line_picks_up_compaction_counters() {
+        let mut agg = MetricsAggregate::default();
+        let mut tokens = TokenAggregate::default();
+        let line = r#"{"kind":"metrics_snapshot","ts":0,"counters":{"compaction_attempts":5,"compaction_failures":2}}"#;
+        absorb_metrics_line(line, &mut agg, &mut tokens).expect("parse ok");
+        assert_eq!(agg.compaction_attempts, 5);
+        assert_eq!(agg.compaction_failures, 2);
+    }
+
+    #[test]
+    fn absorb_metrics_line_defaults_missing_compaction_counters_to_zero() {
+        let mut agg = MetricsAggregate::default();
+        let mut tokens = TokenAggregate::default();
+        let line = r#"{"kind":"metrics_snapshot","ts":0,"counters":{"turns":1}}"#;
+        absorb_metrics_line(line, &mut agg, &mut tokens).expect("parse ok");
+        assert_eq!(agg.turns, 1);
+        assert_eq!(agg.compaction_attempts, 0);
+        assert_eq!(agg.compaction_failures, 0);
     }
 }

@@ -42,6 +42,16 @@ pub struct Counters {
     pub completion_tokens_total: u64,
     pub prompt_cache_hit_tokens_total: u64,
     pub prompt_cache_miss_tokens_total: u64,
+    /// `try_auto_compact` が `compact_conversation` を呼んだ回数
+    /// (threshold 超え発火の総数; 内部で skip / summariser 成功 /
+    /// 各種 `Err` のいずれに転んでも 1 とカウントする). Manual
+    /// `attini session compact` は `Counters` を持たないため
+    /// この counter には載らない。
+    pub compaction_attempts: u64,
+    /// `compact_conversation` が `Err` を返した回数
+    /// (`load_records_since_last_summary` / `run_summariser` /
+    /// `session.append` の `?` 経由 `Err` を合算)。
+    pub compaction_failures: u64,
 }
 
 /// Per-tool-name buckets for `Counters::tool_calls_by_kind`. Names are
@@ -107,6 +117,8 @@ impl Counters {
                 "prompt_cache_miss_tokens_total".to_string(),
                 self.prompt_cache_miss_tokens_total,
             ),
+            ("compaction_attempts".to_string(), self.compaction_attempts),
+            ("compaction_failures".to_string(), self.compaction_failures),
         ]
     }
 }
@@ -318,7 +330,7 @@ fn drive(
     counters: &mut Counters,
 ) -> io::Result<Driven> {
     if matches!(cont, Continuation::Prompt(_)) {
-        try_auto_compact(session, &cfg.model)?;
+        try_auto_compact(session, &cfg.model, counters)?;
     }
 
     let mut messages = build_initial_messages(session, cfg)?;
@@ -691,7 +703,7 @@ Aim for ~500 words of plain prose. Do not include markdown code fences \
 unless quoting a short critical excerpt. Do not comment on the \
 summarization itself; produce only the summary.";
 
-fn try_auto_compact(session: &mut Session, model: &str) -> io::Result<()> {
+fn try_auto_compact(session: &mut Session, model: &str, counters: &mut Counters) -> io::Result<()> {
     if session.load_pending()?.is_some() {
         return Ok(());
     }
@@ -704,7 +716,9 @@ fn try_auto_compact(session: &mut Session, model: &str) -> io::Result<()> {
     eprintln!(
         "[compaction] previous prompt was {latest} tokens (threshold {COMPACTION_TRIGGER_TOKENS}), summarising..."
     );
+    counters.compaction_attempts += 1;
     if let Err(e) = compact_conversation(session, model) {
+        counters.compaction_failures += 1;
         eprintln!("[compaction] failed, continuing with full history: {e}");
     }
     Ok(())
@@ -760,10 +774,31 @@ fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<St
     };
     let result = curl::call(&request, &mut sinks)
         .map_err(|e| io::Error::other(format!("summariser call failed: {e}")))?;
-    if result.content.trim().is_empty() {
-        return Err(io::Error::other("summariser returned empty content"));
+    pick_summary_text(&result).ok_or_else(|| {
+        io::Error::other(
+            "summariser returned empty content \
+             (both content and reasoning_content were empty)",
+        )
+    })
+}
+
+/// Pick a usable summary from a [`CallResult`]: prefer `content` and
+/// fall back to `reasoning_content` when the primary field is empty.
+/// Some reasoning-capable DeepSeek models emit the actual answer via
+/// `reasoning_content` while leaving `content` blank; without this
+/// fallback auto-compaction fails on every such response and the
+/// invocation carries the full history for the remaining turns.
+fn pick_summary_text(result: &curl::CallResult) -> Option<String> {
+    let content = result.content.trim();
+    if !content.is_empty() {
+        return Some(content.to_string());
     }
-    Ok(result.content)
+    result
+        .reasoning_content
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Given the real records that follow the last summary, return
@@ -1598,5 +1633,43 @@ mod tests {
         // per the order).
         gate.begin_turn();
         assert_eq!(gate.admit(now), GateDecision::SessionExhausted);
+    }
+
+    // -------------------------------------------------------------
+    // pick_summary_text
+    // -------------------------------------------------------------
+
+    fn call_result(content: &str, reasoning: Option<&str>) -> curl::CallResult {
+        curl::CallResult {
+            content: content.to_string(),
+            reasoning_content: reasoning.map(str::to_string),
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn pick_summary_text_returns_content_when_present() {
+        let r = call_result("hello summary", Some("thinking..."));
+        assert_eq!(pick_summary_text(&r), Some("hello summary".to_string()));
+    }
+
+    #[test]
+    fn pick_summary_text_falls_back_to_reasoning_when_content_empty() {
+        let r = call_result("   ", Some("actual answer"));
+        assert_eq!(pick_summary_text(&r), Some("actual answer".to_string()));
+    }
+
+    #[test]
+    fn pick_summary_text_returns_none_when_reasoning_is_some_empty() {
+        let r = call_result("", Some("   "));
+        assert_eq!(pick_summary_text(&r), None);
+    }
+
+    #[test]
+    fn pick_summary_text_returns_none_when_reasoning_is_none() {
+        let r = call_result("", None);
+        assert_eq!(pick_summary_text(&r), None);
     }
 }
