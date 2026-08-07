@@ -12,7 +12,8 @@ use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
-    SkillLoadInvocation, ToolExecutionError, ToolOutcome,
+    SkillLoadInvocation, SubagentStartInvocation, SubagentWaitInvocation, ToolExecutionError,
+    ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{AutoDecision, Judgment, Mode, evaluate};
@@ -66,6 +67,8 @@ pub struct ToolCallsByKind {
     pub patch: u64,
     pub command: u64,
     pub skill_load: u64,
+    pub subagent_start: u64,
+    pub subagent_wait: u64,
     pub unknown: u64,
 }
 
@@ -94,6 +97,14 @@ impl Counters {
             (
                 "tool_calls.skill_load".to_string(),
                 self.tool_calls_by_kind.skill_load,
+            ),
+            (
+                "tool_calls.subagent_start".to_string(),
+                self.tool_calls_by_kind.subagent_start,
+            ),
+            (
+                "tool_calls.subagent_wait".to_string(),
+                self.tool_calls_by_kind.subagent_wait,
             ),
             (
                 "tool_calls.unknown".to_string(),
@@ -165,6 +176,12 @@ pub struct AgentConfig {
     /// Applies only to fresh invocations; combining with `--approve`
     /// / `--reject` is rejected in `main.rs`.
     pub skill_name: Option<String>,
+    /// Whether `subagent_start` / `subagent_wait` tools should be
+    /// advertised to the model. `main.rs` sets this to true only
+    /// when `TMUX` is set and `ATTINI_IS_SUBAGENT` is unset (so
+    /// subagents cannot recurse and non-tmux environments are not
+    /// shown a tool that would fail).
+    pub subagent_available: bool,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -375,7 +392,7 @@ fn drive(
         }
     }
 
-    let tools = build_tool_defs(cfg.mode);
+    let tools = build_tool_defs(cfg.mode, cfg.subagent_available);
     let rules = permissions::load(&cfg.session_name)?;
     let mut gate = ToolCallGate::new(cfg);
 
@@ -448,6 +465,8 @@ fn drive(
                 "patch" => counters.tool_calls_by_kind.patch += 1,
                 "command" => counters.tool_calls_by_kind.command += 1,
                 "skill_load" => counters.tool_calls_by_kind.skill_load += 1,
+                "subagent_start" => counters.tool_calls_by_kind.subagent_start += 1,
+                "subagent_wait" => counters.tool_calls_by_kind.subagent_wait += 1,
                 _ => counters.tool_calls_by_kind.unknown += 1,
             }
             match gate.admit(Instant::now()) {
@@ -529,6 +548,14 @@ fn drive(
                 }
                 ToolKind::Skill => {
                     let content = run_skill_load(tc, counters);
+                    append_tool(session, &mut messages, &tc.id, content)?;
+                }
+                ToolKind::SubagentStart => {
+                    let content = run_subagent_start(tc, counters);
+                    append_tool(session, &mut messages, &tc.id, content)?;
+                }
+                ToolKind::SubagentWait => {
+                    let content = run_subagent_wait(tc, counters);
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
                 ToolKind::Unknown => {
@@ -686,6 +713,111 @@ fn run_skill_load(tc: &ToolCall, counters: &mut Counters) -> String {
     }
 }
 
+/// Dispatch a `subagent_start` tool call: parse, spawn a child tmux
+/// window running `attini agent`, and return the child's session
+/// name and tmux window id (or a `tool_error_json` if any step
+/// failed).
+fn run_subagent_start(tc: &ToolCall, counters: &mut Counters) -> String {
+    let inv = match SubagentStartInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            counters.tool_errors += 1;
+            eprintln!("[subagent_start] parse err: {err:?}");
+            return tool_error_json_from(&err);
+        }
+    };
+    match crate::subagent::spawn(inv.session_name.as_deref(), &inv.prompt) {
+        Ok(spawned) => {
+            eprintln!(
+                "[subagent_start] {} (window {})",
+                spawned.session_name, spawned.window_id
+            );
+            let mut out = String::new();
+            {
+                use nojson::DisplayJson;
+                struct Payload<'a> {
+                    session_name: &'a str,
+                    window_id: &'a str,
+                }
+                impl DisplayJson for Payload<'_> {
+                    fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+                        f.object(|f| {
+                            f.member("session_name", self.session_name)?;
+                            f.member("window_id", self.window_id)
+                        })
+                    }
+                }
+                out.push_str(
+                    &nojson::Json(Payload {
+                        session_name: &spawned.session_name,
+                        window_id: &spawned.window_id,
+                    })
+                    .to_string(),
+                );
+            }
+            out
+        }
+        Err(e) => {
+            counters.tool_errors += 1;
+            let (code, message) = e.to_code_and_message();
+            eprintln!("[subagent_start] failed: {message}");
+            tool_error_json(code, &message)
+        }
+    }
+}
+
+/// Dispatch a `subagent_wait` tool call: parse the session name
+/// list, block until each named child is no longer running, and
+/// return one status object per session (in the requested order).
+fn run_subagent_wait(tc: &ToolCall, counters: &mut Counters) -> String {
+    let inv = match SubagentWaitInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            counters.tool_errors += 1;
+            eprintln!("[subagent_wait] parse err: {err:?}");
+            return tool_error_json_from(&err);
+        }
+    };
+    eprintln!(
+        "[subagent_wait] waiting for {} session(s)",
+        inv.session_names.len()
+    );
+    let statuses = crate::subagent::wait(&inv.session_names);
+    use nojson::DisplayJson;
+    struct StatusJson<'a>(&'a crate::subagent::SubagentStatus);
+    impl DisplayJson for StatusJson<'_> {
+        fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+            let s = self.0;
+            f.object(|f| {
+                f.member("session_name", &s.session_name)?;
+                f.member(
+                    "state",
+                    match s.state {
+                        crate::subagent::SubagentState::NotFound => "not_found",
+                        crate::subagent::SubagentState::Completed => "completed",
+                        crate::subagent::SubagentState::AwaitingApproval => "awaiting_approval",
+                        crate::subagent::SubagentState::Error => "error",
+                        crate::subagent::SubagentState::Crashed => "crashed",
+                    },
+                )?;
+                f.member("content", &s.content)
+            })
+        }
+    }
+    struct Payload<'a>(&'a [crate::subagent::SubagentStatus]);
+    impl DisplayJson for Payload<'_> {
+        fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+            f.object(|f| {
+                f.member(
+                    "sessions",
+                    self.0.iter().map(StatusJson).collect::<Vec<_>>().as_slice(),
+                )
+            })
+        }
+    }
+    nojson::Json(Payload(&statuses)).to_string()
+}
+
 // -------------------------------------------------------------------
 // Compaction: summarise older records and append a `summary` record
 // -------------------------------------------------------------------
@@ -838,13 +970,17 @@ fn is_safe_boundary(msg: &ChatMessage) -> bool {
     }
 }
 
-fn build_tool_defs(mode: Mode) -> Vec<ToolDef> {
+fn build_tool_defs(mode: Mode, subagent_available: bool) -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
     if !matches!(mode, Mode::Plan) {
         defs.push(PatchInvocation::definition());
     }
     defs.push(CommandInvocation::definition());
     defs.push(SkillLoadInvocation::definition());
+    if subagent_available {
+        defs.push(SubagentStartInvocation::definition());
+        defs.push(SubagentWaitInvocation::definition());
+    }
     defs
 }
 
@@ -995,7 +1131,7 @@ fn emit_suggested_rule(argv: &[String]) {
 /// Unconditionally wrap `s` in POSIX single-quotes, escaping any
 /// interior single-quotes with the `'\\''` sequence. Used by
 /// [`shell_escape_argv`] as the quoting primitive.
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -1068,6 +1204,8 @@ enum ToolKind {
     Patch,
     Command,
     Skill,
+    SubagentStart,
+    SubagentWait,
     Unknown,
 }
 
@@ -1077,6 +1215,8 @@ fn classify(name: &str) -> ToolKind {
         "patch" => ToolKind::Patch,
         "command" => ToolKind::Command,
         "skill_load" => ToolKind::Skill,
+        "subagent_start" => ToolKind::SubagentStart,
+        "subagent_wait" => ToolKind::SubagentWait,
         _ => ToolKind::Unknown,
     }
 }
@@ -1487,6 +1627,7 @@ mod tests {
             tool_call_rate: rate,
             session_tool_call_max: session_max,
             skill_name: None,
+            subagent_available: false,
         }
     }
 

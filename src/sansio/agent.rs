@@ -483,6 +483,103 @@ const SKILL_LOAD_PARAMS_SCHEMA: &str = r#"{
 "required":["name"]
 }"#;
 
+/// Ask the shell to spawn a child `attini agent` in a new tmux
+/// window running the supplied `prompt`. The shell returns the
+/// child's session name and tmux window id; the model uses
+/// [`SubagentWaitInvocation`] later to block until the child
+/// finishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentStartInvocation {
+    pub prompt: String,
+    pub session_name: Option<String>,
+}
+
+impl SubagentStartInvocation {
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "subagent_start".to_string(),
+            description: "Spawn a child attini agent in a separate tmux window and return \
+                 immediately. The child runs independently with its own session, permissions, \
+                 and metrics. Pair with subagent_wait to block until it finishes."
+                .to_string(),
+            parameters_json: SUBAGENT_START_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+        let root = json.value();
+        let prompt = required_string(root, "prompt")?;
+        if prompt.trim().is_empty() {
+            return Err(ToolExecutionError::ArgumentsParseFailed(
+                "subagent_start: prompt must not be empty".to_string(),
+            ));
+        }
+        let session_name = optional_string(root, "session_name")?;
+        if let Some(name) = &session_name
+            && name.trim().is_empty()
+        {
+            return Err(ToolExecutionError::ArgumentsParseFailed(
+                "subagent_start: session_name must not be empty".to_string(),
+            ));
+        }
+        Ok(Self {
+            prompt,
+            session_name,
+        })
+    }
+}
+
+const SUBAGENT_START_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"prompt":{"type":"string","description":"Initial user prompt for the child agent."},
+"session_name":{"type":"string","description":"Optional session name for the child. Omit to auto-generate a `subagent-<timestamp>-<hex>` name."}
+},
+"required":["prompt"]
+}"#;
+
+/// Block until every named child subagent reaches a non-running
+/// state. Each entry in the returned array carries the child's
+/// terminal state and the latest assistant message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentWaitInvocation {
+    pub session_names: Vec<String>,
+}
+
+impl SubagentWaitInvocation {
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "subagent_wait".to_string(),
+            description: "Block until every listed subagent session is no longer running \
+                 (completed, awaiting approval, errored, crashed, or not found) and return \
+                 each session's state and latest assistant content."
+                .to_string(),
+            parameters_json: SUBAGENT_WAIT_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+        let root = json.value();
+        let session_names = required_string_array(root, "session_names")?;
+        if session_names.is_empty() {
+            return Err(ToolExecutionError::ArgumentsParseFailed(
+                "subagent_wait: session_names must not be empty".to_string(),
+            ));
+        }
+        Ok(Self { session_names })
+    }
+}
+
+const SUBAGENT_WAIT_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"session_names":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Session names to wait on (typically returned by subagent_start)."}
+},
+"required":["session_names"]
+}"#;
+
 fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
     let value = root
         .to_member(name)

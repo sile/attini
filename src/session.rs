@@ -1068,6 +1068,228 @@ fn parse_prompt_tokens(line: &str) -> Result<Option<u64>, String> {
     Ok(Some(n))
 }
 
+/// Read every `SessionRecord` from a `conversation.jsonl` file
+/// without acquiring the session LOCK. Suited for observing a
+/// session's tail while it (or another process) still holds the
+/// LOCK. Missing files return an empty vector. Individual malformed
+/// or unknown lines are silently skipped so a partial file (e.g. a
+/// half-written last line from a crashed writer) still yields the
+/// prefix of well-formed records.
+pub fn read_conversation_records(path: &Path) -> io::Result<Vec<SessionRecord>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let reader = io::BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(Some(record)) = parse_session_record_line(&line) {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+/// Deserialize one JSON Lines record into the corresponding
+/// [`SessionRecord`] variant. Unknown `kind` values return
+/// `Ok(None)` so callers can iterate a mixed stream without
+/// erroring on forward-compatible additions. Malformed JSON (missing
+/// required field, wrong type) returns `Err`.
+fn parse_session_record_line(line: &str) -> Result<Option<SessionRecord>, String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    match kind.as_str() {
+        "invocation_start" => {
+            let ts = read_u64(value, "ts")?;
+            let attini_version = read_string(value, "attini_version")?;
+            let model = read_string(value, "model")?;
+            Ok(Some(SessionRecord::InvocationStart {
+                ts,
+                attini_version,
+                model,
+            }))
+        }
+        "invocation_end" => {
+            let ts = read_u64(value, "ts")?;
+            let reason_str = read_string(value, "reason")?;
+            let reason = match reason_str.as_str() {
+                "completed" => InvocationEndReason::Completed,
+                "awaiting_approval" => InvocationEndReason::AwaitingApproval,
+                "error" => InvocationEndReason::Error,
+                "session_tool_call_exhausted" => InvocationEndReason::SessionToolCallExhausted,
+                other => return Err(format!("unknown invocation_end.reason {other:?}")),
+            };
+            Ok(Some(SessionRecord::InvocationEnd { ts, reason }))
+        }
+        "user" => {
+            let ts = read_u64(value, "ts")?;
+            let text = read_string(value, "text")?;
+            Ok(Some(SessionRecord::User { ts, text }))
+        }
+        "assistant" => {
+            let ts = read_u64(value, "ts")?;
+            let content = read_string(value, "content")?;
+            let reasoning = read_optional_string(value, "reasoning")?;
+            let tool_calls = read_tool_calls(value)?;
+            Ok(Some(SessionRecord::Assistant {
+                ts,
+                content,
+                reasoning,
+                tool_calls,
+            }))
+        }
+        "tool" => {
+            let ts = read_u64(value, "ts")?;
+            let call_id = read_string(value, "call_id")?;
+            let content = read_string(value, "content")?;
+            Ok(Some(SessionRecord::Tool {
+                ts,
+                call_id,
+                content,
+            }))
+        }
+        "tool_approval" => {
+            let ts = read_u64(value, "ts")?;
+            let call_id = read_string(value, "call_id")?;
+            let decision_str = read_string(value, "decision")?;
+            let decision = match decision_str.as_str() {
+                "approve" => ApprovalDecision::Approve,
+                "reject" => ApprovalDecision::Reject,
+                other => return Err(format!("unknown tool_approval.decision {other:?}")),
+            };
+            let auto_decided_by = parse_auto_decided_by(value)?;
+            Ok(Some(SessionRecord::ToolApproval {
+                ts,
+                call_id,
+                decision,
+                auto_decided_by,
+            }))
+        }
+        "metrics_snapshot" => {
+            let ts = read_u64(value, "ts")?;
+            let counters = parse_metrics_counters(value)?;
+            Ok(Some(SessionRecord::MetricsSnapshot {
+                ts,
+                counters: MetricsSnapshotBody { entries: counters },
+            }))
+        }
+        "token_usage" => {
+            let ts = read_u64(value, "ts")?;
+            let body = parse_token_usage_body(value)?;
+            Ok(Some(SessionRecord::TokenUsage { ts, body }))
+        }
+        "summary" => {
+            let ts = read_u64(value, "ts")?;
+            let since_ts = read_u64(value, "since_ts")?;
+            let cutoff_ts = read_u64(value, "cutoff_ts")?;
+            let text = read_string(value, "text")?;
+            Ok(Some(SessionRecord::Summary {
+                ts,
+                since_ts,
+                cutoff_ts,
+                text,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn read_u64(value: nojson::RawJsonValue<'_, '_>, key: &str) -> Result<u64, String> {
+    value
+        .to_member(key)
+        .and_then(|m| m.required())
+        .and_then(|m| m.try_into())
+        .map_err(|e: JsonParseError| e.to_string())
+}
+
+fn parse_auto_decided_by(
+    value: nojson::RawJsonValue<'_, '_>,
+) -> Result<Option<AutoDecidedBy>, String> {
+    let Some(m) = value
+        .to_member("auto_decided_by")
+        .map_err(|e| e.to_string())?
+        .optional()
+    else {
+        return Ok(None);
+    };
+    if m.as_raw_str().trim() == "null" {
+        return Ok(None);
+    }
+    let scope = read_string(m, "scope")?;
+    let reason = read_string(m, "reason")?;
+    let mut argv_prefix = Vec::new();
+    let list = m
+        .to_member("argv_prefix")
+        .and_then(|arr| arr.required())
+        .map_err(|e| e.to_string())?;
+    for item in list.to_array().map_err(|e| e.to_string())? {
+        argv_prefix.push(
+            item.to_unquoted_string_str()
+                .map_err(|e| e.to_string())?
+                .into_owned(),
+        );
+    }
+    Ok(Some(AutoDecidedBy {
+        scope,
+        argv_prefix,
+        reason,
+    }))
+}
+
+fn parse_metrics_counters(
+    value: nojson::RawJsonValue<'_, '_>,
+) -> Result<Vec<(String, u64)>, String> {
+    let counters = value
+        .to_member("counters")
+        .and_then(|m| m.required())
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for (k, v) in counters.to_object().map_err(|e| e.to_string())? {
+        let name = k
+            .to_unquoted_string_str()
+            .map_err(|e| e.to_string())?
+            .into_owned();
+        let n: u64 = v.try_into().map_err(|e: JsonParseError| e.to_string())?;
+        out.push((name, n));
+    }
+    Ok(out)
+}
+
+fn parse_token_usage_body(value: nojson::RawJsonValue<'_, '_>) -> Result<TokenUsageBody, String> {
+    let usage = value
+        .to_member("usage")
+        .and_then(|m| m.required())
+        .map_err(|e| e.to_string())?;
+    let opt_u64 = |key: &str| -> Result<Option<u64>, String> {
+        let Some(v) = usage.to_member(key).map_err(|e| e.to_string())?.optional() else {
+            return Ok(None);
+        };
+        if v.as_raw_str().trim() == "null" {
+            return Ok(None);
+        }
+        let n: u64 = v.try_into().map_err(|e: JsonParseError| e.to_string())?;
+        Ok(Some(n))
+    };
+    Ok(TokenUsageBody {
+        prompt_tokens: opt_u64("prompt_tokens")?,
+        completion_tokens: opt_u64("completion_tokens")?,
+        total_tokens: opt_u64("total_tokens")?,
+        prompt_cache_hit_tokens: opt_u64("prompt_cache_hit_tokens")?,
+        prompt_cache_miss_tokens: opt_u64("prompt_cache_miss_tokens")?,
+    })
+}
+
 /// Extract a [`ChatMessage`] from one JSON Lines record if the
 /// record contributes to the conversation context. Returns
 /// `Ok(None)` for records that are logged for observability but

@@ -234,6 +234,13 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
 
     let workspace_root = std::env::current_dir()
         .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
+    // subagent_start / subagent_wait are only advertised when the
+    // parent is running inside a tmux session AND is not itself a
+    // subagent (recursion guard). Env probes are done here (only I/O
+    // spot in the CLI wiring) so agent_cli::build_tool_defs stays
+    // pure.
+    let subagent_available =
+        std::env::var("TMUX").is_ok() && std::env::var("ATTINI_IS_SUBAGENT").is_err();
     let cfg = AgentConfig {
         session_name,
         model,
@@ -247,6 +254,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         tool_call_rate,
         session_tool_call_max,
         skill_name,
+        subagent_available,
     };
     let exit = agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(Some(exit))
