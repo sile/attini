@@ -127,9 +127,9 @@ fn assert_split_invariant(bytes: Vec<u8>, splits: Vec<usize>) {
 }
 
 #[test]
-fn split_invariance_on_random_bytes() -> noprop::Result<()> {
+fn split_invariance_on_random_bytes() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let bytes = sample_random_bytes(ctx);
         let splits = sample_splits(ctx, bytes.len());
         assert_split_invariant(bytes, splits);
@@ -139,9 +139,9 @@ fn split_invariance_on_random_bytes() -> noprop::Result<()> {
 }
 
 #[test]
-fn split_invariance_on_sse_like_bytes() -> noprop::Result<()> {
+fn split_invariance_on_sse_like_bytes() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let bytes = sample_sse_like_bytes(ctx);
         let splits = sample_splits(ctx, bytes.len());
         assert_split_invariant(bytes, splits);

@@ -12,4 +12,4 @@ nojson = "0.3"
 sha2 = "0.11"
 
 [dev-dependencies]
-noprop = "0.0.2"
+noprop = "0.2.0"

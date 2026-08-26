@@ -177,9 +177,9 @@ fn walk_collect(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
 /// Property 1: any syntactic variant of a Layer-1 canonical path
 /// must be rejected with `ExcludedPath`.
 #[test]
-fn prop_layer1_syntactic_variants_all_reject() -> noprop::Result<()> {
+fn prop_layer1_syntactic_variants_all_reject() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let ws = Workspace::new("layer1-syntactic");
         // Ensure every Layer 1 target physically exists so Update
         // canonicalisation succeeds and the check reaches Layer 1
@@ -242,9 +242,9 @@ fn prop_layer1_syntactic_variants_all_reject() -> noprop::Result<()> {
 /// snapshot: `..` bypasses would call `create_dir_all` on a path
 /// like `<root>/malicious/` if the pre-create logic were loose.
 #[test]
-fn prop_layer2_syntactic_bypass_has_no_side_effect() -> noprop::Result<()> {
+fn prop_layer2_syntactic_bypass_has_no_side_effect() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let ws = Workspace::new("layer2-bypass");
         let executor = ws.executor();
         let dirs_before = collect_dirs_outside_scratchpad(ws.root());
@@ -310,9 +310,9 @@ fn walk_dirs(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
 /// Property 3: on any reject verdict from `preview_patch`, the
 /// filesystem below the workspace root must be byte-identical.
 #[test]
-fn prop_reject_verdicts_do_not_mutate_filesystem() -> noprop::Result<()> {
+fn prop_reject_verdicts_do_not_mutate_filesystem() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let ws = Workspace::new("reject-nondestructive");
         let executor = ws.executor();
         let before = snapshot(ws.root());
@@ -372,9 +372,9 @@ fn prop_reject_verdicts_do_not_mutate_filesystem() -> noprop::Result<()> {
 /// Property 6: an Add that succeeded must admit a subsequent Update
 /// on the same path within the same invocation.
 #[test]
-fn prop_add_then_update_within_invocation_is_allowed() -> noprop::Result<()> {
+fn prop_add_then_update_within_invocation_is_allowed() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let ws = Workspace::new("add-then-update");
         let executor = ws.executor();
         // Pick an Add target that Layer 3 will allow. We use a bare

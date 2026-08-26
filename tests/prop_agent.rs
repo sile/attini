@@ -24,7 +24,7 @@ fn sample_request_id(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Req
     // exercised, but keep a healthy stream of synthetic IDs to verify
     // stale-event handling.
     if let Some(active) = core.active_request()
-        && noprop::sample_ratio(ctx, 3, 5)
+        && noprop::sample_ratio(ctx, noprop::Ratio::new(3, 5))
     {
         return active;
     }
@@ -36,7 +36,7 @@ fn sample_call_id(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> String
     // tool_results are occasionally committed (not always dropped as
     // stale). Otherwise emit a synthetic id.
     let active = core.active_tool_calls();
-    if !active.is_empty() && noprop::sample_ratio(ctx, 3, 5) {
+    if !active.is_empty() && noprop::sample_ratio(ctx, noprop::Ratio::new(3, 5)) {
         let idx = noprop::sample_usize_in(ctx, 0..=(active.len() - 1));
         return active[idx].call_id.clone();
     }
@@ -251,9 +251,9 @@ fn count_tool(core: &AgentCore) -> usize {
 }
 
 #[test]
-fn public_contract_holds_across_random_event_sequences() -> noprop::Result<()> {
+fn public_contract_holds_across_random_event_sequences() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let mut core = AgentCore::new();
         assert_getter_consistency(&core);
 

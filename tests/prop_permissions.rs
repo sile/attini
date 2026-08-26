@@ -26,9 +26,9 @@ fn approve_rule(argv_prefix: Vec<String>) -> Rule {
 }
 
 #[test]
-fn rule_shorter_than_argv_with_matching_head_auto_approves() -> noprop::Result<()> {
+fn rule_shorter_than_argv_with_matching_head_auto_approves() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         let prefix = sample_argv(ctx, 1, 4);
         let extra_tail = sample_argv(ctx, 0, 4);
         let mut argv = prefix.clone();
@@ -47,9 +47,9 @@ fn rule_shorter_than_argv_with_matching_head_auto_approves() -> noprop::Result<(
 }
 
 #[test]
-fn rule_longer_than_argv_never_matches() -> noprop::Result<()> {
+fn rule_longer_than_argv_never_matches() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         // Prefix strictly longer than argv guarantees non-match.
         let argv = sample_argv(ctx, 0, 3);
         let extra = sample_argv(ctx, 1, 3);
@@ -65,9 +65,9 @@ fn rule_longer_than_argv_never_matches() -> noprop::Result<()> {
 }
 
 #[test]
-fn any_element_mismatch_prevents_match() -> noprop::Result<()> {
+fn any_element_mismatch_prevents_match() -> noprop::RunResult {
     let seed = noprop::seed_from_env_or_time(SEED_ENV).expect("valid seed");
-    noprop::Runner::new(seed, ITERATIONS).run(|ctx| {
+    noprop::Runner::new(seed).run(ITERATIONS, |ctx| {
         // Build prefix and argv of equal length (>=1), then flip one
         // element in argv to guarantee at least one difference.
         let n = noprop::sample_usize_in(ctx, 1..=4);
