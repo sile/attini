@@ -20,6 +20,7 @@ A DeepSeek-powered coding agent prototype.
 
 - Rust 1.93+ (`edition = 2024`)
 - `DEEPSEEK_API_KEY` environment variable
+- Optional `DEEPSEEK_BASE_URL` for OpenAI-compatible endpoints (local LLMs, etc.)
 
 ## Build / Test
 
@@ -34,6 +35,10 @@ Set the environment variable first:
 
 ```sh
 export DEEPSEEK_API_KEY=sk-...
+
+# Optional: point at a local OpenAI-compatible server
+# export DEEPSEEK_BASE_URL=http://127.0.0.1:8888/v1
+# export DEEPSEEK_API_KEY=local
 ```
 
 ### Interactive TUI
@@ -82,4 +87,5 @@ after approval.
 
 | Variable | Description |
 | --- | --- |
-| `DEEPSEEK_API_KEY` | DeepSeek API key (required) |
+| `DEEPSEEK_API_KEY` | API key (required). Use any non-empty value for local servers that ignore auth. |
+| `DEEPSEEK_BASE_URL` | OpenAI-compatible API base URL (optional). Default: `https://api.deepseek.com`. Trailing slash is stripped; `/chat/completions` is appended. Example: `http://host:8888/v1`. |

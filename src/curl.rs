@@ -1,4 +1,9 @@
 //! Sync HTTP transport for `attini agent` via a `curl` subprocess.
+//!
+//! Endpoint and credentials:
+//! - `DEEPSEEK_API_KEY` (required)
+//! - `DEEPSEEK_BASE_URL` (optional OpenAI-compatible base; default
+//!   `https://api.deepseek.com`; `/chat/completions` is appended)
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -9,8 +14,44 @@ use crate::sansio::deepseek::{
 };
 use crate::sansio::sse::{SseDecoder, SseEvent};
 
-const DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
+/// Default OpenAI-compatible API base (no trailing path).
+/// The chat completions path is appended by [`chat_completions_url`].
+const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+const BASE_URL_ENV: &str = "DEEPSEEK_BASE_URL";
 const API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+
+/// Build the chat-completions endpoint from an optional base URL.
+///
+/// `base` should be an OpenAI-compatible root such as
+/// `https://api.deepseek.com` or `http://host:8888/v1`. A trailing slash
+/// is stripped before `/chat/completions` is appended. When `base` is
+/// `None`, [`DEFAULT_BASE_URL`] is used.
+fn chat_completions_url(base: Option<&str>) -> Result<String, io::Error> {
+    let raw = match base {
+        None => DEFAULT_BASE_URL,
+        Some(s) if s.is_empty() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{BASE_URL_ENV} is empty"),
+            ));
+        }
+        Some(s) => s,
+    };
+    let trimmed = raw.trim_end_matches('/');
+    Ok(format!("{trimmed}{CHAT_COMPLETIONS_PATH}"))
+}
+
+fn resolve_chat_completions_url() -> io::Result<String> {
+    match std::env::var(BASE_URL_ENV) {
+        Ok(value) => chat_completions_url(Some(&value)),
+        Err(std::env::VarError::NotPresent) => chat_completions_url(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{BASE_URL_ENV} is not valid Unicode"),
+        )),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResult {
@@ -50,6 +91,7 @@ pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<
         ));
     }
 
+    let url = resolve_chat_completions_url()?;
     let body = request.to_json_string();
 
     let mut child = Command::new("curl")
@@ -63,7 +105,7 @@ pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<
         .arg("Accept: text/event-stream")
         .arg("--data-binary")
         .arg("@-")
-        .arg(DEEPSEEK_URL)
+        .arg(&url)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -230,5 +272,37 @@ impl Assembly {
             finish_reason: self.finish_reason,
             usage: self.usage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_completions_url;
+
+    #[test]
+    fn default_base_url_appends_chat_completions() {
+        let url = chat_completions_url(None).expect("default base must succeed");
+        assert_eq!(url, "https://api.deepseek.com/chat/completions");
+    }
+
+    #[test]
+    fn custom_base_url_appends_chat_completions() {
+        let url = chat_completions_url(Some("http://100.114.199.83:8888/v1"))
+            .expect("custom base must succeed");
+        assert_eq!(url, "http://100.114.199.83:8888/v1/chat/completions");
+    }
+
+    #[test]
+    fn trailing_slash_on_base_is_stripped() {
+        let url = chat_completions_url(Some("http://127.0.0.1:8888/v1/"))
+            .expect("base with trailing slash must succeed");
+        assert_eq!(url, "http://127.0.0.1:8888/v1/chat/completions");
+    }
+
+    #[test]
+    fn empty_base_url_is_rejected() {
+        let err = chat_completions_url(Some("")).expect_err("empty base must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("DEEPSEEK_BASE_URL"));
     }
 }
