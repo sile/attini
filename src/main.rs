@@ -83,6 +83,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         .ty("NAME")
         .doc("Model name")
         .default(DEFAULT_MODEL)
+        .env("ATTINI_MODEL_NAME")
         .take(args)
         .then(|o| o.value().parse())?;
     let system: Option<String> = noargs::opt("system")
