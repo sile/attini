@@ -120,11 +120,19 @@ impl From<io::Error> for SubagentError {
 /// synchronous child process, inheriting the parent's working
 /// directory and environment plus `ATTINI_IS_SUBAGENT=1`. Returns
 /// once the child reaches a terminal state.
+///
+/// Planning mode and an approved plan are handed to the child via
+/// internal environment variables (not public CLI flags): a child of
+/// a planning parent gets `ATTINI_PLANNING_MODE=1`, and a child of an
+/// approved-plan parent gets the snapshot path and plan hash so it
+/// validates the same content-addressed snapshot instead of re-reading
+/// the live plan file.
 pub fn run(
     session_name: Option<&str>,
     prompt: &str,
     model: &str,
     mode: Mode,
+    plan: Option<&crate::plan::ApprovedPlan>,
 ) -> Result<SubagentStatus, SubagentError> {
     let session_name = resolve_session_name(session_name)?;
     let paths = session_paths(&session_name)?;
@@ -161,13 +169,17 @@ pub fn run(
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     match mode {
-        Mode::Plan => {
-            cmd.arg("--plan");
+        Mode::Planning => {
+            cmd.env("ATTINI_PLANNING_MODE", "1");
         }
         Mode::LocalOnly => {
             cmd.arg("--local-only");
         }
         Mode::Default => {}
+    }
+    if let Some(approved) = plan {
+        cmd.env("ATTINI_PLAN_SNAPSHOT", &approved.snapshot_path)
+            .env("ATTINI_PLAN_SHA256", &approved.plan_sha256);
     }
     cmd.arg(prompt);
     let status = cmd.status().map_err(|e| SubagentError::SpawnFailed {

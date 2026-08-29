@@ -1,6 +1,7 @@
 //! Sync single-turn agent loop for `attini agent`.
 
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
@@ -10,12 +11,14 @@ use nojson::DisplayJson;
 
 use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
+use crate::plan::ApprovedPlan;
 use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
-    SkillLoadInvocation, SubagentRunInvocation, ToolExecutionError, ToolOutcome,
+    SkillLoadInvocation, SubagentRunInvocation, SubmitPlanInvocation, ToolExecutionError,
+    ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
-use crate::sansio::permissions::{AutoDecision, Judgment, Mode, evaluate};
+use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
     Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
@@ -52,6 +55,16 @@ pub struct Counters {
     /// (`load_records_since_last_summary` / `run_summariser` /
     /// `session.append` の `?` 経由 `Err` を合算)。
     pub compaction_failures: u64,
+    /// Number of plans created by `submit_plan` in this invocation.
+    pub plan_created: u64,
+    /// Number of `plan run` invocations (recorded by `plan_cmd`).
+    pub plan_runs: u64,
+    /// Number of plan delegations to child subagents.
+    pub plan_delegations: u64,
+    /// Number of actions approved via an approved plan.
+    pub plan_action_approvals: u64,
+    /// Number of actions rejected as not approved by the plan.
+    pub plan_action_rejections: u64,
 }
 
 /// Per-tool-name buckets for `Counters::tool_calls_by_kind`. Names are
@@ -67,6 +80,7 @@ pub struct ToolCallsByKind {
     pub command: u64,
     pub skill_load: u64,
     pub subagent_run: u64,
+    pub submit_plan: u64,
     pub unknown: u64,
 }
 
@@ -101,6 +115,10 @@ impl Counters {
                 self.tool_calls_by_kind.subagent_run,
             ),
             (
+                "tool_calls.submit_plan".to_string(),
+                self.tool_calls_by_kind.submit_plan,
+            ),
+            (
                 "tool_calls.unknown".to_string(),
                 self.tool_calls_by_kind.unknown,
             ),
@@ -124,6 +142,17 @@ impl Counters {
             ),
             ("compaction_attempts".to_string(), self.compaction_attempts),
             ("compaction_failures".to_string(), self.compaction_failures),
+            ("plan.created".to_string(), self.plan_created),
+            ("plan.runs".to_string(), self.plan_runs),
+            ("plan.delegations".to_string(), self.plan_delegations),
+            (
+                "plan.action_approvals".to_string(),
+                self.plan_action_approvals,
+            ),
+            (
+                "plan.action_rejections".to_string(),
+                self.plan_action_rejections,
+            ),
         ]
     }
 }
@@ -174,6 +203,15 @@ pub struct AgentConfig {
     /// model. `main.rs` sets this to true only when
     /// `ATTINI_IS_SUBAGENT` is unset (so subagents cannot recurse).
     pub subagent_available: bool,
+    /// How side-effecting tool calls are authorized in this
+    /// invocation. `plan run` supplies
+    /// [`Authorization::ApprovedPlan`]; every other entry point uses
+    /// the default `PerTool`.
+    pub authorization: Authorization,
+    /// When set (by `plan create`), a successful `submit_plan`
+    /// terminal tool call writes the rendered plan to this path and
+    /// ends the invocation.
+    pub plan_output_path: Option<std::path::PathBuf>,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -197,7 +235,17 @@ pub enum Continuation {
     Reject,
 }
 
-pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
+/// Terminal outcome of one `agent_cli::run` invocation.
+#[derive(Debug)]
+pub enum RunOutcome {
+    /// Normal exit with the process exit code.
+    Exit(ExitCode),
+    /// A planning-mode `submit_plan` terminal tool wrote a plan and
+    /// ended the invocation. Carries the written plan path.
+    PlanSubmitted(PathBuf),
+}
+
+pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
     // Combine persistent extra_read_paths (from permissions.json) with
     // CLI --read-path overrides for this invocation, canonicalise
@@ -226,6 +274,7 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
 
     let (reason, exit_code) = match &outcome {
         Ok(Driven::Completed) => (InvocationEndReason::Completed, EXIT_OK),
+        Ok(Driven::PlanSubmitted(_)) => (InvocationEndReason::Completed, EXIT_OK),
         Ok(Driven::AwaitingApproval) => (
             InvocationEndReason::AwaitingApproval,
             EXIT_AWAITING_APPROVAL,
@@ -247,16 +296,19 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<ExitCode> {
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
     match outcome {
-        Ok(_) => Ok(ExitCode::from(exit_code)),
+        Ok(Driven::PlanSubmitted(path)) => Ok(RunOutcome::PlanSubmitted(path)),
+        Ok(_) => Ok(RunOutcome::Exit(ExitCode::from(exit_code))),
         Err(e) => {
             eprintln!("attini: {e}");
-            Ok(ExitCode::from(EXIT_ERROR))
+            Ok(RunOutcome::Exit(ExitCode::from(EXIT_ERROR)))
         }
     }
 }
 
 enum Driven {
     Completed,
+    /// A planning-mode `submit_plan` terminal tool wrote a plan.
+    PlanSubmitted(PathBuf),
     AwaitingApproval,
     /// Invocation-scope tool-call backstop tripped
     /// ([`AgentConfig::session_tool_call_max`]).
@@ -443,6 +495,19 @@ fn drive(
         messages.push(assistant);
 
         if call_result.tool_calls.is_empty() {
+            // In planning mode the invocation must end with
+            // `submit_plan`; a bare final response gets a corrective
+            // prompt and the loop retries (bounded by max_turns).
+            if cfg.mode == Mode::Planning {
+                let corrective = "You did not call submit_plan. Investigate the workspace and \
+                    end your reply by calling the submit_plan tool with the final plan.";
+                session.append(&SessionRecord::User {
+                    ts: now_unix_millis(),
+                    text: corrective.to_string(),
+                })?;
+                messages.push(ChatMessage::User(corrective.to_string()));
+                continue;
+            }
             return Ok(Driven::Completed);
         }
 
@@ -458,6 +523,7 @@ fn drive(
                 "command" => counters.tool_calls_by_kind.command += 1,
                 "skill_load" => counters.tool_calls_by_kind.skill_load += 1,
                 "subagent_run" => counters.tool_calls_by_kind.subagent_run += 1,
+                "submit_plan" => counters.tool_calls_by_kind.submit_plan += 1,
                 _ => counters.tool_calls_by_kind.unknown += 1,
             }
             match gate.admit(Instant::now()) {
@@ -517,11 +583,15 @@ fn drive(
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
                 ToolKind::Patch => {
-                    let preview_text = render_patch_preview(tc, executor)?;
-                    eprintln!("[patch] approval required");
-                    eprintln!("{preview_text}");
-                    save_pending(session, tc, PendingToolKind::Patch, preview_text)?;
-                    return Ok(Driven::AwaitingApproval);
+                    if let Authorization::ApprovedPlan(plan) = &cfg.authorization {
+                        run_plan_patch(tc, executor, session, &mut messages, counters, plan)?;
+                    } else {
+                        let preview_text = render_patch_preview(tc, executor)?;
+                        eprintln!("[patch] approval required");
+                        eprintln!("{preview_text}");
+                        save_pending(session, tc, PendingToolKind::Patch, preview_text)?;
+                        return Ok(Driven::AwaitingApproval);
+                    }
                 }
                 ToolKind::Command => {
                     match dispatch_command(
@@ -529,6 +599,7 @@ fn drive(
                         executor,
                         cfg.mode,
                         &rules,
+                        &cfg.authorization,
                         session,
                         &mut messages,
                         counters,
@@ -544,6 +615,12 @@ fn drive(
                 ToolKind::SubagentRun => {
                     let content = run_subagent_run(tc, cfg, counters);
                     append_tool(session, &mut messages, &tc.id, content)?;
+                }
+                ToolKind::SubmitPlan => {
+                    if let Some(path) = run_submit_plan(tc, cfg, session, &mut messages, counters)?
+                    {
+                        return Ok(Driven::PlanSubmitted(path));
+                    }
                 }
                 ToolKind::Unknown => {
                     let content = tool_error_json(
@@ -718,6 +795,10 @@ fn run_subagent_run(tc: &ToolCall, cfg: &AgentConfig, counters: &mut Counters) -
         &inv.prompt,
         &cfg.model,
         cfg.mode,
+        match &cfg.authorization {
+            Authorization::ApprovedPlan(plan) => Some(plan),
+            Authorization::PerTool => None,
+        },
     ) {
         Ok(status) => {
             eprintln!(
@@ -754,6 +835,118 @@ fn run_subagent_run(tc: &ToolCall, cfg: &AgentConfig, counters: &mut Counters) -
             tool_error_json(code, &message)
         }
     }
+}
+
+/// Dispatch a `submit_plan` terminal tool call in planning mode:
+/// render the structured plan components into a sealed Markdown plan
+/// file, write it atomically (refusing to overwrite), append the
+/// `PlanCreated` session record and the tool record, and end the
+/// invocation. A `None` return means the arguments were invalid: the
+/// error tool result was appended and the loop should continue so the
+/// model can retry.
+fn run_submit_plan(
+    tc: &ToolCall,
+    cfg: &AgentConfig,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+    counters: &mut Counters,
+) -> io::Result<Option<std::path::PathBuf>> {
+    let inv = match SubmitPlanInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            counters.tool_errors += 1;
+            eprintln!("[submit_plan] parse err: {err:?}");
+            let content = tool_error_json_from(&err);
+            append_tool(session, messages, &tc.id, content)?;
+            return Ok(None);
+        }
+    };
+    let output = cfg.plan_output_path.as_ref().ok_or_else(|| {
+        io::Error::other("submit_plan called but no plan output path is configured")
+    })?;
+    if output.exists() {
+        return Err(io::Error::other(format!(
+            "refusing to overwrite existing plan file {}",
+            output.display()
+        )));
+    }
+
+    let mut confirmations: Vec<crate::plan::Confirmation> =
+        Vec::with_capacity(inv.confirmations.len() + 1);
+    confirmations.push(crate::plan::Confirmation::unchecked(
+        crate::plan::RESERVED_CONFIRMATION_ID,
+        crate::plan::ALL_OK_DESCRIPTION,
+    ));
+    confirmations.extend(
+        inv.confirmations
+            .iter()
+            .map(|c| crate::plan::Confirmation::unchecked(&c.id, &c.description)),
+    );
+    let actions = crate::plan::PlanActions {
+        patches: inv
+            .patches
+            .iter()
+            .map(|p| crate::plan::PlanPatchAction {
+                id: p.id.clone(),
+                path: p.path.clone(),
+                description: p.description.clone(),
+            })
+            .collect(),
+        commands: inv
+            .commands
+            .iter()
+            .map(|c| crate::plan::PlanCommandAction {
+                id: c.id.clone(),
+                argv: c.argv.clone(),
+                description: c.description.clone(),
+            })
+            .collect(),
+    };
+    let text = crate::plan::render_sealed(&inv.body_markdown, &actions, &confirmations)
+        .map_err(|e| io::Error::other(format!("plan render failed: {e}")))?;
+    let plan_sha256 =
+        crate::plan::seal_hash(text.as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
+
+    write_plan_atomic(output, text.as_bytes())?;
+    eprintln!("[submit_plan] wrote {}", output.display());
+
+    session.append(&SessionRecord::PlanCreated {
+        ts: now_unix_millis(),
+        path: output.display().to_string(),
+        plan_sha256: plan_sha256.clone(),
+    })?;
+    let result = plan_result_json(output, &plan_sha256);
+    append_tool(session, messages, &tc.id, result)?;
+    counters.plan_created += 1;
+    Ok(Some(output.clone()))
+}
+
+/// Atomically write `bytes` to `path`, failing if the path already
+/// exists (`O_EXCL`).
+fn write_plan_atomic(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.flush()
+}
+
+fn plan_result_json(path: &std::path::Path, plan_sha256: &str) -> String {
+    use nojson::DisplayJson;
+    struct Payload<'a> {
+        path: &'a std::path::Path,
+        plan_sha256: &'a str,
+    }
+    impl DisplayJson for Payload<'_> {
+        fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
+            f.object(|f| {
+                f.member("path", self.path.display().to_string())?;
+                f.member("plan_sha256", self.plan_sha256)
+            })
+        }
+    }
+    nojson::Json(Payload { path, plan_sha256 }).to_string()
 }
 
 fn state_str(state: crate::subagent::SubagentState) -> &'static str {
@@ -919,13 +1112,16 @@ fn is_safe_boundary(msg: &ChatMessage) -> bool {
 
 fn build_tool_defs(mode: Mode, subagent_available: bool) -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
-    if !matches!(mode, Mode::Plan) {
+    if !matches!(mode, Mode::Planning) {
         defs.push(PatchInvocation::definition());
     }
     defs.push(CommandInvocation::definition());
     defs.push(SkillLoadInvocation::definition());
     if subagent_available {
         defs.push(SubagentRunInvocation::definition());
+    }
+    if mode == Mode::Planning {
+        defs.push(SubmitPlanInvocation::definition());
     }
     defs
 }
@@ -935,11 +1131,13 @@ enum CommandDispatch {
     Continue,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_command(
     tc: &ToolCall,
     executor: &ToolExecutor,
     mode: Mode,
     rules: &LoadedRules,
+    authorization: &Authorization,
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
     counters: &mut Counters,
@@ -954,7 +1152,13 @@ fn dispatch_command(
             return Ok(CommandDispatch::Continue);
         }
     };
-    let judgment = evaluate(mode, &rules.session, &rules.workspace, &inv.argv);
+    let judgment = evaluate(
+        mode,
+        &rules.session,
+        &rules.workspace,
+        &inv.argv,
+        authorization,
+    );
     let display = shell_escape_argv(&inv.argv);
     match judgment {
         Judgment::AutoApprove(dec) => {
@@ -977,6 +1181,44 @@ fn dispatch_command(
                 }
             };
             append_tool(session, messages, &tc.id, content)?;
+            Ok(CommandDispatch::Continue)
+        }
+        Judgment::PlanAction { action_id } => {
+            let plan = match authorization {
+                Authorization::ApprovedPlan(plan) => plan,
+                Authorization::PerTool => unreachable!("PlanAction requires ApprovedPlan"),
+            };
+            eprintln!("[command] plan action '{action_id}': {display}");
+            append_plan_action_approval(session, &tc.id, plan, &action_id)?;
+            counters.plan_action_approvals += 1;
+            let content = match run_command_sync(&inv, executor) {
+                Ok(s) => s,
+                Err(err) => {
+                    let (code, msg) = err.to_code_and_message();
+                    counters.tool_errors += 1;
+                    let payload = tool_error_json(code, &msg);
+                    append_tool(session, messages, &tc.id, payload)?;
+                    return Ok(CommandDispatch::Continue);
+                }
+            };
+            append_tool(session, messages, &tc.id, content)?;
+            Ok(CommandDispatch::Continue)
+        }
+        Judgment::PlanActionNotApproved => {
+            let message = format!(
+                "plan action not approved: {} is not listed in the approved plan. \
+                 Stop and propose the exact action to add.",
+                display
+            );
+            eprintln!("[command] plan_action_not_approved: {display}");
+            counters.plan_action_rejections += 1;
+            counters.tool_errors += 1;
+            append_tool(
+                session,
+                messages,
+                &tc.id,
+                tool_error_json("plan_action_not_approved", &message),
+            )?;
             Ok(CommandDispatch::Continue)
         }
         Judgment::AutoDeny(dec) => {
@@ -1010,6 +1252,8 @@ fn dispatch_command(
                 scope: "plan".to_string(),
                 argv_prefix: Vec::new(),
                 reason: format!("plan_mode_reject:{}", reason.as_str()),
+                plan_sha256: None,
+                action_id: None,
             };
             session.append(&SessionRecord::ToolApproval {
                 ts: now_unix_millis(),
@@ -1049,6 +1293,8 @@ fn append_auto_approval(
         scope: dec.scope.as_str().to_string(),
         argv_prefix: dec.argv_prefix.clone(),
         reason: dec.reason.as_str().to_string(),
+        plan_sha256: None,
+        action_id: None,
     };
     session.append(&SessionRecord::ToolApproval {
         ts: now_unix_millis(),
@@ -1056,6 +1302,94 @@ fn append_auto_approval(
         decision,
         auto_decided_by: Some(sidecar),
     })
+}
+
+/// Record a `ToolApproval` for an approved-plan action.
+fn append_plan_action_approval(
+    session: &mut Session,
+    call_id: &str,
+    plan: &ApprovedPlan,
+    action_id: &str,
+) -> io::Result<()> {
+    let sidecar = AutoDecidedBy {
+        scope: "plan".to_string(),
+        argv_prefix: Vec::new(),
+        reason: "plan_action".to_string(),
+        plan_sha256: Some(plan.plan_sha256.clone()),
+        action_id: Some(action_id.to_string()),
+    };
+    session.append(&SessionRecord::ToolApproval {
+        ts: now_unix_millis(),
+        call_id: call_id.to_string(),
+        decision: ApprovalDecision::Approve,
+        auto_decided_by: Some(sidecar),
+    })
+}
+
+/// Apply a patch under an approved plan: every edit target path must
+/// be listed in the plan's patch actions. Unlisted paths are surfaced
+/// as a `plan_action_not_approved` error tool result (never a pending)
+/// and the batch is not applied.
+fn run_plan_patch(
+    tc: &ToolCall,
+    executor: &ToolExecutor,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+    counters: &mut Counters,
+    plan: &ApprovedPlan,
+) -> io::Result<()> {
+    let inv = match PatchInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            let content = tool_error_json("patch_args", &format!("{err:?}"));
+            eprintln!("[patch] parse err: {err:?}");
+            counters.tool_errors += 1;
+            counters.plan_action_rejections += 1;
+            return append_tool(session, messages, &tc.id, content);
+        }
+    };
+    let mut missing: Vec<String> = Vec::new();
+    let mut action_ids: Vec<String> = Vec::new();
+    for edit in &inv.edits {
+        match plan.actions.patch_by_path(edit.path()) {
+            Some(action) => action_ids.push(action.id.clone()),
+            None => missing.push(edit.path().to_string()),
+        }
+    }
+    if !missing.is_empty() {
+        let message = format!(
+            "plan action not approved: patch paths {:?} are not listed in the approved plan. \
+             Stop and propose the exact paths to add.",
+            missing
+        );
+        eprintln!("[patch] plan_action_not_approved: {missing:?}");
+        counters.plan_action_rejections += 1;
+        counters.tool_errors += 1;
+        return append_tool(
+            session,
+            messages,
+            &tc.id,
+            tool_error_json("plan_action_not_approved", &message),
+        );
+    }
+    let (hashes, _preview) = executor
+        .preview_patch(&inv)
+        .map_err(|e| io::Error::other(format!("patch preview: {e:?}")))?;
+    let paths = executor
+        .apply_patch(&inv, &hashes)
+        .map_err(|e| io::Error::other(format!("patch apply: {e:?}")))?;
+    let action_id = action_ids.first().cloned().unwrap_or_default();
+    append_plan_action_approval(session, &tc.id, plan, &action_id)?;
+    counters.plan_action_approvals += 1;
+    eprintln!(
+        "[patch] plan action: {}",
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    append_tool(session, messages, &tc.id, patch_result_json(&paths))
 }
 
 /// Suggest the two `attini session grant` invocations that would
@@ -1151,6 +1485,7 @@ enum ToolKind {
     Command,
     Skill,
     SubagentRun,
+    SubmitPlan,
     Unknown,
 }
 
@@ -1161,6 +1496,7 @@ fn classify(name: &str) -> ToolKind {
         "command" => ToolKind::Command,
         "skill_load" => ToolKind::Skill,
         "subagent_run" => ToolKind::SubagentRun,
+        "submit_plan" => ToolKind::SubmitPlan,
         _ => ToolKind::Unknown,
     }
 }
@@ -1572,6 +1908,8 @@ mod tests {
             session_tool_call_max: session_max,
             skill_name: None,
             subagent_available: false,
+            authorization: Authorization::PerTool,
+            plan_output_path: None,
         }
     }
 

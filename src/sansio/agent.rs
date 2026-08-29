@@ -483,6 +483,230 @@ const SKILL_LOAD_PARAMS_SCHEMA: &str = r#"{
 "required":["name"]
 }"#;
 
+/// Terminal tool used by `plan create`'s planning mode: submit the
+/// rendered plan components. attini renders the versioned actions
+/// JSON block, the flat confirmation checklist, and the seal marker
+/// deterministically; the model never writes markers or checkbox
+/// lines itself. A successful submission ends the invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitPlanInvocation {
+    pub body_markdown: String,
+    pub confirmations: Vec<SubmitConfirmation>,
+    pub patches: Vec<SubmitPatch>,
+    pub commands: Vec<SubmitCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitConfirmation {
+    pub id: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitPatch {
+    pub id: String,
+    pub path: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitCommand {
+    pub id: String,
+    pub argv: Vec<String>,
+    pub description: String,
+}
+
+impl SubmitPlanInvocation {
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "submit_plan".to_string(),
+            description: "Submit the plan you explored and finalize it. The plan body, \
+                 confirmation items, approved patch paths, and approved command argv \
+                 are rendered into a sealed Markdown plan file. This ends the planning \
+                 invocation."
+                .to_string(),
+            parameters_json: SUBMIT_PLAN_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    /// Parse and validate the structured `submit_plan` arguments.
+    /// Enforces the shared plan ID rules, per-kind counts, required
+    /// non-empty fields, and uniqueness across all IDs. `all-ok` and
+    /// the format version are reserved for attini, not the model.
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
+        let root = json.value();
+        let body_markdown = required_string(root, "body_markdown")?;
+        if body_markdown.trim().is_empty() {
+            return Err(ToolExecutionError::ArgumentsParseFailed(
+                "submit_plan: body_markdown must not be empty".to_string(),
+            ));
+        }
+        let confirmations = parse_confirmation_args(root)?;
+        let patches = parse_patch_args(root)?;
+        let commands = parse_command_args(root)?;
+
+        if confirmations.len() > crate::plan::MAX_CONFIRMATIONS {
+            return Err(ToolExecutionError::ArgumentsParseFailed(format!(
+                "submit_plan: too many confirmations (max {})",
+                crate::plan::MAX_CONFIRMATIONS
+            )));
+        }
+        if patches.len() > crate::plan::MAX_ACTIONS || commands.len() > crate::plan::MAX_ACTIONS {
+            return Err(ToolExecutionError::ArgumentsParseFailed(format!(
+                "submit_plan: too many actions (max {})",
+                crate::plan::MAX_ACTIONS
+            )));
+        }
+        let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &confirmations {
+            if c.id == crate::plan::RESERVED_CONFIRMATION_ID {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "submit_plan: the all-ok confirmation is reserved".to_string(),
+                ));
+            }
+            check_plan_id(&c.id, "confirmation", &mut ids)?;
+            if c.description.trim().is_empty() {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "submit_plan: confirmation description must not be empty".to_string(),
+                ));
+            }
+        }
+        for p in &patches {
+            check_plan_id(&p.id, "patch", &mut ids)?;
+            if p.path.trim().is_empty() {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "submit_plan: patch path must not be empty".to_string(),
+                ));
+            }
+            if p.description.trim().is_empty() {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "submit_plan: patch description must not be empty".to_string(),
+                ));
+            }
+        }
+        let mut patch_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in &patches {
+            if !patch_paths.insert(p.path.as_str()) {
+                return Err(ToolExecutionError::ArgumentsParseFailed(format!(
+                    "submit_plan: duplicate patch path {:?}",
+                    p.path
+                )));
+            }
+        }
+        for c in &commands {
+            check_plan_id(&c.id, "command", &mut ids)?;
+            if c.argv.is_empty() {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "submit_plan: command argv must have at least one element".to_string(),
+                ));
+            }
+            if c.description.trim().is_empty() {
+                return Err(ToolExecutionError::ArgumentsParseFailed(
+                    "submit_plan: command description must not be empty".to_string(),
+                ));
+            }
+        }
+        let mut command_argv: std::collections::HashSet<&Vec<String>> =
+            std::collections::HashSet::new();
+        for c in &commands {
+            if !command_argv.insert(&c.argv) {
+                return Err(ToolExecutionError::ArgumentsParseFailed(format!(
+                    "submit_plan: duplicate command argv {:?}",
+                    c.argv
+                )));
+            }
+        }
+        Ok(Self {
+            body_markdown,
+            confirmations,
+            patches,
+            commands,
+        })
+    }
+}
+
+fn check_plan_id(
+    id: &str,
+    kind: &str,
+    ids: &mut std::collections::HashSet<String>,
+) -> Result<(), ToolExecutionError> {
+    crate::plan::validate_plan_id(id).map_err(|e| {
+        ToolExecutionError::ArgumentsParseFailed(format!("submit_plan: {kind}: {e}"))
+    })?;
+    if !ids.insert(id.to_string()) {
+        return Err(ToolExecutionError::ArgumentsParseFailed(format!(
+            "submit_plan: duplicate {kind} id {id:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_confirmation_args(
+    root: RawJsonValue<'_, '_>,
+) -> Result<Vec<SubmitConfirmation>, ToolExecutionError> {
+    let mut out = Vec::new();
+    let value = root
+        .to_member("confirmations")
+        .map_err(map_parse_err)?
+        .optional();
+    if let Some(arr) = value {
+        for item in arr.to_array().map_err(map_parse_err)? {
+            out.push(SubmitConfirmation {
+                id: required_string(item, "id")?,
+                description: required_string(item, "description")?,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_patch_args(root: RawJsonValue<'_, '_>) -> Result<Vec<SubmitPatch>, ToolExecutionError> {
+    let mut out = Vec::new();
+    let value = root.to_member("patches").map_err(map_parse_err)?.optional();
+    if let Some(arr) = value {
+        for item in arr.to_array().map_err(map_parse_err)? {
+            out.push(SubmitPatch {
+                id: required_string(item, "id")?,
+                path: required_string(item, "path")?,
+                description: required_string(item, "description")?,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn parse_command_args(
+    root: RawJsonValue<'_, '_>,
+) -> Result<Vec<SubmitCommand>, ToolExecutionError> {
+    let mut out = Vec::new();
+    let value = root
+        .to_member("commands")
+        .map_err(map_parse_err)?
+        .optional();
+    if let Some(arr) = value {
+        for item in arr.to_array().map_err(map_parse_err)? {
+            out.push(SubmitCommand {
+                id: required_string(item, "id")?,
+                argv: required_string_array(item, "argv")?,
+                description: required_string(item, "description")?,
+            });
+        }
+    }
+    Ok(out)
+}
+
+const SUBMIT_PLAN_PARAMS_SCHEMA: &str = r#"{
+"type":"object",
+"properties":{
+"body_markdown":{"type":"string","description":"Natural-language Markdown body: purpose, change approach, targets, and verification."},
+"confirmations":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string","description":"Lowercase id ([a-z][a-z0-9-]{0,63}); the reserved all-ok id is added by attini."},"description":{"type":"string","description":"A user judgment item to approve."}},"required":["id","description"]}},
+"patches":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"path":{"type":"string","description":"Exact workspace-relative path that may be patched."},"description":{"type":"string"}},"required":["id","path","description"]}},
+"commands":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"argv":{"type":"array","items":{"type":"string"},"minItems":1,"description":"Exact argv that may be run (no shell)."},"description":{"type":"string"}},"required":["id","argv","description"]}}
+},
+"required":["body_markdown"]
+}"#;
+
 /// Run a child `attini agent` synchronously in a separate session and
 /// block until it reaches a terminal state. Returns the child's
 /// session name, terminal state, and latest assistant content.
@@ -3553,5 +3777,70 @@ mod tests {
             core.metrics().command_output_chunks_dropped_as_stale.get(),
             1
         );
+    }
+
+    // -----------------------------------------------------------------
+    // SubmitPlanInvocation
+    // -----------------------------------------------------------------
+
+    fn valid_submit_json() -> String {
+        r#"{"body_markdown":"plan body","confirmations":[{"id":"migration","description":"run migration"}],"patches":[{"id":"fix-parser","path":"src/parser.rs","description":"fix parser"}],"commands":[{"id":"test","argv":["cargo","test"],"description":"run tests"}]}"#
+            .to_string()
+    }
+
+    #[test]
+    fn submit_plan_parses_valid_arguments() {
+        let inv = SubmitPlanInvocation::parse(&valid_submit_json()).expect("parse");
+        assert_eq!(inv.body_markdown, "plan body");
+        assert_eq!(inv.confirmations.len(), 1);
+        assert_eq!(inv.confirmations[0].id, "migration");
+        assert_eq!(inv.patches[0].path, "src/parser.rs");
+        assert_eq!(
+            inv.commands[0].argv,
+            vec!["cargo".to_string(), "test".to_string()]
+        );
+    }
+
+    #[test]
+    fn submit_plan_rejects_reserved_all_ok_id() {
+        let json =
+            r#"{"body_markdown":"b","confirmations":[{"id":"all-ok","description":"reserved"}]}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    #[test]
+    fn submit_plan_rejects_empty_body() {
+        let json = r#"{"body_markdown":"   "}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    #[test]
+    fn submit_plan_rejects_invalid_id() {
+        let json = r#"{"body_markdown":"b","confirmations":[{"id":"Bad_Id","description":"x"}]}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    #[test]
+    fn submit_plan_rejects_duplicate_ids_across_kinds() {
+        let json = r#"{"body_markdown":"b","confirmations":[{"id":"dup","description":"c"}],"patches":[{"id":"dup","path":"src/a.rs","description":"p"}]}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    #[test]
+    fn submit_plan_rejects_duplicate_patch_path() {
+        let json = r#"{"body_markdown":"b","patches":[{"id":"a","path":"src/x.rs","description":"p1"},{"id":"b","path":"src/x.rs","description":"p2"}]}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    #[test]
+    fn submit_plan_rejects_empty_command_argv() {
+        let json = r#"{"body_markdown":"b","commands":[{"id":"a","argv":[],"description":"c"}]}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    #[test]
+    fn submit_plan_rejects_duplicate_command_argv() {
+        let json = r#"{"body_markdown":"b","commands":[{"id":"a","argv":["ls"],"description":"c1"},{"id":"b","argv":["ls"],"description":"c2"}]}"#;
+        assert!(SubmitPlanInvocation::parse(json).is_err());
     }
 }

@@ -262,6 +262,7 @@ struct ToolCallCounts {
     command: u64,
     skill_load: u64,
     subagent_run: u64,
+    submit_plan: u64,
     unknown: u64,
 }
 
@@ -274,6 +275,7 @@ impl ToolCallCounts {
             + self.command
             + self.skill_load
             + self.subagent_run
+            + self.submit_plan
             + self.unknown
     }
 }
@@ -290,6 +292,11 @@ struct MetricsAggregate {
     prompt_cache_miss_tokens_total: u64,
     compaction_attempts: u64,
     compaction_failures: u64,
+    plan_created: u64,
+    plan_runs: u64,
+    plan_delegations: u64,
+    plan_action_approvals: u64,
+    plan_action_rejections: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -432,6 +439,10 @@ fn absorb_metrics_line(
                 .tool_calls
                 .subagent_run
                 .saturating_add(get("tool_calls.subagent_run")?);
+            agg.tool_calls.submit_plan = agg
+                .tool_calls
+                .submit_plan
+                .saturating_add(get("tool_calls.submit_plan")?);
             agg.tool_calls.unknown = agg
                 .tool_calls
                 .unknown
@@ -456,6 +467,17 @@ fn absorb_metrics_line(
             agg.compaction_failures = agg
                 .compaction_failures
                 .saturating_add(get("compaction_failures")?);
+            agg.plan_created = agg.plan_created.saturating_add(get("plan.created")?);
+            agg.plan_runs = agg.plan_runs.saturating_add(get("plan.runs")?);
+            agg.plan_delegations = agg
+                .plan_delegations
+                .saturating_add(get("plan.delegations")?);
+            agg.plan_action_approvals = agg
+                .plan_action_approvals
+                .saturating_add(get("plan.action_approvals")?);
+            agg.plan_action_rejections = agg
+                .plan_action_rejections
+                .saturating_add(get("plan.action_rejections")?);
         }
         "token_usage" => {
             let Some(usage) = value
@@ -540,6 +562,14 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
     println!(
         "  compaction: attempts={} failures={}",
         mx.compaction_attempts, mx.compaction_failures,
+    );
+    println!(
+        "  plan: created={} runs={} delegations={} action_approvals={} action_rejections={}",
+        mx.plan_created,
+        mx.plan_runs,
+        mx.plan_delegations,
+        mx.plan_action_approvals,
+        mx.plan_action_rejections,
     );
     println!(
         "  duration_ms: total={} avg_per_invocation={}",
@@ -635,6 +665,11 @@ struct TotalsAggregate {
     duration_ms_total: u64,
     compaction_attempts: u64,
     compaction_failures: u64,
+    plan_created: u64,
+    plan_runs: u64,
+    plan_delegations: u64,
+    plan_action_approvals: u64,
+    plan_action_rejections: u64,
 }
 
 fn compute_totals(sessions: &[PerSessionMetrics]) -> TotalsAggregate {
@@ -669,6 +704,17 @@ fn compute_totals(sessions: &[PerSessionMetrics]) -> TotalsAggregate {
         t.compaction_failures = t
             .compaction_failures
             .saturating_add(m.metrics.compaction_failures);
+        t.plan_created = t.plan_created.saturating_add(m.metrics.plan_created);
+        t.plan_runs = t.plan_runs.saturating_add(m.metrics.plan_runs);
+        t.plan_delegations = t
+            .plan_delegations
+            .saturating_add(m.metrics.plan_delegations);
+        t.plan_action_approvals = t
+            .plan_action_approvals
+            .saturating_add(m.metrics.plan_action_approvals);
+        t.plan_action_rejections = t
+            .plan_action_rejections
+            .saturating_add(m.metrics.plan_action_rejections);
     }
     t
 }
@@ -718,6 +764,16 @@ impl DisplayJson for SessionMetricsJson<'_> {
                 &CompactionJson {
                     attempts: mx.compaction_attempts,
                     failures: mx.compaction_failures,
+                },
+            )?;
+            f.member(
+                "plan",
+                &PlanJson {
+                    created: mx.plan_created,
+                    runs: mx.plan_runs,
+                    delegations: mx.plan_delegations,
+                    action_approvals: mx.plan_action_approvals,
+                    action_rejections: mx.plan_action_rejections,
                 },
             )?;
             f.member(
@@ -793,6 +849,16 @@ impl DisplayJson for TotalsJson<'_> {
                 },
             )?;
             f.member(
+                "plan",
+                &PlanJson {
+                    created: t.plan_created,
+                    runs: t.plan_runs,
+                    delegations: t.plan_delegations,
+                    action_approvals: t.plan_action_approvals,
+                    action_rejections: t.plan_action_rejections,
+                },
+            )?;
+            f.member(
                 "duration_ms",
                 &TotalDurationJson {
                     total: t.duration_ms_total,
@@ -811,6 +877,25 @@ impl DisplayJson for CompactionJson {
         f.object(|f| {
             f.member("attempts", self.attempts)?;
             f.member("failures", self.failures)
+        })
+    }
+}
+
+struct PlanJson {
+    created: u64,
+    runs: u64,
+    delegations: u64,
+    action_approvals: u64,
+    action_rejections: u64,
+}
+impl DisplayJson for PlanJson {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("created", self.created)?;
+            f.member("runs", self.runs)?;
+            f.member("delegations", self.delegations)?;
+            f.member("action_approvals", self.action_approvals)?;
+            f.member("action_rejections", self.action_rejections)
         })
     }
 }
@@ -854,6 +939,7 @@ impl DisplayJson for ToolCallsByKindJson<'_> {
             f.member("command", self.0.command)?;
             f.member("skill_load", self.0.skill_load)?;
             f.member("subagent_run", self.0.subagent_run)?;
+            f.member("submit_plan", self.0.submit_plan)?;
             f.member("unknown", self.0.unknown)
         })
     }
@@ -1452,9 +1538,10 @@ mod tests {
             command: 5,
             skill_load: 6,
             subagent_run: 7,
+            submit_plan: 8,
             unknown: 9,
         };
-        assert_eq!(counts.total(), 37);
+        assert_eq!(counts.total(), 45);
     }
 
     #[test]
