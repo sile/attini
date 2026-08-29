@@ -6,8 +6,14 @@
 //! limiter are still accumulated, so callers can hand the full output
 //! to the model exactly as before. The parent's stdout is never used
 //! here because the CLI's final result is emitted there.
+//!
+//! The child's output is framed by `[child] started (pid ...)` /
+//! `[child] finished (...)` separator lines on stderr, and when stderr
+//! is a terminal the streamed bytes are coloured (dim for the child's
+//! stdout, yellow for its stderr) so the output is clearly marked as
+//! coming from the child process.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +24,13 @@ pub const STREAM_DISPLAY_BYTES_PER_SECOND: usize = 64 * 1024;
 
 /// Size of each read from a child pipe.
 const CHUNK_SIZE: usize = 4 * 1024;
+
+/// ANSI escape for dimmed text (used for the child's stdout).
+const ANSI_DIM: &str = "\x1b[2m";
+/// ANSI escape for yellow text (used for the child's stderr).
+const ANSI_YELLOW: &str = "\x1b[33m";
+/// ANSI escape resetting all attributes.
+const ANSI_RESET: &str = "\x1b[0m";
 
 /// Captured result of a streamed child run.
 #[derive(Debug)]
@@ -35,23 +48,34 @@ pub struct ChildOutput {
 /// Run `cmd` with piped stdout / stderr, streaming both to the parent
 /// stderr under [`STREAM_DISPLAY_BYTES_PER_SECOND`] while accumulating
 /// the full output. Blocks until the child exits and both pipes are
-/// drained.
+/// drained. Prints `[child] started` / `[child] finished` separator
+/// lines to stderr, and colours the streamed bytes when stderr is a
+/// terminal.
 pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
     let started = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let color = io::stderr().is_terminal();
+    eprintln!("{}", start_line(pid));
+
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let stdout_thread = stdout
-        .map(|reader| thread::spawn(move || pump(reader, DisplayRateLimiter::new_per_second())));
-    let stderr_thread = stderr
-        .map(|reader| thread::spawn(move || pump(reader, DisplayRateLimiter::new_per_second())));
+    let stdout_thread = stdout.map(|reader| {
+        let limiter = DisplayRateLimiter::new_per_second();
+        thread::spawn(move || pump(reader, StreamKind::Stdout, color, limiter))
+    });
+    let stderr_thread = stderr.map(|reader| {
+        let limiter = DisplayRateLimiter::new_per_second();
+        thread::spawn(move || pump(reader, StreamKind::Stderr, color, limiter))
+    });
 
     let status = child.wait()?;
     let stdout_bytes = join_pump(stdout_thread)?;
     let stderr_bytes = join_pump(stderr_thread)?;
     let duration = started.elapsed();
+    eprintln!("{}", finish_line(&status, duration));
 
     Ok(ChildOutput {
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
@@ -59,6 +83,24 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
         status,
         duration,
     })
+}
+
+/// `[child] started (pid NNNN)` separator line.
+pub fn start_line(pid: u32) -> String {
+    format!("[child] started (pid {pid})")
+}
+
+/// `[child] finished (exit 0, 1.2s)` separator line. A child that was
+/// terminated by a signal is reported as `signal`.
+pub fn finish_line(status: &ExitStatus, duration: Duration) -> String {
+    let termination = match status.code() {
+        Some(code) => format!("exit {code}"),
+        None => "signal".to_string(),
+    };
+    format!(
+        "[child] finished ({termination}, {:.1}s)",
+        duration.as_secs_f64()
+    )
 }
 
 fn join_pump(handle: Option<thread::JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
@@ -70,9 +112,32 @@ fn join_pump(handle: Option<thread::JoinHandle<io::Result<Vec<u8>>>>) -> io::Res
     }
 }
 
+/// Which child stream a pump thread is draining. Selects the display
+/// colour when the parent stderr is a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+impl StreamKind {
+    fn ansi(self) -> &'static str {
+        match self {
+            Self::Stdout => ANSI_DIM,
+            Self::Stderr => ANSI_YELLOW,
+        }
+    }
+}
+
 /// Read a child pipe to EOF, accumulating every byte and displaying
-/// the stream to the parent stderr under `limiter`'s rate cap.
-fn pump<R: Read>(mut reader: R, mut limiter: DisplayRateLimiter) -> io::Result<Vec<u8>> {
+/// the stream to the parent stderr under `limiter`'s rate cap, wrapped
+/// in the stream's ANSI colour when `color` is true.
+fn pump<R: Read>(
+    mut reader: R,
+    kind: StreamKind,
+    color: bool,
+    mut limiter: DisplayRateLimiter,
+) -> io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
     let mut chunk = [0u8; CHUNK_SIZE];
     let mut stderr = io::stderr().lock();
@@ -82,9 +147,30 @@ fn pump<R: Read>(mut reader: R, mut limiter: DisplayRateLimiter) -> io::Result<V
             break;
         }
         accumulated.extend_from_slice(&chunk[..n]);
-        limiter.write(&mut stderr, &chunk[..n])?;
+        let allowed = limiter.allow(&chunk[..n]);
+        if allowed > 0 {
+            write_display(&mut stderr, kind, color, &chunk[..allowed])?;
+        }
     }
     Ok(accumulated)
+}
+
+/// Write `bytes` to `sink`, wrapping them in the stream colour when
+/// `color` is true (each write is self-contained: open colour, bytes,
+/// reset), and raw otherwise.
+fn write_display<W: Write>(
+    sink: &mut W,
+    kind: StreamKind,
+    color: bool,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if color {
+        sink.write_all(kind.ansi().as_bytes())?;
+        sink.write_all(bytes)?;
+        sink.write_all(ANSI_RESET.as_bytes())
+    } else {
+        sink.write_all(bytes)
+    }
 }
 
 /// Per-stream byte-rate limiter for the display copy. Accumulation is
@@ -111,18 +197,27 @@ impl DisplayRateLimiter {
         Self::new(STREAM_DISPLAY_BYTES_PER_SECOND, Duration::from_secs(1))
     }
 
-    /// Display up to the remaining window budget of `bytes`, writing
-    /// to `sink`. Excess bytes are dropped from the display only.
-    pub fn write<W: Write>(&mut self, sink: &mut W, bytes: &[u8]) -> io::Result<()> {
+    /// Return how many bytes of `bytes` may be displayed in the
+    /// current window (up to the remaining budget), advancing the
+    /// window when it has elapsed. The returned prefix is what callers
+    /// should display; the rest is dropped from the display only.
+    pub fn allow(&mut self, bytes: &[u8]) -> usize {
         let now = Instant::now();
         if now.duration_since(self.window_start) >= self.window {
             self.window_start = now;
             self.used = 0;
         }
-        let to_write = bytes.len().min(self.budget.saturating_sub(self.used));
-        if to_write > 0 {
-            sink.write_all(&bytes[..to_write])?;
-            self.used += to_write;
+        let allowed = bytes.len().min(self.budget.saturating_sub(self.used));
+        self.used += allowed;
+        allowed
+    }
+
+    /// Display up to the remaining window budget of `bytes`, writing
+    /// to `sink`. Excess bytes are dropped from the display only.
+    pub fn write<W: Write>(&mut self, sink: &mut W, bytes: &[u8]) -> io::Result<()> {
+        let allowed = self.allow(bytes);
+        if allowed > 0 {
+            sink.write_all(&bytes[..allowed])?;
         }
         Ok(())
     }
@@ -173,7 +268,7 @@ mod tests {
         // A tiny budget must not truncate the accumulated bytes.
         let reader = io::Cursor::new(b"x".repeat(10 * 1024));
         let limiter = DisplayRateLimiter::new(1, Duration::from_secs(1));
-        let bytes = pump(reader, limiter).expect("pump");
+        let bytes = pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
         assert_eq!(bytes.len(), 10 * 1024, "accumulation is never rate-capped");
     }
 
@@ -194,5 +289,70 @@ mod tests {
         cmd.arg("-c").arg("exit 3");
         let out = run_streamed(&mut cmd).expect("run");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    // -----------------------------------------------------------------
+    // Separator lines and colouring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn start_line_contains_pid() {
+        assert_eq!(start_line(12345), "[child] started (pid 12345)");
+    }
+
+    #[test]
+    fn finish_line_reports_exit_code_and_duration() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .expect("run");
+        assert_eq!(
+            finish_line(&status, Duration::from_millis(1250)),
+            "[child] finished (exit 0, 1.2s)"
+        );
+    }
+
+    #[test]
+    fn finish_line_reports_signal_without_exit_code() {
+        // A status whose code() is None is treated as signalled.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("kill -9 $$")
+            .status()
+            .expect("run");
+        assert!(status.code().is_none());
+        let line = finish_line(&status, Duration::ZERO);
+        assert!(
+            line.starts_with("[child] finished (signal, 0.0s)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn write_display_wraps_in_colour_when_enabled() {
+        let mut sink = Vec::new();
+        write_display(&mut sink, StreamKind::Stdout, true, b"abc").expect("write");
+        assert_eq!(sink, b"\x1b[2mabc\x1b[0m");
+
+        let mut sink = Vec::new();
+        write_display(&mut sink, StreamKind::Stderr, true, b"abc").expect("write");
+        assert_eq!(sink, b"\x1b[33mabc\x1b[0m");
+    }
+
+    #[test]
+    fn write_display_is_raw_when_colour_disabled() {
+        let mut sink = Vec::new();
+        write_display(&mut sink, StreamKind::Stdout, false, b"abc").expect("write");
+        write_display(&mut sink, StreamKind::Stderr, false, b"def").expect("write");
+        assert_eq!(sink, b"abcdef", "no ANSI codes outside a terminal");
+    }
+
+    #[test]
+    fn limiter_allow_returns_displayable_count() {
+        let mut limiter = DisplayRateLimiter::new(5, Duration::from_secs(1));
+        assert_eq!(limiter.allow(b"ab"), 2);
+        assert_eq!(limiter.allow(b"cdefgh"), 3, "fills the remaining budget");
+        assert_eq!(limiter.allow(b"ij"), 0, "budget exhausted");
     }
 }
