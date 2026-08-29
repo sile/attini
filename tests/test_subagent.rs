@@ -1,7 +1,9 @@
-//! Integration tests for `attini::subagent` covering spawn error
-//! paths (no tmux dependency required) and the shared read-only
-//! parser `attini::session::read_conversation_records` that
-//! subagent_wait relies on.
+//! Integration tests for `attini::subagent` covering the shared
+//! read-only parser `attini::session::read_conversation_records` that
+//! `subagent_run` relies on. The synchronous self-exec flow itself is
+//! covered by the unit tests in `src/subagent.rs` (state
+//! classification and pre-spawn decisions), since `subagent::run`
+//! resolves session paths relative to the current working directory.
 
 use std::fs;
 use std::path::PathBuf;

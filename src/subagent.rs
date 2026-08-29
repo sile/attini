@@ -1,49 +1,30 @@
-//! Spawn and observe child `attini agent` invocations in separate
-//! tmux windows. The parent invokes `subagent_start` to fork a child
-//! and `subagent_wait` to block until the listed children reach a
-//! non-running state. Availability is gated on `$TMUX` being set and
+//! Run a child `attini agent` synchronously in a separate session.
+//! The parent invokes the single `subagent_run` tool to self-exec the
+//! current attini binary as a child process and blocks until the
+//! child reaches a terminal state. Availability is gated on
 //! `$ATTINI_IS_SUBAGENT` being unset so children cannot recurse.
 
-use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent_cli::shell_single_quote;
+use crate::sansio::permissions::Mode;
 use crate::session::{
     InvocationEndReason, LockStatus, SessionRecord, inspect_lock, read_conversation_records,
     session_paths, session_root,
 };
 
-/// Ceiling on how long `spawn` waits for the child to acquire its
-/// session LOCK before declaring the startup a failure.
-const SPAWN_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Polling interval used both by the spawn barrier and by `wait`
-/// when watching each child's LOCK state.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Number of times `spawn` retries the auto-generated session name
+/// Number of times `run` retries the auto-generated session name
 /// when the low-entropy hex suffix collides with an existing
 /// `.attini/{name}/` directory.
 const AUTOGEN_RETRY_ATTEMPTS: usize = 3;
 
-/// Result of a successful `spawn` call.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpawnedSubagent {
-    /// Session name the child was started with (auto-generated when
-    /// the caller did not supply one).
-    pub session_name: String,
-    /// tmux window id (`@<n>` form) captured from
-    /// `tmux new-window -P -F '#{window_id}'`.
-    pub window_id: String,
-}
-
-/// Snapshot of one child's terminal state, returned by `wait`.
+/// Result of a successful `run` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentStatus {
+    /// Session name the child ran in (auto-generated when the caller
+    /// did not supply one).
     pub session_name: String,
     pub state: SubagentState,
     /// Latest Assistant `content` (or a `reasoning_content`
@@ -52,52 +33,44 @@ pub struct SubagentStatus {
     pub content: String,
 }
 
-/// State classification `wait` reports for each requested session.
+/// Terminal-state classification `run` reports for the child session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentState {
-    /// The named session directory does not exist. `wait` skips
-    /// polling for it and returns this state immediately so the
-    /// caller can distinguish "unknown name" from "child crashed".
-    NotFound,
     /// The child finished normally
     /// ([`InvocationEndReason::Completed`]).
     Completed,
-    /// The child stopped in an approval-pending state; the tmux
-    /// window is idle and `pending.json` is present until a human
-    /// resumes it.
+    /// The child stopped in an approval-pending state; `pending.json`
+    /// is present until a human resumes the session with
+    /// `attini agent -s <session> --approve` / `--reject`.
     AwaitingApproval,
     /// The child ended in an error state
     /// ([`InvocationEndReason::Error`] or
     /// [`InvocationEndReason::SessionToolCallExhausted`], collapsed).
     Error,
-    /// The child released its LOCK without leaving a coherent
-    /// terminal record (SIGKILL, OOM, panic-abort before
-    /// `InvocationEnd` was appended, invariant-broken `pending.json`
-    /// state, etc.). Callers should treat it as a failure and
-    /// decide whether to retry.
+    /// The child exited without leaving a coherent terminal record
+    /// (SIGKILL, OOM, panic-abort before `InvocationEnd` was
+    /// appended, invariant-broken `pending.json` state, etc.). Callers
+    /// should treat it as a failure and decide whether to retry.
     Crashed,
 }
 
-/// Failure modes for [`spawn`].
+/// Failure modes for [`run`].
 #[derive(Debug)]
 pub enum SubagentError {
-    /// A session directory with that name already exists. Auto-
-    /// generated names retry a bounded number of times before
-    /// surfacing this.
-    AlreadyExists { session_name: String },
     /// Requested session name failed the shared validation applied
     /// to every attini session (empty, path separators, control
     /// characters, ...).
     InvalidSessionName { message: String },
-    /// The `tmux new-window` invocation failed. `message` captures
-    /// tmux's stderr.
-    TmuxFailed { message: String },
-    /// The child did not acquire its session LOCK within the
-    /// spawn barrier timeout (`SPAWN_STARTUP_TIMEOUT` in this
-    /// module).
-    StartupTimeout { session_name: String },
+    /// Auto-generated names collided with existing session
+    /// directories across `AUTOGEN_RETRY_ATTEMPTS` attempts.
+    NameGenerationExhausted,
+    /// The named session is in use: its LOCK names a live PID, so a
+    /// concurrent invocation holds it.
+    Busy { session_name: String },
+    /// `std::env::current_exe()` or `Command::spawn` failed.
+    SpawnFailed { message: String },
     /// Filesystem or I/O error not covered by the more specific
-    /// variants (e.g. the parent could not read its own CWD).
+    /// variants.
     Io(io::Error),
 }
 
@@ -106,26 +79,26 @@ impl SubagentError {
     /// `tool_error_json` in `agent_cli`.
     pub fn to_code_and_message(&self) -> (&'static str, String) {
         match self {
-            Self::AlreadyExists { session_name } => (
-                "subagent_already_exists",
-                format!("session {session_name:?} already exists"),
-            ),
             Self::InvalidSessionName { message } => (
                 "subagent_invalid_session_name",
                 format!("invalid session name: {message}"),
             ),
-            Self::TmuxFailed { message } => (
-                "subagent_start_failed",
-                format!("tmux new-window failed: {message}"),
-            ),
-            Self::StartupTimeout { session_name } => (
-                "subagent_startup_timeout",
+            Self::NameGenerationExhausted => (
+                "subagent_name_generation_exhausted",
                 format!(
-                    "child for session {session_name:?} did not acquire its LOCK within {}s",
-                    SPAWN_STARTUP_TIMEOUT.as_secs()
+                    "could not generate a unique session name after {AUTOGEN_RETRY_ATTEMPTS} \
+                     attempts"
                 ),
             ),
-            Self::Io(e) => ("subagent_start_failed", format!("io error: {e}")),
+            Self::Busy { session_name } => (
+                "subagent_session_busy",
+                format!("session {session_name:?} is busy (LOCK held by a live process)"),
+            ),
+            Self::SpawnFailed { message } => (
+                "subagent_run_failed",
+                format!("failed to start child agent: {message}"),
+            ),
+            Self::Io(e) => ("subagent_run_failed", format!("io error: {e}")),
         }
     }
 }
@@ -143,111 +116,105 @@ impl From<io::Error> for SubagentError {
     }
 }
 
-/// Spawn `attini agent -s <session_name> <prompt>` in a new tmux
-/// window, returning once the child has acquired its session LOCK.
-pub fn spawn(session_name: Option<&str>, prompt: &str) -> Result<SpawnedSubagent, SubagentError> {
+/// Run `attini agent --model <model> -s <session_name> <prompt>` as a
+/// synchronous child process, inheriting the parent's working
+/// directory and environment plus `ATTINI_IS_SUBAGENT=1`. Returns
+/// once the child reaches a terminal state.
+pub fn run(
+    session_name: Option<&str>,
+    prompt: &str,
+    model: &str,
+    mode: Mode,
+) -> Result<SubagentStatus, SubagentError> {
     let session_name = resolve_session_name(session_name)?;
-    pre_create_session_dir(&session_name)?;
-    let cwd = std::env::current_dir()?;
-    let cwd_str = cwd
-        .to_str()
-        .ok_or_else(|| SubagentError::Io(io::Error::other("CWD is not valid UTF-8")))?;
-    let shell_command = quote_shell_command(&["attini", "agent", "-s", &session_name, prompt]);
-    let output = Command::new("tmux")
-        .args([
-            "new-window",
-            "-d",
-            "-c",
-            cwd_str,
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-n",
-            &session_name,
-            "-e",
-            "ATTINI_IS_SUBAGENT=1",
-            &shell_command,
-        ])
-        .output()
-        .map_err(|e| SubagentError::TmuxFailed {
-            message: e.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(SubagentError::TmuxFailed {
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
+    let paths = session_paths(&session_name)?;
+    let pending_exists_preflight = paths.pending.try_exists().unwrap_or(false);
+    match preflight(
+        paths.dir.is_dir(),
+        inspect_lock(&paths.lock),
+        pending_exists_preflight,
+    ) {
+        Preflight::Spawn => {}
+        Preflight::AwaitingApproval => {
+            let records = read_conversation_records(&paths.conversation).unwrap_or_default();
+            return Ok(SubagentStatus {
+                session_name,
+                state: SubagentState::AwaitingApproval,
+                content: pick_last_content(&records),
+            });
+        }
+        Preflight::Busy => {
+            return Err(SubagentError::Busy { session_name });
+        }
     }
-    let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    wait_for_lock_acquisition(&session_name)?;
-    Ok(SpawnedSubagent {
+
+    let exe = std::env::current_exe().map_err(|e| SubagentError::SpawnFailed {
+        message: format!("current_exe: {e}"),
+    })?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("agent")
+        .arg("--model")
+        .arg(model)
+        .arg("-s")
+        .arg(&session_name)
+        .env("ATTINI_IS_SUBAGENT", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    match mode {
+        Mode::Plan => {
+            cmd.arg("--plan");
+        }
+        Mode::LocalOnly => {
+            cmd.arg("--local-only");
+        }
+        Mode::Default => {}
+    }
+    cmd.arg(prompt);
+    let status = cmd.status().map_err(|e| SubagentError::SpawnFailed {
+        message: e.to_string(),
+    })?;
+    let exit_success = status.success();
+
+    let pending_exists = paths.pending.try_exists().unwrap_or(false);
+    let records = read_conversation_records(&paths.conversation).unwrap_or_default();
+    let latest_end_reason = latest_invocation_end_reason(&records);
+    let state = classify_state(pending_exists, latest_end_reason, exit_success);
+    let content = pick_last_content(&records);
+    Ok(SubagentStatus {
         session_name,
-        window_id,
+        state,
+        content,
     })
 }
 
-/// Block until every listed session reaches a non-running state,
-/// then return one [`SubagentStatus`] per session in the input
-/// order. Sessions whose `.attini/{name}/` directory does not exist
-/// short-circuit to [`SubagentState::NotFound`] without polling.
-pub fn wait(session_names: &[String]) -> Vec<SubagentStatus> {
-    // Separate names into (not_found, needs_polling) up front so the
-    // main loop only touches the polling set.
-    let mut not_found: Vec<String> = Vec::new();
-    let mut polling: Vec<String> = Vec::new();
-    for name in session_names {
-        if session_dir(name).is_dir() {
-            polling.push(name.clone());
-        } else {
-            not_found.push(name.clone());
-        }
+/// Decision made before spawning a child for the named session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Preflight {
+    /// Fresh session (no directory yet) or idle existing session:
+    /// spawn the child.
+    Spawn,
+    /// The session is stopped in an approval-pending state; do not
+    /// spawn, report `AwaitingApproval` to the caller.
+    AwaitingApproval,
+    /// A live LOCK is held: another invocation owns the session.
+    Busy,
+}
+
+/// Classify a session directory's state before deciding whether to
+/// spawn. An existing session is reusable only when idle and not
+/// holding a live LOCK; a session stopped at an approval-pending
+/// state must not receive a new prompt.
+pub(crate) fn preflight(dir_exists: bool, lock: LockStatus, pending_exists: bool) -> Preflight {
+    if !dir_exists {
+        return Preflight::Spawn;
     }
-    let mut done: std::collections::HashMap<String, SubagentStatus> =
-        std::collections::HashMap::new();
-    for name in &not_found {
-        done.insert(
-            name.clone(),
-            SubagentStatus {
-                session_name: name.clone(),
-                state: SubagentState::NotFound,
-                content: String::new(),
-            },
-        );
+    if matches!(lock, LockStatus::PidAlive(_)) {
+        return Preflight::Busy;
     }
-    while done.len() < session_names.len() {
-        let mut made_progress = false;
-        for name in &polling {
-            if done.contains_key(name) {
-                continue;
-            }
-            let dir = session_dir(name);
-            let lock = inspect_lock(&dir.join("LOCK"));
-            if matches!(lock, LockStatus::PidAlive(_)) {
-                continue;
-            }
-            let pending_exists = dir.join("pending.json").try_exists().unwrap_or(false);
-            let records =
-                read_conversation_records(&dir.join("conversation.jsonl")).unwrap_or_default();
-            let latest_end_reason = latest_invocation_end_reason(&records);
-            let state = classify_state(pending_exists, latest_end_reason);
-            let content = pick_last_content(&records);
-            done.insert(
-                name.clone(),
-                SubagentStatus {
-                    session_name: name.clone(),
-                    state,
-                    content,
-                },
-            );
-            made_progress = true;
-        }
-        if !made_progress && done.len() < session_names.len() {
-            thread::sleep(POLL_INTERVAL);
-        }
+    if pending_exists {
+        return Preflight::AwaitingApproval;
     }
-    session_names
-        .iter()
-        .map(|n| done.remove(n).expect("every requested name was resolved"))
-        .collect()
+    Preflight::Spawn
 }
 
 fn resolve_session_name(supplied: Option<&str>) -> Result<String, SubagentError> {
@@ -266,14 +233,12 @@ fn resolve_session_name(supplied: Option<&str>) -> Result<String, SubagentError>
             return Ok(candidate);
         }
     }
-    Err(SubagentError::AlreadyExists {
-        session_name: "<auto-generated>".to_string(),
-    })
+    Err(SubagentError::NameGenerationExhausted)
 }
 
 /// `subagent-{YYYYMMDD-HHMMSS}-{6 hex}`. Uses `subsec_nanos()` &
-/// `0xFF_FF_FF` as the hex source; the `spawn` retry loop rerolls
-/// on collision so the granularity is coarse enough to only rely on
+/// `0xFF_FF_FF` as the hex source; the retry loop rerolls on
+/// collision so the granularity is coarse enough to only rely on
 /// a handful of retries in the worst case.
 fn generate_auto_name() -> String {
     let now = SystemTime::now()
@@ -311,33 +276,6 @@ fn unix_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     (y as u32, m, d, h, mi, s)
 }
 
-fn pre_create_session_dir(name: &str) -> Result<(), SubagentError> {
-    fs::create_dir_all(session_root())?;
-    match fs::create_dir(session_dir(name)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(SubagentError::AlreadyExists {
-            session_name: name.to_string(),
-        }),
-        Err(e) => Err(SubagentError::Io(e)),
-    }
-}
-
-fn wait_for_lock_acquisition(name: &str) -> Result<(), SubagentError> {
-    let deadline = Instant::now() + SPAWN_STARTUP_TIMEOUT;
-    let lock_path = session_dir(name).join("LOCK");
-    loop {
-        if matches!(inspect_lock(&lock_path), LockStatus::PidAlive(_)) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(SubagentError::StartupTimeout {
-                session_name: name.to_string(),
-            });
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-}
-
 fn session_dir(name: &str) -> PathBuf {
     session_root().join(name)
 }
@@ -351,20 +289,24 @@ fn latest_invocation_end_reason(records: &[SessionRecord]) -> Option<InvocationE
     None
 }
 
-/// Decision table from the polished issue: pending.json existence
-/// combined with the latest InvocationEnd.reason picks one of the
-/// four terminal states (`NotFound` is set upstream in `wait`).
+/// Decision table for the terminal state: `pending.json` existence
+/// combined with the latest `InvocationEnd` reason and the child's
+/// exit status. A `Completed` reason with a non-zero exit is treated
+/// as a crash (the record and the process disagreed).
 pub(crate) fn classify_state(
     pending_exists: bool,
     latest_end_reason: Option<InvocationEndReason>,
+    exit_success: bool,
 ) -> SubagentState {
     if pending_exists {
         return SubagentState::AwaitingApproval;
     }
     match latest_end_reason {
-        Some(InvocationEndReason::Completed) => SubagentState::Completed,
-        Some(InvocationEndReason::Error) => SubagentState::Error,
-        Some(InvocationEndReason::SessionToolCallExhausted) => SubagentState::Error,
+        Some(InvocationEndReason::Completed) if exit_success => SubagentState::Completed,
+        Some(InvocationEndReason::Completed) => SubagentState::Crashed,
+        Some(InvocationEndReason::Error) | Some(InvocationEndReason::SessionToolCallExhausted) => {
+            SubagentState::Error
+        }
         // `AwaitingApproval` reason without pending.json means the
         // invariant broke somewhere. Treat it as a crash so the
         // parent can retry or surface it to the user.
@@ -398,56 +340,100 @@ pub(crate) fn pick_last_content(records: &[SessionRecord]) -> String {
     String::new()
 }
 
-/// Compose a shell command by POSIX-single-quoting each argv element
-/// and joining with spaces. Every element goes through
-/// [`shell_single_quote`], which always wraps in single quotes and
-/// escapes interior quotes with the `'\''` sequence, so the output
-/// is safe to hand to a shell's `-c` no matter what characters the
-/// arguments contain.
-pub(crate) fn quote_shell_command(argv: &[&str]) -> String {
-    argv.iter()
-        .map(|a| shell_single_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // preflight
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn preflight_fresh_session_spawns() {
+        assert_eq!(preflight(false, LockStatus::None, false), Preflight::Spawn);
+    }
+
+    #[test]
+    fn preflight_idle_existing_session_spawns() {
+        assert_eq!(preflight(true, LockStatus::None, false), Preflight::Spawn);
+        assert_eq!(
+            preflight(true, LockStatus::PidDead, false),
+            Preflight::Spawn
+        );
+        assert_eq!(
+            preflight(true, LockStatus::Corrupted, false),
+            Preflight::Spawn
+        );
+    }
+
+    #[test]
+    fn preflight_live_lock_is_busy() {
+        assert_eq!(
+            preflight(true, LockStatus::PidAlive(42), false),
+            Preflight::Busy
+        );
+        assert_eq!(
+            preflight(true, LockStatus::PidAlive(42), true),
+            Preflight::Busy
+        );
+    }
+
+    #[test]
+    fn preflight_pending_without_live_lock_awaits_approval() {
+        assert_eq!(
+            preflight(true, LockStatus::None, true),
+            Preflight::AwaitingApproval
+        );
+    }
 
     // -----------------------------------------------------------------
     // classify_state
     // -----------------------------------------------------------------
 
     #[test]
-    fn classify_pending_wins_over_reason() {
+    fn classify_pending_wins_over_reason_and_exit() {
         assert_eq!(
-            classify_state(true, Some(InvocationEndReason::Completed)),
+            classify_state(true, Some(InvocationEndReason::Completed), true),
             SubagentState::AwaitingApproval
         );
         assert_eq!(
-            classify_state(true, Some(InvocationEndReason::Error)),
+            classify_state(true, Some(InvocationEndReason::Error), false),
             SubagentState::AwaitingApproval
         );
-        assert_eq!(classify_state(true, None), SubagentState::AwaitingApproval);
+        assert_eq!(
+            classify_state(true, None, false),
+            SubagentState::AwaitingApproval
+        );
     }
 
     #[test]
-    fn classify_completed_maps_to_completed() {
+    fn classify_completed_with_clean_exit_is_completed() {
         assert_eq!(
-            classify_state(false, Some(InvocationEndReason::Completed)),
+            classify_state(false, Some(InvocationEndReason::Completed), true),
             SubagentState::Completed
+        );
+    }
+
+    #[test]
+    fn classify_completed_with_bad_exit_is_crashed() {
+        assert_eq!(
+            classify_state(false, Some(InvocationEndReason::Completed), false),
+            SubagentState::Crashed
         );
     }
 
     #[test]
     fn classify_error_and_exhausted_collapse_to_error() {
         assert_eq!(
-            classify_state(false, Some(InvocationEndReason::Error)),
+            classify_state(false, Some(InvocationEndReason::Error), false),
             SubagentState::Error
         );
         assert_eq!(
-            classify_state(false, Some(InvocationEndReason::SessionToolCallExhausted)),
+            classify_state(
+                false,
+                Some(InvocationEndReason::SessionToolCallExhausted),
+                false
+            ),
             SubagentState::Error
         );
     }
@@ -455,14 +441,15 @@ mod tests {
     #[test]
     fn classify_awaiting_without_pending_is_crashed() {
         assert_eq!(
-            classify_state(false, Some(InvocationEndReason::AwaitingApproval)),
+            classify_state(false, Some(InvocationEndReason::AwaitingApproval), true),
             SubagentState::Crashed
         );
     }
 
     #[test]
     fn classify_no_invocation_end_is_crashed() {
-        assert_eq!(classify_state(false, None), SubagentState::Crashed);
+        assert_eq!(classify_state(false, None, true), SubagentState::Crashed);
+        assert_eq!(classify_state(false, None, false), SubagentState::Crashed);
     }
 
     // -----------------------------------------------------------------
@@ -511,52 +498,6 @@ mod tests {
         // ones have content, we honor the "latest" rule.
         let records = vec![assistant("older", None), assistant("", None)];
         assert_eq!(pick_last_content(&records), "");
-    }
-
-    // -----------------------------------------------------------------
-    // quote_shell_command
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn quote_shell_command_wraps_each_argv_element() {
-        assert_eq!(
-            quote_shell_command(&["attini", "agent", "-s", "test", "hello"]),
-            "'attini' 'agent' '-s' 'test' 'hello'"
-        );
-    }
-
-    #[test]
-    fn quote_shell_command_handles_metacharacters() {
-        // Verify that a full alphabet of shell hazards survives
-        // round-tripping through a shell's word splitter.
-        let raw = vec!["a b", "$FOO", "`cmd`", "\\", "\"quoted\"", "'single'"];
-        let escaped = quote_shell_command(&raw);
-        // The naive property: the escape function's output must
-        // interpolate literally under sh word splitting. We assert
-        // that each escaped token, on its own, contains the raw
-        // characters verbatim between the outermost quotes.
-        for raw_token in &raw {
-            // Interior single quotes are the tricky case; other
-            // metacharacters must appear literally inside the outer
-            // '...' block.
-            if !raw_token.contains('\'') {
-                assert!(
-                    escaped.contains(&format!("'{raw_token}'")),
-                    "token {raw_token:?} not in {escaped}"
-                );
-            }
-        }
-        // Interior single quote uses the '\'' bounce escape.
-        assert!(
-            escaped.contains(r#"'single'\''single'\'''"#)
-                || escaped.contains(r#"''\''single'\'''"#),
-            "single-quote escape missing in {escaped}"
-        );
-    }
-
-    #[test]
-    fn quote_shell_command_wraps_empty_string() {
-        assert_eq!(quote_shell_command(&[""]), "''");
     }
 
     // -----------------------------------------------------------------

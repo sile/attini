@@ -261,8 +261,7 @@ struct ToolCallCounts {
     patch: u64,
     command: u64,
     skill_load: u64,
-    subagent_start: u64,
-    subagent_wait: u64,
+    subagent_run: u64,
     unknown: u64,
 }
 
@@ -274,8 +273,7 @@ impl ToolCallCounts {
             + self.patch
             + self.command
             + self.skill_load
-            + self.subagent_start
-            + self.subagent_wait
+            + self.subagent_run
             + self.unknown
     }
 }
@@ -430,14 +428,10 @@ fn absorb_metrics_line(
                 .tool_calls
                 .skill_load
                 .saturating_add(get("tool_calls.skill_load")?);
-            agg.tool_calls.subagent_start = agg
+            agg.tool_calls.subagent_run = agg
                 .tool_calls
-                .subagent_start
-                .saturating_add(get("tool_calls.subagent_start")?);
-            agg.tool_calls.subagent_wait = agg
-                .tool_calls
-                .subagent_wait
-                .saturating_add(get("tool_calls.subagent_wait")?);
+                .subagent_run
+                .saturating_add(get("tool_calls.subagent_run")?);
             agg.tool_calls.unknown = agg
                 .tool_calls
                 .unknown
@@ -520,15 +514,14 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
     println!("  tool_calls: {} total", mx.tool_calls.total());
     println!(
         "    list={}  read={}  search={}  patch={}  command={}  skill_load={}  \
-         subagent_start={}  subagent_wait={}  unknown={}",
+         subagent_run={}  unknown={}",
         mx.tool_calls.list,
         mx.tool_calls.read,
         mx.tool_calls.search,
         mx.tool_calls.patch,
         mx.tool_calls.command,
         mx.tool_calls.skill_load,
-        mx.tool_calls.subagent_start,
-        mx.tool_calls.subagent_wait,
+        mx.tool_calls.subagent_run,
         mx.tool_calls.unknown,
     );
     println!("    errors={}", mx.tool_errors);
@@ -860,8 +853,7 @@ impl DisplayJson for ToolCallsByKindJson<'_> {
             f.member("patch", self.0.patch)?;
             f.member("command", self.0.command)?;
             f.member("skill_load", self.0.skill_load)?;
-            f.member("subagent_start", self.0.subagent_start)?;
-            f.member("subagent_wait", self.0.subagent_wait)?;
+            f.member("subagent_run", self.0.subagent_run)?;
             f.member("unknown", self.0.unknown)
         })
     }
@@ -1459,11 +1451,10 @@ mod tests {
             patch: 4,
             command: 5,
             skill_load: 6,
-            subagent_start: 7,
-            subagent_wait: 8,
+            subagent_run: 7,
             unknown: 9,
         };
-        assert_eq!(counts.total(), 45);
+        assert_eq!(counts.total(), 37);
     }
 
     #[test]

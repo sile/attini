@@ -30,7 +30,7 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 fn chat_completions_url(base: Option<&str>) -> Result<String, io::Error> {
     let raw = match base {
         None => DEFAULT_BASE_URL,
-        Some(s) if s.is_empty() => {
+        Some("") => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("{BASE_URL_ENV} is empty"),
@@ -320,9 +320,7 @@ impl Assembly {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        chat_completions_url, extract_api_error_message, format_curl_failure,
-    };
+    use super::{chat_completions_url, extract_api_error_message, format_curl_failure};
 
     #[test]
     fn default_base_url_appends_chat_completions() {
