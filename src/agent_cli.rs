@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use nojson::DisplayJson;
@@ -1634,13 +1634,10 @@ fn run_command_sync(
 ) -> Result<String, CommandError> {
     let started = Instant::now();
     // argv is guaranteed non-empty by CommandInvocation::parse.
-    let output = Command::new(&inv.argv[0])
-        .args(&inv.argv[1..])
-        .current_dir(executor.root())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| CommandError::SpawnFailed {
+    let mut cmd = Command::new(&inv.argv[0]);
+    cmd.args(&inv.argv[1..]).current_dir(executor.root());
+    let output =
+        crate::child_output::run_streamed(&mut cmd).map_err(|e| CommandError::SpawnFailed {
             message: e.to_string(),
         })?;
     let elapsed = started.elapsed();
@@ -1650,8 +1647,8 @@ fn run_command_sync(
         "signaled"
     };
     Ok(command_result_json(
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
+        &output.stdout,
+        &output.stderr,
         output.status.code(),
         termination_reason,
         elapsed,
@@ -2094,5 +2091,34 @@ mod tests {
     fn pick_summary_text_returns_none_when_reasoning_is_none() {
         let r = call_result("", None);
         assert_eq!(pick_summary_text(&r), None);
+    }
+
+    // -----------------------------------------------------------------
+    // command_result_json
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn command_result_json_keeps_full_output_text() {
+        let stdout = "line 1\nline 2\n".repeat(200);
+        let stderr = "warning: something\n".repeat(50);
+        let json = command_result_json(
+            &stdout,
+            &stderr,
+            Some(1),
+            "exited",
+            Duration::from_millis(123),
+        );
+        assert!(json.contains("\"stdout\":\"line 1\\nline 2\\n"));
+        assert!(json.contains("\"stderr\":\"warning: something\\n"));
+        assert!(json.contains("\"exit_code\":1"));
+        assert!(json.contains("\"termination_reason\":\"exited\""));
+        assert!(json.contains("\"duration_ms\":123"));
+    }
+
+    #[test]
+    fn command_result_json_roundtrips_no_exit_code() {
+        let json = command_result_json("out", "", None, "signaled", Duration::ZERO);
+        assert!(json.contains("\"exit_code\":null"));
+        assert!(json.contains("\"termination_reason\":\"signaled\""));
     }
 }
