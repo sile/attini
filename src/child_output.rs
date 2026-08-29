@@ -103,6 +103,36 @@ pub fn finish_line(status: &ExitStatus, duration: Duration) -> String {
     )
 }
 
+/// Run `cmd` with stdout piped and streamed to the parent stderr under
+/// the rate limit (with the same colouring and `[child]` separators as
+/// [`run_streamed`]), while stderr is inherited raw from the parent.
+/// The streamed stdout is not accumulated. Blocks until the child
+/// exits and its stdout is drained, and returns the exit status.
+///
+/// This is the subagent variant: the child's stderr (warnings, command
+/// logs) passes straight through to the terminal without rate limiting
+/// or colouring, while its stdout (the model's streaming progress) is
+/// shown as a secondary, rate-limited copy.
+pub fn run_streaming_stdout(cmd: &mut Command) -> io::Result<ExitStatus> {
+    let started = Instant::now();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let color = io::stderr().is_terminal();
+    eprintln!("{}", start_line(pid));
+
+    let stdout = child.stdout.take();
+    let stdout_thread = stdout.map(|reader| {
+        let limiter = DisplayRateLimiter::new_per_second();
+        thread::spawn(move || pump(reader, StreamKind::Stdout, color, limiter))
+    });
+
+    let status = child.wait()?;
+    let _ = join_pump(stdout_thread)?;
+    eprintln!("{}", finish_line(&status, started.elapsed()));
+    Ok(status)
+}
+
 fn join_pump(handle: Option<thread::JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
     match handle {
         Some(h) => h
@@ -289,6 +319,25 @@ mod tests {
         cmd.arg("-c").arg("exit 3");
         let out = run_streamed(&mut cmd).expect("run");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    #[test]
+    fn run_streaming_stdout_returns_child_status() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'streamed\\n'; exit 7");
+        let status = run_streaming_stdout(&mut cmd).expect("run");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn run_streaming_stdout_completes_with_large_output() {
+        // The streamed stdout is discarded, so a large burst must not
+        // block on a full pipe (readers drain it continuously).
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 1048576 /dev/zero | tr '\\0' 'x'; exit 0");
+        let status = run_streaming_stdout(&mut cmd).expect("run");
+        assert!(status.success());
     }
 
     // -----------------------------------------------------------------

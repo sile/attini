@@ -6,7 +6,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sansio::permissions::Mode;
@@ -165,9 +165,7 @@ pub fn run(
         .arg(model)
         .arg("-s")
         .arg(&session_name)
-        .env("ATTINI_IS_SUBAGENT", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .env("ATTINI_IS_SUBAGENT", "1");
     match mode {
         Mode::Planning => {
             cmd.env("ATTINI_PLANNING_MODE", "1");
@@ -182,8 +180,14 @@ pub fn run(
             .env("ATTINI_PLAN_SHA256", &approved.plan_sha256);
     }
     cmd.arg(prompt);
-    let status = cmd.status().map_err(|e| SubagentError::SpawnFailed {
-        message: e.to_string(),
+    // The child's stdout (its streaming model progress) is piped and
+    // displayed to the parent stderr under the shared rate limit;
+    // its stderr is inherited raw. The tool result content still comes
+    // from the child session's conversation, not from this stream.
+    let status = crate::child_output::run_streaming_stdout(&mut cmd).map_err(|e| {
+        SubagentError::SpawnFailed {
+            message: e.to_string(),
+        }
     })?;
     let exit_success = status.success();
 
