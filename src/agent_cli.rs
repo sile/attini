@@ -45,15 +45,15 @@ pub struct Counters {
     pub completion_tokens_total: u64,
     pub prompt_cache_hit_tokens_total: u64,
     pub prompt_cache_miss_tokens_total: u64,
-    /// `try_auto_compact` が `compact_conversation` を呼んだ回数
-    /// (threshold 超え発火の総数; 内部で skip / summariser 成功 /
-    /// 各種 `Err` のいずれに転んでも 1 とカウントする). Manual
-    /// `attini session compact` は `Counters` を持たないため
-    /// この counter には載らない。
+    /// Number of times `try_auto_compact` invoked `compact_conversation`.
+    /// (Total number of times it fired past the threshold; counted as 1
+    /// whether it ends in an internal skip, a summariser success, or any
+    /// of the various `Err` outcomes.) Manual `attini session compact`
+    /// does not hold `Counters`, so it is not recorded here.
     pub compaction_attempts: u64,
-    /// `compact_conversation` が `Err` を返した回数
-    /// (`load_records_since_last_summary` / `run_summariser` /
-    /// `session.append` の `?` 経由 `Err` を合算)。
+    /// Number of times `compact_conversation` returned `Err`.
+    /// (Aggregates `Err` arising from `load_records_since_last_summary`,
+    /// `run_summariser`, or the `?` in `session.append`.)
     pub compaction_failures: u64,
     /// Number of plans created by `submit_plan` in this invocation.
     pub plan_created: u64,
