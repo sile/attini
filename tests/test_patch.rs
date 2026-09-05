@@ -395,12 +395,17 @@ fn layer1_rejects_syntactic_bypass_variants_of_git_metadata() {
     // workspace-relative path as `.git/HEAD`. Layer 1 matches on
     // canonical form and must reject all three.
     let root = TempRoot::new("layer1-syntactic");
-    root.write(".git/HEAD", b"ref\n");
-    // Some other file exists so `x/../.git/HEAD` has a real
-    // intermediate component to traverse through.
-    root.write("noise.txt", b"x");
+    // `.git/HEAD` is created by `git init` inside `exec_with_git`,
+    // so do NOT write it here: the Update's `before` is irrelevant
+    // because Layer 1 rejects before any content match, and writing
+    // git's HEAD corrupts the repo (spurious "not a git
+    // repository").
+    // `noise-dir/` is a real directory so `..` can traverse through
+    // the intermediate component (a file would make canonicalise
+    // fail with ENOTDIR → UpdateOnMissingFile).
+    fs::create_dir_all(root.path().join("noise-dir")).expect("mkdir noise-dir");
     let executor = exec_with_git(&root, &[]);
-    for variant in [".git/HEAD", "./.git/HEAD", "noise.txt/../.git/HEAD"] {
+    for variant in [".git/HEAD", "./.git/HEAD", "noise-dir/../.git/HEAD"] {
         let err = executor
             .preview_patch(&inv(vec![update(variant, "ref\n", "hijack\n")]))
             .expect_err("reject");

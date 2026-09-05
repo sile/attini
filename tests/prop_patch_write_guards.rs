@@ -107,9 +107,10 @@ fn mangle_syntactic(ctx: &mut noprop::TestCaseContext, base: &str) -> String {
         "detour" => {
             // Insert `noise/../` early in the path. The first
             // segment must exist as a directory for `..` to bounce
-            // through — we use the workspace root itself, so the
-            // detour is `<seed-dir>/../<base>`.
-            format!("seed.md/../{base}")
+            // through — we reuse the `.attini` metadata dir (always
+            // present with an open session), so the detour is
+            // `.attini/../<base>`.
+            format!(".attini/../{base}")
         }
         _ => base.to_string(),
     }
@@ -185,11 +186,16 @@ fn prop_layer1_syntactic_variants_all_reject() -> noprop::RunResult {
         // canonicalisation succeeds and the check reaches Layer 1
         // (otherwise `resolve_within` fails first at IoError →
         // UpdateOnMissingFile, which would mask the property).
+        //
+        // `.git/HEAD` is created by `git init` above and is already
+        // present (content is irrelevant: Layer 1 rejects it before
+        // any Update content match), so it must NOT be overwritten
+        // here — doing so corrupts the repo and produces a spurious
+        // "not a git repository" proxy state.
         fs::create_dir_all(ws.root().join(".git/hooks")).expect("git dir");
         fs::create_dir_all(ws.root().join(".attini/test")).expect("session dir");
         fs::create_dir_all(ws.root().join(".attini/other")).expect("other session dir");
         for f in [
-            ".git/HEAD",
             ".git/hooks/pre-commit",
             ".attini/test/LOCK",
             ".attini/test/conversation.jsonl",
