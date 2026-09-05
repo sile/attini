@@ -3983,7 +3983,10 @@ mod tests {
         assert_eq!(inv.inner.body_markdown, "plan body");
         assert_eq!(inv.inner.confirmations.len(), 1);
         assert_eq!(inv.inner.confirmations[0].id, "migration");
-        assert_eq!(inv.inner.commands[0].argv, vec!["cargo".to_string(), "test".to_string()]);
+        assert_eq!(
+            inv.inner.commands[0].argv,
+            vec!["cargo".to_string(), "test".to_string()]
+        );
     }
 
     #[test]
@@ -3991,7 +3994,10 @@ mod tests {
         let json = r#"{"body_markdown":"   "}"#;
         let err = PlanProposeInvocation::parse(json).unwrap_err();
         let msg = format!("{err:?}");
-        assert!(msg.contains("plan:"), "expected a `plan:` prefix, got: {msg}");
+        assert!(
+            msg.contains("plan:"),
+            "expected a `plan:` prefix, got: {msg}"
+        );
         assert!(!msg.contains("submit_plan"), "stale prefix leaked: {msg}");
     }
 }

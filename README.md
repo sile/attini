@@ -67,6 +67,18 @@ attini chat [--model NAME] [--system TEXT] [--show-reasoning] "<PROMPT>"
 
 Streams the response to stdout. The tool loop is not run.
 
+### Agent CLI (`attini agent`)
+
+```sh
+attini agent [--reference PATH ...] [--skill NAME] [--read-path PATH ...] "<PROMPT>"
+```
+
+`--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
+UTF-8 file into the system prompt before the first turn, so context is present
+without a `read` round-trip. Relative paths resolve against the workspace root.
+Files larger than 32 KiB are not inlined; instead they are granted as extra read
+roots and referenced by absolute path (readable with the `read` tool).
+
 ### Model selection
 
 - Default model: `deepseek-v4-flash` (override with `--model`)

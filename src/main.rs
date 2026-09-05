@@ -134,6 +134,25 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         let s: String = taken.then(|o| o.value().parse())?;
         read_paths.push(std::path::PathBuf::from(s));
     }
+    // --reference is repeatable; same loop pattern as --read-path.
+    let mut reference_paths: Vec<std::path::PathBuf> = Vec::new();
+    loop {
+        let taken = noargs::opt("reference")
+            .short('r')
+            .ty("PATH")
+            .doc(
+                "File whose contents are inlined into the system prompt before the first turn. \
+                 Repeatable. Relative paths resolve against the workspace root. Files larger \
+                 than 32 KiB are not inlined; they are granted as read roots and referenced \
+                 by absolute path instead.",
+            )
+            .take(args);
+        if !taken.is_present() {
+            break;
+        }
+        let s: String = taken.then(|o| o.value().parse())?;
+        reference_paths.push(std::path::PathBuf::from(s));
+    }
     let turn_tool_call_limit: usize = noargs::opt("turn-tool-call-limit")
         .ty("N")
         .doc(
@@ -272,6 +291,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         max_turns: DEFAULT_MAX_TURNS,
         mode,
         extra_read_paths_cli: read_paths,
+        reference_paths,
         turn_tool_call_limit,
         tool_call_rate,
         session_tool_call_max,
