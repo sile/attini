@@ -626,6 +626,57 @@ impl SubmitPlanInvocation {
     }
 }
 
+/// A non-terminal `plan` tool exposed in normal (non-planning)
+/// sessions. The model drafts a sealed plan artifact for a change
+/// that spans multiple `patch` calls or also needs `command` steps.
+/// A human approves it with `attini plan ok <file>` and runs it with
+/// `attini plan run <file>`. Unlike [`SubmitPlanInvocation`], calling
+/// this tool does NOT end the invocation. It is a suggestion for
+/// larger changes; if the change must be iterated step-by-step on
+/// intermediate results, the model should keep using `patch` /
+/// `command` directly instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanProposeInvocation {
+    pub inner: SubmitPlanInvocation,
+}
+
+impl PlanProposeInvocation {
+    pub fn definition() -> ToolDef {
+        ToolDef {
+            name: "plan".to_string(),
+            description: "Draft a plan for a change that spans multiple `patch` calls or \
+                 also needs `command` steps, and write it as a sealed Markdown plan file \
+                 under the session's plans directory. A human must approve it with \
+                 `attini plan ok <file>` before it can be run with `attini plan run <file>`. \
+                 Use this when a change is too large to complete as a single patch/command \
+                 sequence. This does NOT end the invocation, and is a suggestion, not a \
+                 mandate: if the change must be iterated step-by-step on intermediate \
+                 results, keep using `patch`/`command` directly."
+                .to_string(),
+            parameters_json: SUBMIT_PLAN_PARAMS_SCHEMA.to_string(),
+        }
+    }
+
+    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
+        match SubmitPlanInvocation::parse(arguments_json) {
+            Ok(inner) => Ok(Self { inner }),
+            Err(err) => Err(rename_plan_error(err)),
+        }
+    }
+}
+
+/// Rewrite `submit_plan`-prefixed argument errors to `plan` so the
+/// model sees a consistent tool name when `plan` reuses the shared
+/// [`SubmitPlanInvocation`] validation.
+fn rename_plan_error(err: ToolExecutionError) -> ToolExecutionError {
+    match err {
+        ToolExecutionError::ArgumentsParseFailed(msg) => {
+            ToolExecutionError::ArgumentsParseFailed(msg.replace("submit_plan", "plan"))
+        }
+        other => other,
+    }
+}
+
 fn check_plan_id(
     id: &str,
     kind: &str,
@@ -3920,5 +3971,27 @@ mod tests {
     fn submit_plan_rejects_duplicate_command_argv() {
         let json = r#"{"body_markdown":"b","commands":[{"id":"a","argv":["ls"],"description":"c1"},{"id":"b","argv":["ls"],"description":"c2"}]}"#;
         assert!(SubmitPlanInvocation::parse(json).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // PlanProposeInvocation (non-terminal `plan` tool)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn plan_propose_parses_valid_arguments() {
+        let inv = PlanProposeInvocation::parse(&valid_submit_json()).expect("parse");
+        assert_eq!(inv.inner.body_markdown, "plan body");
+        assert_eq!(inv.inner.confirmations.len(), 1);
+        assert_eq!(inv.inner.confirmations[0].id, "migration");
+        assert_eq!(inv.inner.commands[0].argv, vec!["cargo".to_string(), "test".to_string()]);
+    }
+
+    #[test]
+    fn plan_propose_rewrites_error_prefix_to_plan() {
+        let json = r#"{"body_markdown":"   "}"#;
+        let err = PlanProposeInvocation::parse(json).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("plan:"), "expected a `plan:` prefix, got: {msg}");
+        assert!(!msg.contains("submit_plan"), "stale prefix leaked: {msg}");
     }
 }

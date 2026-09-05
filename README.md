@@ -79,9 +79,28 @@ Streams the response to stdout. The tool loop is not run.
 | `read` | Read a UTF-8 text file | Up to 1 MiB; optional `line_range` |
 | `search` | Literal substring search (no regex) | `max_results` limit (default 50) |
 | `patch` | Batch of add / unique-replacement edits | Preview + approval before applying; `before` must match exactly once; workspace-boundary check |
+| `plan` | Draft a sealed Markdown plan for a change spanning multiple `patch` calls or also needing `command` steps | Non-terminal; written to `.attini/<session>/plans/`; a human must `attini plan ok` then `attini plan run` |
 
 `patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
 after approval.
+
+## Plans
+
+In a normal (non-planning) session, the `plan` tool drafts a sealed Markdown plan for
+a change that spans multiple `patch` calls or also needs `command` steps, and writes it
+under the session's `plans/` directory (for example `.attini/<session>/plans/plan-<ts>-<attempt>.md`).
+It does not end the invocation and is a suggestion, not a mandate — if the change must
+be iterated step-by-step on intermediate results, keep using `patch`/`command` directly.
+A human must approve the plan before it can be executed:
+
+```sh
+attini plan ok <PLAN.md>
+attini plan run [--session NAME] <PLAN.md>
+```
+
+`attini plan create` runs a dedicated planning session that ends with the `submit_plan`
+tool instead; see `attini plan --help` for the full `create`/`check`/`ok`/`run`/`close`
+family.
 
 ## Environment variables
 

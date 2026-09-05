@@ -13,9 +13,9 @@ use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::plan::ApprovedPlan;
 use crate::sansio::agent::{
-    CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
-    SkillLoadInvocation, SubagentRunInvocation, SubmitPlanInvocation, ToolExecutionError,
-    ToolOutcome,
+    CommandError, CommandInvocation, PatchInvocation, PatchPreview, PlanProposeInvocation,
+    ReadOnlyTool, SkillLoadInvocation, SubagentRunInvocation, SubmitPlanInvocation,
+    ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
@@ -654,6 +654,9 @@ fn drive(
                         return Ok(Driven::PlanSubmitted(path));
                     }
                 }
+                ToolKind::Plan => {
+                    run_plan_propose(tc, session, &mut messages, counters)?;
+                }
                 ToolKind::Unknown => {
                     let content = tool_error_json(
                         "unknown_tool",
@@ -903,6 +906,47 @@ fn run_submit_plan(
         )));
     }
 
+    write_plan_from_invocation(&inv, output, session, messages, &tc.id, counters)?;
+    Ok(Some(output.clone()))
+}
+
+/// Non-terminal `plan` tool dispatcher. Writes a sealed plan artifact
+/// under the session's `plans/` directory (auto-named, O_EXCL) and
+/// returns without ending the invocation.
+fn run_plan_propose(
+    tc: &ToolCall,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+    counters: &mut Counters,
+) -> io::Result<()> {
+    let inv = match SubmitPlanInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            counters.tool_errors += 1;
+            eprintln!("[plan] parse err: {err:?}");
+            let content = tool_error_json_from(&err);
+            append_tool(session, messages, &tc.id, content)?;
+            return Ok(());
+        }
+    };
+    let output = next_plan_output(session.dir())?;
+    write_plan_from_invocation(&inv, &output, session, messages, &tc.id, counters)?;
+    Ok(())
+}
+
+/// Render a [`SubmitPlanInvocation`] into a sealed plan file at
+/// `output` (O_EXCL, refusing overwrite), then append the
+/// `PlanCreated` record and a tool result to the conversation.
+/// Shared by the terminal `submit_plan` tool and the non-terminal
+/// `plan` proposal tool.
+fn write_plan_from_invocation(
+    inv: &SubmitPlanInvocation,
+    output: &std::path::Path,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+    tool_id: &str,
+    counters: &mut Counters,
+) -> io::Result<()> {
     let mut confirmations: Vec<crate::plan::Confirmation> =
         Vec::with_capacity(inv.confirmations.len() + 1);
     confirmations.push(crate::plan::Confirmation::unchecked(
@@ -940,7 +984,7 @@ fn run_submit_plan(
         crate::plan::seal_hash(text.as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
 
     write_plan_atomic(output, text.as_bytes())?;
-    eprintln!("[submit_plan] wrote {}", output.display());
+    eprintln!("[plan] wrote {}", output.display());
 
     session.append(&SessionRecord::PlanCreated {
         ts: now_unix_millis(),
@@ -948,9 +992,24 @@ fn run_submit_plan(
         plan_sha256: plan_sha256.clone(),
     })?;
     let result = plan_result_json(output, &plan_sha256);
-    append_tool(session, messages, &tc.id, result)?;
+    append_tool(session, messages, tool_id, result)?;
     counters.plan_created += 1;
-    Ok(Some(output.clone()))
+    Ok(())
+}
+
+/// Pick a fresh `plans/plan-<ts>-<attempt>.md` path under the session
+/// directory, creating the directory if needed.
+fn next_plan_output(session_dir: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    let dir = session_dir.join("plans");
+    std::fs::create_dir_all(&dir)?;
+    let ts = now_unix_millis();
+    for attempt in 0..200u32 {
+        let path = dir.join(format!("plan-{ts:016x}-{attempt:04x}.md"));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::other("could not allocate a unique plan filename"))
 }
 
 /// Atomically write `bytes` to `path`, failing if the path already
@@ -1155,6 +1214,7 @@ fn build_tool_defs(mode: Mode, subagent_available: bool) -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
     if !matches!(mode, Mode::Planning) {
         defs.push(PatchInvocation::definition());
+        defs.push(PlanProposeInvocation::definition());
     }
     defs.push(CommandInvocation::definition());
     defs.push(SkillLoadInvocation::definition());
@@ -1527,6 +1587,7 @@ enum ToolKind {
     Skill,
     SubagentRun,
     SubmitPlan,
+    Plan,
     Unknown,
 }
 
@@ -1538,6 +1599,7 @@ fn classify(name: &str) -> ToolKind {
         "skill_load" => ToolKind::Skill,
         "subagent_run" => ToolKind::SubagentRun,
         "submit_plan" => ToolKind::SubmitPlan,
+        "plan" => ToolKind::Plan,
         _ => ToolKind::Unknown,
     }
 }
@@ -2247,6 +2309,81 @@ mod tests {
         // per the order).
         gate.begin_turn();
         assert_eq!(gate.admit(now), GateDecision::SessionExhausted);
+    }
+
+    // -------------------------------------------------------------
+    // build_tool_defs: plan tool exposure
+    // -------------------------------------------------------------
+
+    #[test]
+    fn build_tool_defs_exposes_plan_only_outside_planning_mode() {
+        let normal = build_tool_defs(Mode::Default, true);
+        assert!(
+            normal.iter().any(|d| d.name == "plan"),
+            "`plan` tool missing in normal mode"
+        );
+        assert!(
+            !normal.iter().any(|d| d.name == "submit_plan"),
+            "`submit_plan` must not be exposed in normal mode"
+        );
+
+        let planning = build_tool_defs(Mode::Planning, true);
+        assert!(
+            !planning.iter().any(|d| d.name == "plan"),
+            "`plan` tool must not be exposed in planning mode"
+        );
+        assert!(
+            planning.iter().any(|d| d.name == "submit_plan"),
+            "`submit_plan` must be exposed in planning mode"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // next_plan_output / write_plan_atomic
+    // -------------------------------------------------------------
+
+    fn temp_plan_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("attini-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn write_plan_atomic_refuses_to_overwrite() {
+        let dir = temp_plan_dir("plan-ow");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.md");
+
+        write_plan_atomic(&path, b"first").unwrap();
+        assert!(path.exists());
+
+        // O_EXCL must reject a second write to the same path.
+        assert!(write_plan_atomic(&path, b"second").is_err());
+
+        // The original content is left untouched.
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_plan_output_creates_plans_dir_and_skips_existing() {
+        let dir = temp_plan_dir("plan-next");
+        let p1 = next_plan_output(&dir).unwrap();
+
+        // The session-local plans/ directory is created on demand.
+        assert!(dir.join("plans").is_dir());
+        // Allocating a path must not create the file yet.
+        assert!(!p1.exists());
+
+        write_plan_atomic(&p1, b"x").unwrap();
+
+        // A second allocation must not hand out the already-taken path.
+        let p2 = next_plan_output(&dir).unwrap();
+        assert_ne!(p1, p2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------------------------------------------------
