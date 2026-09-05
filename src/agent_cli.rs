@@ -1,6 +1,6 @@
 //! Sync single-turn agent loop for `attini agent`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -434,6 +434,22 @@ fn drive(
             counters.tool_errors += 1;
             session.clear_pending()?;
         }
+    }
+
+    // Guard against an assistant message whose tool_calls were only
+    // partially answered (e.g. an unapproved sibling left behind when
+    // the loop suspended awaiting approval). Before sending the
+    // transcript to the model, synthesize an explicit reject / cancel
+    // tool result for every unanswered tool_call so the API's
+    // `tool_calls`-must-be-answered invariant holds. This both heals
+    // the in-memory message list and persists the synthetic result to
+    // the session transcript, so the corruption does not recur on the
+    // next invocation.
+    let repaired = repair_orphaned_tool_calls(session, &mut messages)?;
+    if repaired > 0 {
+        eprintln!(
+            "[repair] inserted {repaired} synthetic tool result(s) for unanswered tool_call(s)"
+        );
     }
 
     let tools = build_tool_defs(cfg.mode, cfg.subagent_available);
@@ -1036,8 +1052,17 @@ pub fn compact_conversation(session: &mut Session, model: &str) -> io::Result<()
 }
 
 fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<String> {
+    // The records being summarised may contain an assistant message
+    // whose tool_calls are only partially answered (e.g. a session
+    // that previously suspended awaiting approval). Repair the message
+    // list in-memory before sending so the summariser request observes
+    // the same tool_call/tool invariant the main chat request does;
+    // the synthetic results do not need to be persisted because these
+    // records are about to be folded into a summary.
+    let chat_messages: Vec<ChatMessage> = records.into_iter().map(|r| r.message).collect();
+    let (chat_messages, _) = repair_messages(&chat_messages);
     let mut messages = vec![ChatMessage::System(SUMMARIZER_SYSTEM_PROMPT.to_string())];
-    messages.extend(records.into_iter().map(|r| r.message));
+    messages.extend(chat_messages);
     let request = ChatRequest::new(model.to_string(), messages);
     let mut sink = io::sink();
     let mut sinks = ProgressSinks {
@@ -1655,6 +1680,137 @@ fn run_command_sync(
     ))
 }
 
+/// A synthetic tool result that must be persisted to the session
+/// transcript and inserted into the in-memory message list because
+/// the original `tool_call` was never answered (e.g. an unapproved
+/// sibling left behind when the loop suspended awaiting approval).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrphanedToolCall {
+    call_id: String,
+    content: String,
+}
+
+/// Pure, testable core of [`repair_orphaned_tool_calls`]: scan a
+/// message list and return a repaired copy in which every assistant
+/// message's unanswered `tool_calls` get an explicit reject / cancel
+/// `tool` result inserted immediately after the assistant's existing
+/// tool results, preserving conversation order. Also returns the
+/// list of synthetic results so the caller can persist them to the
+/// session transcript.
+///
+/// An assistant message whose `tool_calls` are all answered is left
+/// untouched; an assistant with no `tool_calls` is copied verbatim.
+fn repair_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<OrphanedToolCall>) {
+    let mut repaired: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut orphans: Vec<OrphanedToolCall> = Vec::new();
+    let mut i = 0usize;
+    while i < messages.len() {
+        let assistant_calls = match &messages[i] {
+            ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                tool_calls.clone()
+            }
+            _ => {
+                repaired.push(messages[i].clone());
+                i += 1;
+                continue;
+            }
+        };
+        repaired.push(messages[i].clone());
+        i += 1;
+        // Gather the contiguous tool result messages that answer this
+        // assistant message's tool_calls. The conversation alternates
+        // assistant(tool_calls) -> tool, tool, ... so the tool results
+        // immediately follow the assistant message.
+        let mut tool_msgs: Vec<ChatMessage> = Vec::new();
+        while i < messages.len() && matches!(&messages[i], ChatMessage::Tool { .. }) {
+            tool_msgs.push(messages[i].clone());
+            i += 1;
+        }
+        let responded: BTreeSet<String> = tool_msgs
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for tc in &assistant_calls {
+            if responded.contains(&tc.id) {
+                continue;
+            }
+            let content = tool_error_json(
+                "unanswered_tool_call",
+                "this tool call was left unapproved and is cancelled before continuing",
+            );
+            orphans.push(OrphanedToolCall {
+                call_id: tc.id.clone(),
+                content: content.clone(),
+            });
+            tool_msgs.push(ChatMessage::Tool {
+                tool_call_id: tc.id.clone(),
+                content,
+            });
+        }
+        repaired.extend(tool_msgs);
+    }
+    (repaired, orphans)
+}
+
+/// Repair a transcript before it is sent to the model: for every
+/// assistant `tool_call` that has no answering `tool` result in
+/// `messages`, synthesize an explicit reject / cancel result, insert
+/// it at the correct position, and persist the corresponding
+/// `ToolApproval` / `Tool` records to `session` so the on-disk
+/// transcript is healed and the same orphan does not recur on a
+/// later invocation. If the cancelled call corresponds to a pending
+/// approval that the caller bypassed with a fresh prompt, the pending
+/// is cleared so a later `--approve` / `--reject` does not double-run
+/// it.
+///
+/// Returns the number of synthetic tool results inserted.
+fn repair_orphaned_tool_calls(
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+) -> io::Result<usize> {
+    let (repaired, orphans) = repair_messages(messages);
+    if orphans.is_empty() {
+        return Ok(0);
+    }
+    for orphan in &orphans {
+        // If the orphan is the very call that the previous invocation
+        // parked in pending.json and the caller resumed with a fresh
+        // prompt (bypassing --approve / --reject), drop the pending so
+        // a later resume does not execute the now-cancelled call.
+        if let Some(pending) = session.load_pending()?
+            && pending.call_id == orphan.call_id
+        {
+            session.clear_pending()?;
+        }
+        session.append(&SessionRecord::ToolApproval {
+            ts: now_unix_millis(),
+            call_id: orphan.call_id.clone(),
+            decision: ApprovalDecision::Reject,
+            auto_decided_by: Some(AutoDecidedBy {
+                scope: "repair".to_string(),
+                argv_prefix: Vec::new(),
+                reason: "unanswered_tool_call_repair".to_string(),
+                plan_sha256: None,
+                action_id: None,
+            }),
+        })?;
+        session.append(&SessionRecord::Tool {
+            ts: now_unix_millis(),
+            call_id: orphan.call_id.clone(),
+            content: orphan.content.clone(),
+        })?;
+        eprintln!(
+            "[repair] cancelled unanswered tool_call {} (left unapproved)",
+            orphan.call_id
+        );
+    }
+    *messages = repaired;
+    Ok(orphans.len())
+}
+
 fn append_tool(
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
@@ -2120,5 +2276,119 @@ mod tests {
         let json = command_result_json("out", "", None, "signaled", Duration::ZERO);
         assert!(json.contains("\"exit_code\":null"));
         assert!(json.contains("\"termination_reason\":\"signaled\""));
+    }
+
+    // -------------------------------------------------------------
+    // repair_messages (transcript integrity)
+    // -------------------------------------------------------------
+
+    fn assistant_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage::Assistant {
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: id.to_string(),
+                    function_name: "command".to_string(),
+                    arguments_json: "{}".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn tool_result(call_id: &str) -> ChatMessage {
+        ChatMessage::Tool {
+            tool_call_id: call_id.to_string(),
+            content: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn repair_messages_inserts_reject_for_unanswered_sibling() {
+        // assistant issues two calls; only the first is answered. The
+        // second must get a synthetic reject inserted after the first
+        // tool result, preserving order.
+        let messages = vec![
+            assistant_calls(&["call_00", "call_01"]),
+            tool_result("call_00"),
+        ];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].call_id, "call_01");
+        assert!(orphans[0].content.contains("unanswered_tool_call"));
+        // Two assistants? No: assistant + two tool messages.
+        assert_eq!(repaired.len(), 3);
+        assert!(matches!(&repaired[0], ChatMessage::Assistant { .. }));
+        match &repaired[1] {
+            ChatMessage::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, "call_00"),
+            other => panic!("expected tool call_00, got {other:?}"),
+        }
+        match &repaired[2] {
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "call_01");
+                assert!(content.contains("unanswered_tool_call"));
+            }
+            other => panic!("expected synthetic tool call_01, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_messages_leaves_complete_transcript_untouched() {
+        let messages = vec![
+            assistant_calls(&["call_00", "call_01"]),
+            tool_result("call_00"),
+            tool_result("call_01"),
+        ];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert!(orphans.is_empty());
+        assert_eq!(repaired, messages);
+    }
+
+    #[test]
+    fn repair_messages_handles_multiple_unanswered_calls() {
+        // No tool results at all: every call is answered by a synthetic
+        // reject, all inserted after the assistant message.
+        let messages = vec![assistant_calls(&["call_00", "call_01", "call_02"])];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert_eq!(orphans.len(), 3);
+        assert_eq!(repaired.len(), 4);
+        for (idx, id) in ["call_00", "call_01", "call_02"].iter().enumerate() {
+            match &repaired[idx + 1] {
+                ChatMessage::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, id),
+                other => panic!("expected tool {id}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn repair_messages_places_synthetic_before_next_user() {
+        // The synthetic reject must be inserted immediately after the
+        // assistant's tool results, before a subsequent user message.
+        let messages = vec![
+            assistant_calls(&["call_00", "call_01"]),
+            tool_result("call_00"),
+            ChatMessage::User("continue".to_string()),
+        ];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(repaired.len(), 4);
+        assert!(matches!(&repaired[2], ChatMessage::Tool { .. }));
+        assert!(matches!(&repaired[3], ChatMessage::User(_)));
+    }
+
+    #[test]
+    fn repair_messages_skips_assistant_without_tool_calls() {
+        let messages = vec![
+            ChatMessage::assistant_text("intro"),
+            assistant_calls(&["call_00"]),
+            tool_result("call_00"),
+        ];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert!(orphans.is_empty());
+        assert_eq!(repaired, messages);
     }
 }
