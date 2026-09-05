@@ -993,6 +993,49 @@ impl PatchError {
             ),
         }
     }
+
+    /// Actionable remediation advice for the model, surfaced as the
+    /// `hint` member of the tool error JSON (`null` when absent).
+    /// Returns `None` for policy/permission rejections where the only
+    /// correct move is to choose a different target (or ask the user).
+    pub fn to_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::MultipleEditsSamePath { .. } => Some(
+                "each path may appear in only one edit per call; split the edits into \
+                 separate patch calls (one per target path) or merge this path's changes \
+                 into a single update with one before/after pair",
+            ),
+            Self::NoMatch { .. } => Some(
+                "`before` is not present verbatim in the file; read the file first, then \
+                 copy an exact existing substring into `before`",
+            ),
+            Self::AmbiguousMatch { .. } => Some(
+                "`before` matched more than one place; extend `before` with surrounding \
+                 lines so it matches exactly once",
+            ),
+            Self::AddOnExistingFile { .. } => Some(
+                "path already exists; use update with a before/after pair instead of add, \
+                 or choose a different path",
+            ),
+            Self::UpdateOnMissingFile { .. } => {
+                Some("path does not exist; use add to create it, or fix the path")
+            }
+            Self::ParentDirMissing { .. } => Some(
+                "the parent directory does not exist; create it first (e.g. mkdir -p), \
+                 then retry",
+            ),
+            Self::TooManyEdits { .. } => {
+                Some("too many edits in one call; split across multiple patch calls")
+            }
+            Self::FileTooLarge { .. } => {
+                Some("content is too large; reduce it or split across multiple patch calls")
+            }
+            Self::Conflict { .. } => {
+                Some("target changed between preview and apply; re-read the file and retry")
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Failure modes specific to [`CommandInvocation`]. In-run
@@ -1096,8 +1139,10 @@ const COMMAND_TAIL_CHARS: usize = 4 * 1024;
 
 impl ToolExecutionError {
     /// Compact JSON representation suitable for a `Tool` role message
-    /// body: `{"error":"CODE","message":"..."}`. Fields are stable
-    /// enough for the model to key on.
+    /// body: `{"error":"CODE","message":"...","hint":"..."}`. `hint`
+    /// is `null` unless there is actionable remediation, and is meant
+    /// to guide the model's retry. Fields are stable enough for the
+    /// model to key on.
     pub fn to_json_string(&self) -> String {
         let (code, message): (&str, String) = match self {
             Self::OutsideWorkspace => (
@@ -1132,9 +1177,14 @@ impl ToolExecutionError {
             Self::Patch(err) => err.to_code_and_message(),
             Self::Command(err) => err.to_code_and_message(),
         };
+        let hint: Option<&'static str> = match self {
+            Self::Patch(err) => err.to_hint(),
+            _ => None,
+        };
         Json(ToolErrorJson {
             code,
             message: &message,
+            hint,
         })
         .to_string()
     }
@@ -1143,13 +1193,16 @@ impl ToolExecutionError {
 struct ToolErrorJson<'a> {
     code: &'a str,
     message: &'a str,
+    hint: Option<&'a str>,
 }
 
 impl nojson::DisplayJson for ToolErrorJson<'_> {
     fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
             f.member("error", self.code)?;
-            f.member("message", self.message)
+            f.member("message", self.message)?;
+            f.member("hint", self.hint)?;
+            Ok(())
         })
     }
 }
@@ -3350,6 +3403,31 @@ mod tests {
         let s = e.to_json_string();
         assert!(s.contains(r#""error":"patch_no_match""#), "got {s}");
         assert!(s.contains("a.txt"));
+    }
+
+    #[test]
+    fn patch_error_json_includes_hint_for_same_path() {
+        let e = ToolExecutionError::Patch(PatchError::MultipleEditsSamePath {
+            path: "dup".to_string(),
+        });
+        let s = e.to_json_string();
+        assert!(
+            s.contains(r#""error":"patch_multiple_edits_same_path""#),
+            "got {s}"
+        );
+        assert!(s.contains(r#""hint":"#), "expected a hint member in {s}");
+        assert!(s.contains("separate patch calls"), "got {s}");
+    }
+
+    #[test]
+    fn patch_error_json_emits_null_hint_when_not_actionable() {
+        let e = ToolExecutionError::Patch(PatchError::Rejected);
+        let s = e.to_json_string();
+        assert!(s.contains(r#""error":"patch_rejected""#), "got {s}");
+        assert!(
+            s.contains(r#""hint":null"#),
+            "Rejected should emit null hint: {s}"
+        );
     }
 
     // -------------------------------------------------------------
