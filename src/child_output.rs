@@ -64,11 +64,17 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
 
     let stdout_thread = stdout.map(|reader| {
         let limiter = DisplayRateLimiter::new_per_second();
-        thread::spawn(move || pump(reader, StreamKind::Stdout, color, limiter))
+        thread::spawn(move || {
+            let mut sink = io::stderr().lock();
+            pump(reader, StreamKind::Stdout, color, limiter, &mut sink)
+        })
     });
     let stderr_thread = stderr.map(|reader| {
         let limiter = DisplayRateLimiter::new_per_second();
-        thread::spawn(move || pump(reader, StreamKind::Stderr, color, limiter))
+        thread::spawn(move || {
+            let mut sink = io::stderr().lock();
+            pump(reader, StreamKind::Stderr, color, limiter, &mut sink)
+        })
     });
 
     let status = child.wait()?;
@@ -114,6 +120,17 @@ pub fn finish_line(status: &ExitStatus, duration: Duration) -> String {
 /// or colouring, while its stdout (the model's streaming progress) is
 /// shown as a secondary, rate-limited copy.
 pub fn run_streaming_stdout(cmd: &mut Command) -> io::Result<ExitStatus> {
+    run_streaming_stdout_to(cmd, io::stderr())
+}
+
+/// Run `cmd` with stdout piped and streamed to `sink` under the rate
+/// limit, stderr inherited raw. The streamed stdout is not accumulated
+/// and is shown only through `sink`, so callers may discard it (e.g.
+/// suppress a noisy display copy in a test). Returns the exit status.
+fn run_streaming_stdout_to<W: Write + Send + 'static>(
+    cmd: &mut Command,
+    mut sink: W,
+) -> io::Result<ExitStatus> {
     let started = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
     let mut child = cmd.spawn()?;
@@ -124,7 +141,7 @@ pub fn run_streaming_stdout(cmd: &mut Command) -> io::Result<ExitStatus> {
     let stdout = child.stdout.take();
     let stdout_thread = stdout.map(|reader| {
         let limiter = DisplayRateLimiter::new_per_second();
-        thread::spawn(move || pump(reader, StreamKind::Stdout, color, limiter))
+        thread::spawn(move || pump(reader, StreamKind::Stdout, color, limiter, &mut sink))
     });
 
     let status = child.wait()?;
@@ -162,15 +179,15 @@ impl StreamKind {
 /// Read a child pipe to EOF, accumulating every byte and displaying
 /// the stream to the parent stderr under `limiter`'s rate cap, wrapped
 /// in the stream's ANSI colour when `color` is true.
-fn pump<R: Read>(
+fn pump<R: Read, W: Write>(
     mut reader: R,
     kind: StreamKind,
     color: bool,
     mut limiter: DisplayRateLimiter,
+    sink: &mut W,
 ) -> io::Result<Vec<u8>> {
     let mut accumulated = Vec::new();
     let mut chunk = [0u8; CHUNK_SIZE];
-    let mut stderr = io::stderr().lock();
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
@@ -179,7 +196,7 @@ fn pump<R: Read>(
         accumulated.extend_from_slice(&chunk[..n]);
         let allowed = limiter.allow(&chunk[..n]);
         if allowed > 0 {
-            write_display(&mut stderr, kind, color, &chunk[..allowed])?;
+            write_display(sink, kind, color, &chunk[..allowed])?;
         }
     }
     Ok(accumulated)
@@ -298,7 +315,8 @@ mod tests {
         // A tiny budget must not truncate the accumulated bytes.
         let reader = io::Cursor::new(b"x".repeat(10 * 1024));
         let limiter = DisplayRateLimiter::new(1, Duration::from_secs(1));
-        let bytes = pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
+        let mut sink = io::sink();
+        let bytes = pump(reader, StreamKind::Stdout, false, limiter, &mut sink).expect("pump");
         assert_eq!(bytes.len(), 10 * 1024, "accumulation is never rate-capped");
     }
 
@@ -325,7 +343,7 @@ mod tests {
     fn run_streaming_stdout_returns_child_status() {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("printf 'streamed\\n'; exit 7");
-        let status = run_streaming_stdout(&mut cmd).expect("run");
+        let status = run_streaming_stdout_to(&mut cmd, Vec::new()).expect("run");
         assert_eq!(status.code(), Some(7));
     }
 
@@ -336,7 +354,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg("head -c 1048576 /dev/zero | tr '\\0' 'x'; exit 0");
-        let status = run_streaming_stdout(&mut cmd).expect("run");
+        let status = run_streaming_stdout_to(&mut cmd, Vec::new()).expect("run");
         assert!(status.success());
     }
 
