@@ -1,6 +1,6 @@
 //! Sync single-turn agent loop for `attini agent`.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -394,7 +394,25 @@ fn drive(
         try_auto_compact(session, &cfg.model, counters)?;
     }
 
+    let is_prompt = matches!(cont, Continuation::Prompt(_));
+    let is_approve_or_reject = matches!(cont, Continuation::Approve | Continuation::Reject);
+
     let mut messages = build_initial_messages(session, cfg)?;
+
+    // The `Prompt` path appends a fresh user record before the model
+    // call. Any assistant `tool_call` left unanswered when the loop
+    // previously suspended must be answered *before* that user record
+    // is appended, otherwise a synthetic tool result would be
+    // persisted after the user and break the assistant -> tool
+    // continuity the API requires.
+    if is_prompt {
+        let repaired = repair_orphaned_tool_calls(session, &mut messages)?;
+        if repaired > 0 {
+            eprintln!(
+                "[repair] inserted {repaired} synthetic tool result(s) for unanswered tool_call(s)"
+            );
+        }
+    }
 
     match cont {
         Continuation::Prompt(text) => {
@@ -436,20 +454,18 @@ fn drive(
         }
     }
 
-    // Guard against an assistant message whose tool_calls were only
-    // partially answered (e.g. an unapproved sibling left behind when
-    // the loop suspended awaiting approval). Before sending the
-    // transcript to the model, synthesize an explicit reject / cancel
-    // tool result for every unanswered tool_call so the API's
-    // `tool_calls`-must-be-answered invariant holds. This both heals
-    // the in-memory message list and persists the synthetic result to
-    // the session transcript, so the corruption does not recur on the
-    // next invocation.
-    let repaired = repair_orphaned_tool_calls(session, &mut messages)?;
-    if repaired > 0 {
-        eprintln!(
-            "[repair] inserted {repaired} synthetic tool result(s) for unanswered tool_call(s)"
-        );
+    // `Approve` / `Reject` consume the parked pending inside the match
+    // above (appending a Tool record for the answered call), so they
+    // run the orphan repair *after* the match; otherwise the pending
+    // is still parked and the freshly-appended Tool record could be
+    // re-surfaced as an orphan.
+    if is_approve_or_reject {
+        let repaired = repair_orphaned_tool_calls(session, &mut messages)?;
+        if repaired > 0 {
+            eprintln!(
+                "[repair] inserted {repaired} synthetic tool result(s) for unanswered tool_call(s)"
+            );
+        }
     }
 
     let tools = build_tool_defs(cfg.mode, cfg.subagent_available);
@@ -1698,59 +1714,75 @@ struct OrphanedToolCall {
 /// list of synthetic results so the caller can persist them to the
 /// session transcript.
 ///
+/// Rather than assuming tool results are contiguous, this indexes every
+/// tool message by the `call_id` it answers, so an assistant's tool
+/// results are associated with it even when the on-disk transcript has
+/// interleaved records (e.g. a `user` turn appended between an
+/// assistant's `tool_calls` and a synthetic reject persisted for it).
+/// Each assistant's answers are emitted immediately after it and stray
+/// / duplicate tool messages are dropped, restoring the
+/// "assistant(tool_calls) -> tool, tool, ..." invariant that the API
+/// requires.
+///
 /// An assistant message whose `tool_calls` are all answered is left
 /// untouched; an assistant with no `tool_calls` is copied verbatim.
 fn repair_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<OrphanedToolCall>) {
+    let mut tools_by_call: BTreeMap<String, VecDeque<ChatMessage>> = BTreeMap::new();
+    for msg in messages {
+        if let ChatMessage::Tool { tool_call_id, .. } = msg {
+            tools_by_call
+                .entry(tool_call_id.clone())
+                .or_default()
+                .push_back(msg.clone());
+        }
+    }
+
     let mut repaired: Vec<ChatMessage> = Vec::with_capacity(messages.len());
     let mut orphans: Vec<OrphanedToolCall> = Vec::new();
-    let mut i = 0usize;
-    while i < messages.len() {
-        let assistant_calls = match &messages[i] {
+    // Call ids for which we already emitted (or synthesised) a tool
+    // result in `repaired`. A later tool message for one of these ids
+    // is a misplaced / duplicate record and is dropped.
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+
+    for msg in messages {
+        match msg {
             ChatMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
-                tool_calls.clone()
+                repaired.push(msg.clone());
+                for tc in tool_calls {
+                    if placed.contains(&tc.id) {
+                        continue;
+                    }
+                    if let Some(queue) = tools_by_call.get_mut(&tc.id) {
+                        if let Some(tool_msg) = queue.pop_front() {
+                            repaired.push(tool_msg);
+                            placed.insert(tc.id.clone());
+                            continue;
+                        }
+                    }
+                    let content = tool_error_json(
+                        "unanswered_tool_call",
+                        "this tool call was left unapproved and is cancelled before continuing",
+                    );
+                    orphans.push(OrphanedToolCall {
+                        call_id: tc.id.clone(),
+                        content: content.clone(),
+                    });
+                    repaired.push(ChatMessage::Tool {
+                        tool_call_id: tc.id.clone(),
+                        content,
+                    });
+                    placed.insert(tc.id.clone());
+                }
             }
-            _ => {
-                repaired.push(messages[i].clone());
-                i += 1;
-                continue;
+            ChatMessage::Tool { tool_call_id, .. } => {
+                if placed.contains(tool_call_id) {
+                    continue; // already emitted as this assistant's tool result
+                }
+                placed.insert(tool_call_id.clone());
+                repaired.push(msg.clone());
             }
-        };
-        repaired.push(messages[i].clone());
-        i += 1;
-        // Gather the contiguous tool result messages that answer this
-        // assistant message's tool_calls. The conversation alternates
-        // assistant(tool_calls) -> tool, tool, ... so the tool results
-        // immediately follow the assistant message.
-        let mut tool_msgs: Vec<ChatMessage> = Vec::new();
-        while i < messages.len() && matches!(&messages[i], ChatMessage::Tool { .. }) {
-            tool_msgs.push(messages[i].clone());
-            i += 1;
+            _ => repaired.push(msg.clone()),
         }
-        let responded: BTreeSet<String> = tool_msgs
-            .iter()
-            .filter_map(|m| match m {
-                ChatMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
-                _ => None,
-            })
-            .collect();
-        for tc in &assistant_calls {
-            if responded.contains(&tc.id) {
-                continue;
-            }
-            let content = tool_error_json(
-                "unanswered_tool_call",
-                "this tool call was left unapproved and is cancelled before continuing",
-            );
-            orphans.push(OrphanedToolCall {
-                call_id: tc.id.clone(),
-                content: content.clone(),
-            });
-            tool_msgs.push(ChatMessage::Tool {
-                tool_call_id: tc.id.clone(),
-                content,
-            });
-        }
-        repaired.extend(tool_msgs);
     }
     (repaired, orphans)
 }
@@ -1766,46 +1798,52 @@ fn repair_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<OrphanedT
 /// is cleared so a later `--approve` / `--reject` does not double-run
 /// it.
 ///
+/// Even when no new synthetic result is required, the repaired message
+/// order is always adopted. `repair_messages` may have moved a tool
+/// result that was persisted out of order (e.g. after a `user` turn)
+/// back to immediately follow its assistant, and that in-memory
+/// correction is the list actually sent to the model; the on-disk
+/// records are left intact.
+///
 /// Returns the number of synthetic tool results inserted.
 fn repair_orphaned_tool_calls(
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
 ) -> io::Result<usize> {
     let (repaired, orphans) = repair_messages(messages);
-    if orphans.is_empty() {
-        return Ok(0);
-    }
-    for orphan in &orphans {
-        // If the orphan is the very call that the previous invocation
-        // parked in pending.json and the caller resumed with a fresh
-        // prompt (bypassing --approve / --reject), drop the pending so
-        // a later resume does not execute the now-cancelled call.
-        if let Some(pending) = session.load_pending()?
-            && pending.call_id == orphan.call_id
-        {
-            session.clear_pending()?;
+    if !orphans.is_empty() {
+        for orphan in &orphans {
+            // If the orphan is the very call that the previous invocation
+            // parked in pending.json and the caller resumed with a fresh
+            // prompt (bypassing --approve / --reject), drop the pending so
+            // a later resume does not execute the now-cancelled call.
+            if let Some(pending) = session.load_pending()?
+                && pending.call_id == orphan.call_id
+            {
+                session.clear_pending()?;
+            }
+            session.append(&SessionRecord::ToolApproval {
+                ts: now_unix_millis(),
+                call_id: orphan.call_id.clone(),
+                decision: ApprovalDecision::Reject,
+                auto_decided_by: Some(AutoDecidedBy {
+                    scope: "repair".to_string(),
+                    argv_prefix: Vec::new(),
+                    reason: "unanswered_tool_call_repair".to_string(),
+                    plan_sha256: None,
+                    action_id: None,
+                }),
+            })?;
+            session.append(&SessionRecord::Tool {
+                ts: now_unix_millis(),
+                call_id: orphan.call_id.clone(),
+                content: orphan.content.clone(),
+            })?;
+            eprintln!(
+                "[repair] cancelled unanswered tool_call {} (left unapproved)",
+                orphan.call_id
+            );
         }
-        session.append(&SessionRecord::ToolApproval {
-            ts: now_unix_millis(),
-            call_id: orphan.call_id.clone(),
-            decision: ApprovalDecision::Reject,
-            auto_decided_by: Some(AutoDecidedBy {
-                scope: "repair".to_string(),
-                argv_prefix: Vec::new(),
-                reason: "unanswered_tool_call_repair".to_string(),
-                plan_sha256: None,
-                action_id: None,
-            }),
-        })?;
-        session.append(&SessionRecord::Tool {
-            ts: now_unix_millis(),
-            call_id: orphan.call_id.clone(),
-            content: orphan.content.clone(),
-        })?;
-        eprintln!(
-            "[repair] cancelled unanswered tool_call {} (left unapproved)",
-            orphan.call_id
-        );
     }
     *messages = repaired;
     Ok(orphans.len())
@@ -2390,5 +2428,49 @@ mod tests {
         let (repaired, orphans) = repair_messages(&messages);
         assert!(orphans.is_empty());
         assert_eq!(repaired, messages);
+    }
+
+    #[test]
+    fn repair_messages_moves_misplaced_tool_before_user() {
+        // The bug this fix addresses: a synthetic tool result was
+        // persisted *after* a user turn. It must be moved back to
+        // immediately follow its assistant so the assistant -> tool
+        // continuity holds, with the user message after the tool
+        // results, and no extra orphan synthetic is generated.
+        let messages = vec![
+            assistant_calls(&["call_00", "call_01"]),
+            tool_result("call_00"),
+            ChatMessage::User("tudukete".to_string()),
+            tool_result("call_01"),
+        ];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert!(orphans.is_empty());
+        assert_eq!(repaired.len(), 4);
+        assert!(matches!(&repaired[0], ChatMessage::Assistant { .. }));
+        match &repaired[1] {
+            ChatMessage::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, "call_00"),
+            other => panic!("expected tool call_00, got {other:?}"),
+        }
+        match &repaired[2] {
+            ChatMessage::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, "call_01"),
+            other => panic!("expected tool call_01, got {other:?}"),
+        }
+        assert!(matches!(&repaired[3], ChatMessage::User(_)));
+    }
+
+    #[test]
+    fn repair_messages_drops_duplicate_tool_result() {
+        // A stray / duplicate tool message for an already-answered call
+        // is dropped rather than re-emitted.
+        let messages = vec![
+            assistant_calls(&["call_00"]),
+            tool_result("call_00"),
+            tool_result("call_00"),
+        ];
+        let (repaired, orphans) = repair_messages(&messages);
+        assert!(orphans.is_empty());
+        assert_eq!(repaired.len(), 2);
+        assert!(matches!(&repaired[0], ChatMessage::Assistant { .. }));
+        assert!(matches!(&repaired[1], ChatMessage::Tool { .. }));
     }
 }
