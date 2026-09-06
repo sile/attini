@@ -196,17 +196,18 @@ impl Session {
         self.writer.flush()
     }
 
-    /// Write `pending.json` (overwriting any previous). The
-    /// caller should follow up by exiting the process — the
-    /// pending file signals to the next invocation that the
-    /// agent loop is mid-turn.
-    pub fn save_pending(&self, pending: &Pending) -> io::Result<()> {
+    /// Write `pending.json` (overwriting any previous) as a JSON
+    /// array of approval-blocked tool calls. The caller should
+    /// follow up by exiting the process — the pending file signals
+    /// to the next invocation that the agent loop is mid-turn.
+    pub fn save_pending(&self, pending: &[Pending]) -> io::Result<()> {
         let content = Json(pending).to_string();
         fs::write(&self.pending_path, content)
     }
 
-    /// Read `pending.json` if it exists.
-    pub fn load_pending(&self) -> io::Result<Option<Pending>> {
+    /// Read `pending.json` if it exists. Returns the parked batch in
+    /// array order (the order the tool calls appeared in the turn).
+    pub fn load_pending(&self) -> io::Result<Option<Vec<Pending>>> {
         let text = match fs::read_to_string(&self.pending_path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -214,7 +215,7 @@ impl Session {
         };
         let json =
             RawJson::parse(&text).map_err(|e| io::Error::other(format!("pending.json: {e}")))?;
-        Pending::from_json(json.value()).map(Some)
+        Pending::from_json_array(json.value()).map(Some)
     }
 
     /// Remove `pending.json` after a resume has been applied.
@@ -497,22 +498,28 @@ pub struct PendingSummary {
     pub ts: u64,
 }
 
-/// Read `pending.json` and return a summary. Missing file → `None`.
-pub fn read_pending_summary(path: &Path) -> io::Result<Option<PendingSummary>> {
+/// Read `pending.json` and return summaries of every parked call.
+/// Missing file → `None`.
+pub fn read_pending_summary(path: &Path) -> io::Result<Option<Vec<PendingSummary>>> {
     let text = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let json = RawJson::parse(&text).map_err(|e| io::Error::other(format!("pending.json: {e}")))?;
-    let pending = Pending::from_json(json.value())?;
-    Ok(Some(PendingSummary {
-        call_id: pending.call_id,
-        tool_kind: pending.tool_kind,
-        function_name: pending.function_name,
-        preview: pending.preview,
-        ts: pending.ts,
-    }))
+    let pendings = Pending::from_json_array(json.value())?;
+    Ok(Some(
+        pendings
+            .into_iter()
+            .map(|p| PendingSummary {
+                call_id: p.call_id,
+                tool_kind: p.tool_kind,
+                function_name: p.function_name,
+                preview: p.preview,
+                ts: p.ts,
+            })
+            .collect(),
+    ))
 }
 
 // -------------------------------------------------------------------
@@ -1480,6 +1487,17 @@ impl Pending {
             preview,
         })
     }
+
+    fn from_json_array(value: nojson::RawJsonValue<'_, '_>) -> io::Result<Vec<Self>> {
+        let iter = value
+            .to_array()
+            .map_err(|e| io::Error::other(format!("pending.json: {e}")))?;
+        let mut out = Vec::new();
+        for elem in iter {
+            out.push(Self::from_json(elem)?);
+        }
+        Ok(out)
+    }
 }
 
 // -------------------------------------------------------------------
@@ -1523,6 +1541,30 @@ mod tests {
             assert_eq!(PendingToolKind::parse(kind.as_str()), Some(kind));
         }
         assert!(PendingToolKind::parse("bogus").is_none());
+    }
+
+    #[test]
+    fn pending_batch_roundtrips_through_json_array() {
+        let a = Pending {
+            ts: 1,
+            call_id: "call_1".to_string(),
+            tool_kind: PendingToolKind::Patch,
+            function_name: "patch".to_string(),
+            arguments_json: r#"{"edits":[]}"#.to_string(),
+            preview: "patch preview".to_string(),
+        };
+        let b = Pending {
+            ts: 2,
+            call_id: "call_2".to_string(),
+            tool_kind: PendingToolKind::Command,
+            function_name: "command".to_string(),
+            arguments_json: r#"{"argv":["git","status"]}"#.to_string(),
+            preview: "command preview".to_string(),
+        };
+        let json = Json(&[a.clone(), b.clone()]).to_string();
+        let parsed = RawJson::parse(&json).expect("array should parse");
+        let got = Pending::from_json_array(parsed.value()).expect("array should convert");
+        assert_eq!(got, vec![a, b]);
     }
 
     #[test]

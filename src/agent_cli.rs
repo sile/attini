@@ -395,33 +395,37 @@ fn drive(
             messages.push(ChatMessage::User(text));
         }
         Continuation::Approve => {
-            let pending = load_pending_or_err(session)?;
-            session.append(&SessionRecord::ToolApproval {
-                ts: now_unix_millis(),
-                call_id: pending.call_id.clone(),
-                decision: ApprovalDecision::Approve,
-                auto_decided_by: None,
-            })?;
-            let content = execute_pending(&pending, executor)?;
-            append_tool(session, &mut messages, &pending.call_id, content)?;
+            let pendings = load_pending_or_err(session)?;
+            for pending in &pendings {
+                session.append(&SessionRecord::ToolApproval {
+                    ts: now_unix_millis(),
+                    call_id: pending.call_id.clone(),
+                    decision: ApprovalDecision::Approve,
+                    auto_decided_by: None,
+                })?;
+                let content = execute_pending(pending, executor)?;
+                append_tool(session, &mut messages, &pending.call_id, content)?;
+            }
             session.clear_pending()?;
         }
         Continuation::Reject => {
-            let pending = load_pending_or_err(session)?;
-            session.append(&SessionRecord::ToolApproval {
-                ts: now_unix_millis(),
-                call_id: pending.call_id.clone(),
-                decision: ApprovalDecision::Reject,
-                auto_decided_by: None,
-            })?;
-            let content = r#"{"error":"rejected","message":"user rejected this tool call"}"#;
-            append_tool(
-                session,
-                &mut messages,
-                &pending.call_id,
-                content.to_string(),
-            )?;
-            counters.tool_errors += 1;
+            let pendings = load_pending_or_err(session)?;
+            for pending in &pendings {
+                session.append(&SessionRecord::ToolApproval {
+                    ts: now_unix_millis(),
+                    call_id: pending.call_id.clone(),
+                    decision: ApprovalDecision::Reject,
+                    auto_decided_by: None,
+                })?;
+                let content = r#"{"error":"rejected","message":"user rejected this tool call"}"#;
+                append_tool(
+                    session,
+                    &mut messages,
+                    &pending.call_id,
+                    content.to_string(),
+                )?;
+                counters.tool_errors += 1;
+            }
             session.clear_pending()?;
         }
     }
@@ -502,6 +506,16 @@ fn drive(
             return Ok(Driven::Completed);
         }
 
+        // Batch-approval state: every tool call in this turn that needs
+        // human approval is parked here. Once the first one is seen we
+        // stop executing side-effecting siblings (auto-approved patches
+        // / commands) so the assistant `tool_calls` list and the answer
+        // `tool` messages stay in the same order; the pending ones are
+        // parked and the rest are left for the orphan-repair pass to
+        // cancel, after which the model re-issues them.
+        let mut parked: Vec<Pending> = Vec::new();
+        let mut suspending = false;
+
         for tc in &call_result.tool_calls {
             // Fine-grained tool_calls_by_kind counting is done here
             // (not via classify()) because classify() collapses
@@ -565,22 +579,33 @@ fn drive(
             }
             match classify(&tc.function_name) {
                 ToolKind::ReadOnly => {
-                    let (summary, content, errored) = run_read_only(tc, executor);
-                    eprintln!("{summary}");
-                    if errored {
-                        counters.tool_errors += 1;
+                    if suspending {
+                        // Left unanswered so the orphan-repair pass can
+                        // cancel it in tool-call order on resume.
+                    } else {
+                        let (summary, content, errored) = run_read_only(tc, executor);
+                        eprintln!("{summary}");
+                        if errored {
+                            counters.tool_errors += 1;
+                        }
+                        append_tool(session, &mut messages, &tc.id, content)?;
                     }
-                    append_tool(session, &mut messages, &tc.id, content)?;
                 }
                 ToolKind::Patch => {
-                    match dispatch_patch_unapproved(tc, executor, session, &mut messages, counters)?
-                    {
-                        PatchDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
-                        PatchDispatch::Continue => {}
+                    if let PatchDispatch::Awaiting(pending) = dispatch_patch_unapproved(
+                        tc,
+                        executor,
+                        session,
+                        &mut messages,
+                        counters,
+                        suspending,
+                    )? {
+                        parked.push(pending);
+                        suspending = true;
                     }
                 }
                 ToolKind::Command => {
-                    match dispatch_command(
+                    if let CommandDispatch::Awaiting(pending) = dispatch_command(
                         tc,
                         executor,
                         cfg.mode,
@@ -589,29 +614,47 @@ fn drive(
                         session,
                         &mut messages,
                         counters,
+                        suspending,
                     )? {
-                        CommandDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
-                        CommandDispatch::Continue => {}
+                        parked.push(pending);
+                        suspending = true;
                     }
                 }
                 ToolKind::Skill => {
-                    let content = run_skill_load(tc, counters);
-                    append_tool(session, &mut messages, &tc.id, content)?;
+                    if suspending {
+                        // Left unanswered; cancelled on resume.
+                    } else {
+                        let content = run_skill_load(tc, counters);
+                        append_tool(session, &mut messages, &tc.id, content)?;
+                    }
                 }
                 ToolKind::SubagentRun => {
-                    let content = run_subagent_run(tc, cfg, counters);
-                    append_tool(session, &mut messages, &tc.id, content)?;
+                    if suspending {
+                        // Left unanswered; cancelled on resume.
+                    } else {
+                        let content = run_subagent_run(tc, cfg, counters);
+                        append_tool(session, &mut messages, &tc.id, content)?;
+                    }
                 }
                 ToolKind::Unknown => {
-                    let content = tool_error_json(
-                        "unknown_tool",
-                        &format!("no such tool: {}", tc.function_name),
-                    );
-                    eprintln!("[unknown tool] {}", tc.function_name);
-                    counters.tool_errors += 1;
-                    append_tool(session, &mut messages, &tc.id, content)?;
+                    if suspending {
+                        // Left unanswered; cancelled on resume.
+                    } else {
+                        let content = tool_error_json(
+                            "unknown_tool",
+                            &format!("no such tool: {}", tc.function_name),
+                        );
+                        eprintln!("[unknown tool] {}", tc.function_name);
+                        counters.tool_errors += 1;
+                        append_tool(session, &mut messages, &tc.id, content)?;
+                    }
                 }
             }
+        }
+
+        if !parked.is_empty() {
+            session.save_pending(&parked)?;
+            return Ok(Driven::AwaitingApproval);
         }
     }
 
@@ -1094,7 +1137,9 @@ fn build_tool_defs(subagent_available: bool) -> Vec<ToolDef> {
 }
 
 enum CommandDispatch {
-    Awaiting,
+    /// The call needs human approval; carries the parked pending.
+    Awaiting(Pending),
+    /// The call was handled (or, in `dry_run`, can be skipped).
     Continue,
 }
 
@@ -1108,14 +1153,17 @@ fn dispatch_command(
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
     counters: &mut Counters,
+    dry_run: bool,
 ) -> io::Result<CommandDispatch> {
     let inv = match CommandInvocation::parse(&tc.arguments_json) {
         Ok(inv) => inv,
         Err(err) => {
-            let content = tool_error_json("command_args", &format!("{err:?}"));
-            eprintln!("[command] parse err: {err:?}");
-            counters.tool_errors += 1;
-            append_tool(session, messages, &tc.id, content)?;
+            if !dry_run {
+                let content = tool_error_json("command_args", &format!("{err:?}"));
+                eprintln!("[command] parse err: {err:?}");
+                counters.tool_errors += 1;
+                append_tool(session, messages, &tc.id, content)?;
+            }
             return Ok(CommandDispatch::Continue);
         }
     };
@@ -1129,46 +1177,50 @@ fn dispatch_command(
     let display = shell_escape_argv(&inv.argv);
     match judgment {
         Judgment::AutoApprove(dec) => {
-            let dec_display = shell_escape_argv(&dec.argv_prefix);
-            eprintln!(
-                "[command] auto-approve via {} rule '{}': {}",
-                dec.scope.as_str(),
-                dec_display,
-                display
-            );
-            append_auto_approval(session, &tc.id, ApprovalDecision::Approve, &dec)?;
-            let content = match run_command_sync(&inv, executor) {
-                Ok(s) => s,
-                Err(err) => {
-                    let (code, msg) = err.to_code_and_message();
-                    counters.tool_errors += 1;
-                    let payload = tool_error_json(code, &msg);
-                    append_tool(session, messages, &tc.id, payload)?;
-                    return Ok(CommandDispatch::Continue);
-                }
-            };
-            append_tool(session, messages, &tc.id, content)?;
+            if !dry_run {
+                let dec_display = shell_escape_argv(&dec.argv_prefix);
+                eprintln!(
+                    "[command] auto-approve via {} rule '{}': {}",
+                    dec.scope.as_str(),
+                    dec_display,
+                    display
+                );
+                append_auto_approval(session, &tc.id, ApprovalDecision::Approve, &dec)?;
+                let content = match run_command_sync(&inv, executor) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let (code, msg) = err.to_code_and_message();
+                        counters.tool_errors += 1;
+                        let payload = tool_error_json(code, &msg);
+                        append_tool(session, messages, &tc.id, payload)?;
+                        return Ok(CommandDispatch::Continue);
+                    }
+                };
+                append_tool(session, messages, &tc.id, content)?;
+            }
             Ok(CommandDispatch::Continue)
         }
         Judgment::AutoDeny(dec) => {
-            let dec_display = shell_escape_argv(&dec.argv_prefix);
-            eprintln!(
-                "[command] auto-deny via {} rule '{}': {}",
-                dec.scope.as_str(),
-                dec_display,
-                display
-            );
-            append_auto_approval(session, &tc.id, ApprovalDecision::Reject, &dec)?;
-            let content = tool_error_json(
-                "denied_by_rule",
-                &format!(
-                    "auto-denied by {} rule argv_prefix {:?}",
+            if !dry_run {
+                let dec_display = shell_escape_argv(&dec.argv_prefix);
+                eprintln!(
+                    "[command] auto-deny via {} rule '{}': {}",
                     dec.scope.as_str(),
-                    dec.argv_prefix
-                ),
-            );
-            counters.tool_errors += 1;
-            append_tool(session, messages, &tc.id, content)?;
+                    dec_display,
+                    display
+                );
+                append_auto_approval(session, &tc.id, ApprovalDecision::Reject, &dec)?;
+                let content = tool_error_json(
+                    "denied_by_rule",
+                    &format!(
+                        "auto-denied by {} rule argv_prefix {:?}",
+                        dec.scope.as_str(),
+                        dec.argv_prefix
+                    ),
+                );
+                counters.tool_errors += 1;
+                append_tool(session, messages, &tc.id, content)?;
+            }
             Ok(CommandDispatch::Continue)
         }
         Judgment::Pending => {
@@ -1176,8 +1228,11 @@ fn dispatch_command(
             eprintln!("[command] approval required");
             eprintln!("{preview_text}");
             emit_suggested_rule(&inv.argv);
-            save_pending(session, tc, PendingToolKind::Command, preview_text)?;
-            Ok(CommandDispatch::Awaiting)
+            Ok(CommandDispatch::Awaiting(build_pending(
+                tc,
+                PendingToolKind::Command,
+                preview_text,
+            )))
         }
     }
 }
@@ -1369,7 +1424,9 @@ fn short_err(err: &ToolExecutionError) -> String {
 }
 
 enum PatchDispatch {
-    Awaiting,
+    /// The call needs human approval; carries the parked pending.
+    Awaiting(Pending),
+    /// The call was handled (or, in `dry_run`, can be skipped).
     Continue,
 }
 
@@ -1380,47 +1437,59 @@ enum PatchDispatch {
 /// (a new file, a scratchpad / non-tracked target) parks a pending
 /// approval and returns [`PatchDispatch::Awaiting`] so the caller
 /// suspends the invocation.
+///
+/// When `dry_run` is `true` (a later sibling already needs approval)
+/// the working tree is never mutated: auto-approved edits are
+/// skipped and preview errors are not appended. The caller still
+/// receives `Awaiting(Pending)` for edits that need a human.
 fn dispatch_patch_unapproved(
     tc: &ToolCall,
     executor: &ToolExecutor,
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
     counters: &mut Counters,
+    dry_run: bool,
 ) -> io::Result<PatchDispatch> {
     let inv = match PatchInvocation::parse(&tc.arguments_json) {
         Ok(inv) => inv,
         Err(err) => {
-            let content = tool_error_json("patch_args", &format!("{err:?}"));
-            eprintln!("[patch] parse err: {err:?}");
-            counters.tool_errors += 1;
-            append_tool(session, messages, &tc.id, content)?;
+            if !dry_run {
+                let content = tool_error_json("patch_args", &format!("{err:?}"));
+                eprintln!("[patch] parse err: {err:?}");
+                counters.tool_errors += 1;
+                append_tool(session, messages, &tc.id, content)?;
+            }
             return Ok(PatchDispatch::Continue);
         }
     };
     let (hashes, preview) = match executor.preview_patch(&inv) {
         Ok(x) => x,
         Err(e) => {
-            let content = tool_error_json("patch_preview", &format!("{e:?}"));
-            eprintln!("[patch] preview err: {e:?}");
-            counters.tool_errors += 1;
-            append_tool(session, messages, &tc.id, content)?;
+            if !dry_run {
+                let content = tool_error_json("patch_preview", &format!("{e:?}"));
+                eprintln!("[patch] preview err: {e:?}");
+                counters.tool_errors += 1;
+                append_tool(session, messages, &tc.id, content)?;
+            }
             return Ok(PatchDispatch::Continue);
         }
     };
     if preview.auto_approve {
-        match executor.apply_patch(&inv, &hashes) {
-            Ok(paths) => {
-                eprintln!(
-                    "[patch] auto-approved: {} file(s) (git-tracked)",
-                    paths.len()
-                );
-                append_tool(session, messages, &tc.id, patch_result_json(&paths))?;
-            }
-            Err(e) => {
-                let content = tool_error_json("patch_apply", &format!("{e:?}"));
-                eprintln!("[patch] apply err: {e:?}");
-                counters.tool_errors += 1;
-                append_tool(session, messages, &tc.id, content)?;
+        if !dry_run {
+            match executor.apply_patch(&inv, &hashes) {
+                Ok(paths) => {
+                    eprintln!(
+                        "[patch] auto-approved: {} file(s) (git-tracked)",
+                        paths.len()
+                    );
+                    append_tool(session, messages, &tc.id, patch_result_json(&paths))?;
+                }
+                Err(e) => {
+                    let content = tool_error_json("patch_apply", &format!("{e:?}"));
+                    eprintln!("[patch] apply err: {e:?}");
+                    counters.tool_errors += 1;
+                    append_tool(session, messages, &tc.id, content)?;
+                }
             }
         }
         Ok(PatchDispatch::Continue)
@@ -1428,8 +1497,11 @@ fn dispatch_patch_unapproved(
         let preview_text = render_patch_preview_text(&preview);
         eprintln!("[patch] approval required");
         eprintln!("{preview_text}");
-        save_pending(session, tc, PendingToolKind::Patch, preview_text)?;
-        Ok(PatchDispatch::Awaiting)
+        Ok(PatchDispatch::Awaiting(build_pending(
+            tc,
+            PendingToolKind::Patch,
+            preview_text,
+        )))
     }
 }
 
@@ -1448,34 +1520,36 @@ fn render_patch_preview_text(p: &PatchPreview) -> String {
     out
 }
 
-fn save_pending(
-    session: &Session,
-    tc: &ToolCall,
-    kind: PendingToolKind,
-    preview: String,
-) -> io::Result<()> {
-    session.save_pending(&Pending {
+fn build_pending(tc: &ToolCall, kind: PendingToolKind, preview: String) -> Pending {
+    Pending {
         ts: now_unix_millis(),
         call_id: tc.id.clone(),
         tool_kind: kind,
         function_name: tc.function_name.clone(),
         arguments_json: tc.arguments_json.clone(),
         preview,
-    })
+    }
 }
 
 fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<String> {
     match pending.tool_kind {
         PendingToolKind::Patch => {
-            let inv = PatchInvocation::parse(&pending.arguments_json)
-                .map_err(|e| io::Error::other(format!("patch args: {e:?}")))?;
-            let (hashes, _preview) = executor
-                .preview_patch(&inv)
-                .map_err(|e| io::Error::other(format!("patch preview: {e:?}")))?;
-            let paths = executor
-                .apply_patch(&inv, &hashes)
-                .map_err(|e| io::Error::other(format!("patch apply: {e:?}")))?;
-            Ok(patch_result_json(&paths))
+            // Convert any patch parse / preview / apply failure into a
+            // tool-error result so a batch approval always answers every
+            // parked call instead of aborting mid-way and leaving a
+            // partially-executed pending set behind.
+            let inv = match PatchInvocation::parse(&pending.arguments_json) {
+                Ok(inv) => inv,
+                Err(e) => return Ok(tool_error_json("patch_args", &format!("{e:?}"))),
+            };
+            let (hashes, _preview) = match executor.preview_patch(&inv) {
+                Ok(x) => x,
+                Err(e) => return Ok(tool_error_json("patch_preview", &format!("{e:?}"))),
+            };
+            match executor.apply_patch(&inv, &hashes) {
+                Ok(paths) => Ok(patch_result_json(&paths)),
+                Err(e) => Ok(tool_error_json("patch_apply", &format!("{e:?}"))),
+            }
         }
         PendingToolKind::Command => {
             let inv = CommandInvocation::parse(&pending.arguments_json)
@@ -1639,8 +1713,8 @@ fn repair_orphaned_tool_calls(
             // parked in pending.json and the caller resumed with a fresh
             // prompt (bypassing --approve / --reject), drop the pending so
             // a later resume does not execute the now-cancelled call.
-            if let Some(pending) = session.load_pending()?
-                && pending.call_id == orphan.call_id
+            if let Some(pendings) = session.load_pending()?
+                && pendings.iter().any(|p| p.call_id == orphan.call_id)
             {
                 session.clear_pending()?;
             }
@@ -1687,7 +1761,7 @@ fn append_tool(
     Ok(())
 }
 
-fn load_pending_or_err(session: &Session) -> io::Result<Pending> {
+fn load_pending_or_err(session: &Session) -> io::Result<Vec<Pending>> {
     session
         .load_pending()?
         .ok_or_else(|| io::Error::other("no pending.json — nothing to approve or reject"))

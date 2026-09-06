@@ -134,13 +134,15 @@ pub fn run_show(name: &str) -> io::Result<()> {
     println!("  lock: {}", format_lock_status(lock));
     print_summary(&summary);
     match pending {
-        Some(p) => {
-            println!("  pending:");
-            println!("    call_id: {}", p.call_id);
-            println!("    tool_kind: {:?}", p.tool_kind);
-            println!("    function_name: {}", p.function_name);
-            println!("    ts: {}", p.ts);
-            println!("    preview: {}", p.preview);
+        Some(ps) => {
+            println!("  pending ({}):", ps.len());
+            for p in ps {
+                println!("    call_id: {}", p.call_id);
+                println!("    tool_kind: {:?}", p.tool_kind);
+                println!("    function_name: {}", p.function_name);
+                println!("    ts: {}", p.ts);
+                println!("    preview: {}", p.preview);
+            }
         }
         None => println!("  pending: (none)"),
     }
