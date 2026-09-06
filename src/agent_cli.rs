@@ -630,11 +630,16 @@ fn drive(
                     if let Authorization::ApprovedPlan(plan) = &cfg.authorization {
                         run_plan_patch(tc, executor, session, &mut messages, counters, plan)?;
                     } else {
-                        let preview_text = render_patch_preview(tc, executor)?;
-                        eprintln!("[patch] approval required");
-                        eprintln!("{preview_text}");
-                        save_pending(session, tc, PendingToolKind::Patch, preview_text)?;
-                        return Ok(Driven::AwaitingApproval);
+                        match dispatch_patch_unapproved(
+                            tc,
+                            executor,
+                            session,
+                            &mut messages,
+                            counters,
+                        )? {
+                            PatchDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
+                            PatchDispatch::Continue => {}
+                        }
                     }
                 }
                 ToolKind::Command => {
@@ -1745,13 +1750,69 @@ fn short_err(err: &ToolExecutionError) -> String {
     }
 }
 
-fn render_patch_preview(tc: &ToolCall, executor: &ToolExecutor) -> io::Result<String> {
-    let inv = PatchInvocation::parse(&tc.arguments_json)
-        .map_err(|e| io::Error::other(format!("patch args: {e:?}")))?;
-    let (_, preview) = executor
-        .preview_patch(&inv)
-        .map_err(|e| io::Error::other(format!("patch preview: {e:?}")))?;
-    Ok(render_patch_preview_text(&preview))
+enum PatchDispatch {
+    Awaiting,
+    Continue,
+}
+
+/// Dispatch a patch tool call outside an approved-plan run.
+///
+/// Edits on git-tracked files are auto-applied immediately (git makes
+/// them revertible, so no human prompt is needed). Any other edit
+/// (a new file, a scratchpad / non-tracked target) parks a pending
+/// approval and returns [`PatchDispatch::Awaiting`] so the caller
+/// suspends the invocation.
+fn dispatch_patch_unapproved(
+    tc: &ToolCall,
+    executor: &ToolExecutor,
+    session: &mut Session,
+    messages: &mut Vec<ChatMessage>,
+    counters: &mut Counters,
+) -> io::Result<PatchDispatch> {
+    let inv = match PatchInvocation::parse(&tc.arguments_json) {
+        Ok(inv) => inv,
+        Err(err) => {
+            let content = tool_error_json("patch_args", &format!("{err:?}"));
+            eprintln!("[patch] parse err: {err:?}");
+            counters.tool_errors += 1;
+            append_tool(session, messages, &tc.id, content)?;
+            return Ok(PatchDispatch::Continue);
+        }
+    };
+    let (hashes, preview) = match executor.preview_patch(&inv) {
+        Ok(x) => x,
+        Err(e) => {
+            let content = tool_error_json("patch_preview", &format!("{e:?}"));
+            eprintln!("[patch] preview err: {e:?}");
+            counters.tool_errors += 1;
+            append_tool(session, messages, &tc.id, content)?;
+            return Ok(PatchDispatch::Continue);
+        }
+    };
+    if preview.auto_approve {
+        match executor.apply_patch(&inv, &hashes) {
+            Ok(paths) => {
+                eprintln!(
+                    "[patch] auto-approved: {} file(s) (git-tracked)",
+                    paths.len()
+                );
+                append_tool(session, messages, &tc.id, patch_result_json(&paths))?;
+            }
+            Err(e) => {
+                let content = tool_error_json("patch_apply", &format!("{e:?}"));
+                eprintln!("[patch] apply err: {e:?}");
+                counters.tool_errors += 1;
+                append_tool(session, messages, &tc.id, content)?;
+            }
+        }
+        Ok(PatchDispatch::Continue)
+    } else {
+        let preview_text = render_patch_preview_text(&preview);
+        eprintln!("[patch] approval required");
+        eprintln!("{preview_text}");
+        save_pending(session, tc, PendingToolKind::Patch, preview_text)?;
+        Ok(PatchDispatch::Awaiting)
+    }
 }
 
 fn render_patch_preview_text(p: &PatchPreview) -> String {

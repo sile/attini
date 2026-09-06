@@ -183,6 +183,7 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
                 added_lines: 1,
                 removed_lines: 0,
                 edit_count: 1,
+                auto_approve: false,
             },
         },
         "approve_patch" => Event::ApproveToolCall {

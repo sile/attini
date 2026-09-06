@@ -290,9 +290,10 @@ impl PatchInvocation {
             description: "Apply a batch of file edits to the workspace. \
                           Each edit is either an add (create a new file) or \
                           an update (replace a unique substring). All edits \
-                          in one call must target distinct paths. Every \
-                          patch requires user approval before it touches \
-                          the filesystem."
+                          in one call must target distinct paths. Patches \
+                          that only update git-tracked files are applied \
+                          immediately; any add or non-tracked edit requires \
+                          user approval before it touches the filesystem."
                 .to_string(),
             parameters_json: PATCH_PARAMS_SCHEMA.to_string(),
         }
@@ -1141,6 +1142,10 @@ pub struct PatchPreview {
     pub removed_lines: u64,
     /// `invocation.edits.len()`.
     pub edit_count: u64,
+    /// True when every edit is an `Update` on a file tracked by the
+    /// workspace's git repository, so the shell may apply the patch
+    /// without an approval prompt (git makes the change revertible).
+    pub auto_approve: bool,
 }
 
 /// Approval status of a tool call. Read-only tools always report
@@ -3584,6 +3589,7 @@ mod tests {
             added_lines: 1,
             removed_lines: 0,
             edit_count: 1,
+            auto_approve: false,
         };
         let actions = core.handle_event(Event::PatchPreviewReady {
             request: id,

@@ -129,10 +129,14 @@ impl ToolExecutor {
         let mut added_lines: u64 = 0;
         let mut removed_lines: u64 = 0;
         let mut target_paths: Vec<String> = Vec::with_capacity(invocation.edits.len());
+        let mut auto_approve = true;
         for edit in &invocation.edits {
             target_paths.push(edit.path().to_string());
             match edit {
                 PatchTool::Add { path, content } => {
+                    // A brand-new file is not yet under git control, so
+                    // creating it cannot be auto-approved.
+                    auto_approve = false;
                     let full = self.resolve_add_target(path)?;
                     if full.exists() {
                         return Err(PatchError::AddOnExistingFile { path: path.clone() });
@@ -149,6 +153,12 @@ impl ToolExecutor {
                     after,
                 } => {
                     let full = self.resolve_update_target(path)?;
+                    // Only edits on files already tracked by git are
+                    // considered safe (revertible). Scratchpad / other
+                    // non-tracked writes still need approval.
+                    if !self.is_git_tracked(&full) {
+                        auto_approve = false;
+                    }
                     let bytes = read_file_capped(&full, path)?;
                     let hash: [u8; 32] = Sha256::digest(&bytes).into();
                     hashes.push(PreviewHash {
@@ -179,8 +189,22 @@ impl ToolExecutor {
             added_lines,
             removed_lines,
             edit_count: invocation.edits.len() as u64,
+            auto_approve,
         };
         Ok((hashes, preview))
+    }
+
+    /// Whether an already-canonical absolute `canon` path is tracked
+    /// by the workspace's git repository (i.e. safe to rewrite without
+    /// an approval prompt). Outside a git repo, returns `false`.
+    fn is_git_tracked(&self, canon: &Path) -> bool {
+        let GitState::Repo { tracked } = &self.git_state else {
+            return false;
+        };
+        let Some(rel) = workspace_relative_canonical(canon, &self.root) else {
+            return false;
+        };
+        tracked.borrow().contains(&rel)
     }
 
     /// Apply all edits atomically in two phases (see `0007` design):

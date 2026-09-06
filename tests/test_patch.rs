@@ -135,6 +135,41 @@ fn preview_update_returns_sha256_of_existing_file() {
 }
 
 #[test]
+fn preview_update_on_tracked_file_marks_auto_approve() {
+    let root = TempRoot::new("preview-auto-approve-tracked");
+    root.write("a.txt", b"hello\nworld\n");
+    let (_, preview) = exec(&root)
+        .preview_patch(&inv(vec![update("a.txt", "world", "rust")]))
+        .expect("preview ok");
+    assert!(preview.auto_approve, "tracked update should auto-approve");
+}
+
+#[test]
+fn preview_add_marks_not_auto_approve() {
+    let root = TempRoot::new("preview-auto-approve-add");
+    let (_, preview) = exec(&root)
+        .preview_patch(&inv(vec![add("new.txt", "one\ntwo\n")]))
+        .expect("preview ok");
+    assert!(!preview.auto_approve, "add must require approval");
+}
+
+#[test]
+fn preview_mixed_tracked_update_and_add_marks_not_auto_approve() {
+    let root = TempRoot::new("preview-auto-approve-mixed");
+    root.write("a.txt", b"hello\n");
+    let (_, preview) = exec(&root)
+        .preview_patch(&inv(vec![
+            update("a.txt", "hello", "hi"),
+            add("new.txt", "x\n"),
+        ]))
+        .expect("preview ok");
+    assert!(
+        !preview.auto_approve,
+        "a patch containing an add must require approval"
+    );
+}
+
+#[test]
 fn preview_update_rejects_no_match() {
     let root = TempRoot::new("preview-nomatch");
     root.write("a.txt", b"hello");

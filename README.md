@@ -90,7 +90,7 @@ roots and referenced by absolute path (readable with the `read` tool).
 | `list` | List files and directories under a workspace-relative path | `max_entries` limit (default 200) |
 | `read` | Read a UTF-8 text file | Up to 1 MiB; optional `line_range` |
 | `search` | Literal substring search (no regex) | `max_results` limit (default 50) |
-| `patch` | Batch of add / unique-replacement edits | Preview + approval before applying; `before` must match exactly once; workspace-boundary check |
+| `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files are auto-applied; any add or non-tracked edit needs approval. `before` must match exactly once; workspace-boundary check |
 | `plan` | Draft a sealed Markdown plan for a change spanning multiple `patch` calls or also needing `command` steps | Non-terminal; written to `.attini/<session>/plans/`; a human must `attini plan ok` then `attini plan run` |
 
 `patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
