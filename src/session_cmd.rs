@@ -11,8 +11,9 @@ use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
 
 use crate::agent_cli;
 use crate::session::{
-    ConversationSummary, LockStatus, Session, SessionPaths, inspect_lock, read_pending_summary,
-    scan_conversation, session_paths, session_root,
+    ConversationSummary, LockStatus, Session, SessionPaths, inspect_lock,
+    read_conversation_records, read_pending_summary, scan_conversation, session_paths,
+    session_root,
 };
 
 pub fn run_list() -> io::Result<()> {
@@ -183,6 +184,69 @@ fn print_summary(s: &ConversationSummary) {
         (Some(ts), Some(kind)) => println!("  last_record: ts={ts} kind={kind}"),
         _ => println!("  last_record: (none)"),
     }
+}
+
+/// Read-only "current plan" view. Renders the latest assistant
+/// message (the model's most recent statement of intent / approach)
+/// plus any pending tool call. Never writes to the conversation.
+pub fn run_plan_view(name: &str) -> io::Result<()> {
+    let paths = session_paths(name)?;
+    if !paths.dir.try_exists()? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("session {name:?} not found ({})", paths.dir.display()),
+        ));
+    }
+    let records = read_conversation_records(&paths.conversation)?;
+    let latest_assistant = records.iter().rev().find_map(|r| match r {
+        crate::session::SessionRecord::Assistant {
+            ts,
+            content,
+            reasoning,
+            tool_calls,
+        } => Some((*ts, content.as_str(), reasoning.as_deref(), tool_calls)),
+        _ => None,
+    });
+
+    println!("session: {name}");
+    match latest_assistant {
+        Some((ts, content, reasoning, tool_calls)) => {
+            println!("  last_assistant ts: {ts}");
+            if !content.trim().is_empty() {
+                println!("\n  --- last assistant message ---\n");
+                println!("{content}");
+            } else {
+                println!("  last assistant message: (empty)");
+            }
+            if !tool_calls.is_empty() {
+                println!("\n  tool_calls:");
+                for tc in tool_calls {
+                    println!("    {}({})", tc.function_name, tc.arguments_json);
+                }
+            }
+            if let Some(r) = reasoning {
+                if !r.trim().is_empty() {
+                    println!("\n  --- reasoning ---\n");
+                    println!("{r}");
+                }
+            }
+        }
+        None => println!("  last_assistant: (no assistant message yet)"),
+    }
+
+    let pending = read_pending_summary(&paths.pending)?;
+    match pending {
+        Some(p) => {
+            println!("\n  pending:");
+            println!("    call_id: {}", p.call_id);
+            println!("    tool_kind: {:?}", p.tool_kind);
+            println!("    function_name: {}", p.function_name);
+            println!("    ts: {}", p.ts);
+            println!("    preview: {}", p.preview);
+        }
+        None => println!("\n  pending: (none)"),
+    }
+    Ok(())
 }
 
 // -------------------------------------------------------------------

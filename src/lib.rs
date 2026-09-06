@@ -13,7 +13,6 @@ pub mod memories;
 pub mod metrics;
 pub mod permissions;
 pub mod plan;
-pub mod plan_cmd;
 pub mod sansio;
 pub mod session;
 pub mod session_cmd;

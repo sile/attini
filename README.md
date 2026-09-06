@@ -91,28 +91,22 @@ roots and referenced by absolute path (readable with the `read` tool).
 | `read` | Read a UTF-8 text file | Up to 1 MiB; optional `line_range` |
 | `search` | Literal substring search (no regex) | `max_results` limit (default 50) |
 | `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files are auto-applied; any add or non-tracked edit needs approval. `before` must match exactly once; workspace-boundary check |
-| `plan` | Draft a sealed Markdown plan for a change spanning multiple `patch` calls or also needing `command` steps | Non-terminal; written to `.attini/<session>/plans/`; a human must `attini plan ok` then `attini plan run` |
 
 `patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
 after approval.
 
-## Plans
+## Current plan (read-only)
 
-In a normal (non-planning) session, the `plan` tool drafts a sealed Markdown plan for
-a change that spans multiple `patch` calls or also needs `command` steps, and writes it
-under the session's `plans/` directory (for example `.attini/<session>/plans/plan-<ts>-<attempt>.md`).
-It does not end the invocation and is a suggestion, not a mandate — if the change must
-be iterated step-by-step on intermediate results, keep using `patch`/`command` directly.
-A human must approve the plan before it can be executed:
+`attini plan -s NAME` shows the current state of a session without touching the
+conversation log: the latest assistant message (the model's most recent statement of
+approach), any tool calls it made, and any tool call currently awaiting approval
+(`pending.json`). It is purely observational — adjust the course by running
+`attini agent -s NAME "<new instruction>"` (or a fresh session) and letting the model
+revise its approach naturally.
 
 ```sh
-attini plan ok <PLAN.md>
-attini plan run [--session NAME] <PLAN.md>
+attini plan -s main
 ```
-
-`attini plan create` runs a dedicated planning session that ends with the `submit_plan`
-tool instead; see `attini plan --help` for the full `create`/`check`/`ok`/`run`/`close`
-family.
 
 ## Environment variables
 

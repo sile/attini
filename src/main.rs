@@ -60,8 +60,8 @@ fn run() -> Result<RunOutcome, RunError> {
     if let Some(exit) = try_run_agent(&mut args)? {
         return Ok(RunOutcome::Exit(exit));
     }
-    if let Some(exit) = try_run_plan(&mut args)? {
-        return Ok(RunOutcome::Exit(exit));
+    if try_run_plan(&mut args)? {
+        return Ok(RunOutcome::Ok);
     }
     if try_run_session(&mut args)? {
         return Ok(RunOutcome::Ok);
@@ -238,42 +238,12 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         }
     };
 
-    // Planning mode and an approved plan are handed to self-exec'd
-    // subagents via internal environment variables (never public CLI
-    // flags), so the subagent child reconstructs the same mode /
-    // authorization as its parent.
-    let planning_mode = std::env::var("ATTINI_PLANNING_MODE").is_ok();
-    let plan_snapshot_env = std::env::var("ATTINI_PLAN_SNAPSHOT").ok();
-    let plan_sha256_env = std::env::var("ATTINI_PLAN_SHA256").ok();
-
-    let mode = if planning_mode {
-        attini::sansio::permissions::Mode::Planning
-    } else if local_only {
+    let mode = if local_only {
         attini::sansio::permissions::Mode::LocalOnly
     } else {
         attini::sansio::permissions::Mode::Default
     };
-    let authorization = match (plan_snapshot_env, plan_sha256_env) {
-        (Some(snapshot_path), Some(plan_sha256)) => {
-            let text = std::fs::read_to_string(&snapshot_path).map_err(|e| {
-                RunError::Runtime(format!(
-                    "failed to read plan snapshot {}: {e}",
-                    snapshot_path
-                ))
-            })?;
-            let snapshot = attini::plan::parse_snapshot(&text)
-                .map_err(|e| RunError::Runtime(format!("plan snapshot: {e}")))?;
-            if snapshot.plan_sha256 != plan_sha256 {
-                return Err(RunError::Runtime(
-                    "plan snapshot hash does not match the delegated plan hash".to_string(),
-                ));
-            }
-            let mut approved = snapshot.into_approved_plan();
-            approved.snapshot_path = std::path::PathBuf::from(&snapshot_path);
-            attini::sansio::permissions::Authorization::ApprovedPlan(approved)
-        }
-        _ => attini::sansio::permissions::Authorization::PerTool,
-    };
+    let authorization = attini::sansio::permissions::Authorization::PerTool;
 
     let workspace_root = std::env::current_dir()
         .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
@@ -298,13 +268,9 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         skill_name,
         subagent_available,
         authorization,
-        plan_output_path: None,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
         agent_cli::RunOutcome::Exit(code) => Ok(Some(code)),
-        // `submit_plan` is not advertised outside planning mode, so a
-        // plain `attini agent` invocation can never reach here.
-        agent_cli::RunOutcome::PlanSubmitted(_) => Ok(Some(ExitCode::SUCCESS)),
     }
 }
 
@@ -312,248 +278,26 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
 // `attini plan` command family
 // -------------------------------------------------------------------
 
-fn try_run_plan(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
+fn try_run_plan(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     if !noargs::cmd("plan")
-        .doc("Create, review, approve, run, and close Markdown plans")
+        .doc("Show the current plan: latest assistant message + any pending tool call (read-only)")
         .take(args)
         .is_present()
     {
-        return Ok(None);
-    }
-    if let Some(exit) = try_run_plan_create(args)? {
-        return Ok(Some(exit));
-    }
-    if let Some(exit) = try_run_plan_check(args)? {
-        return Ok(Some(exit));
-    }
-    if let Some(exit) = try_run_plan_ok(args)? {
-        return Ok(Some(exit));
-    }
-    if let Some(exit) = try_run_plan_run(args)? {
-        return Ok(Some(exit));
-    }
-    if let Some(exit) = try_run_plan_close(args)? {
-        return Ok(Some(exit));
-    }
-    if args.metadata().help_mode {
-        return Ok(None);
-    }
-    Err(RunError::Runtime(
-        "attini plan requires a sub-command (create, check, ok, run, close)".to_string(),
-    ))
-}
-
-/// Parse the agent options shared by `plan create` and `plan run`.
-fn parse_plan_agent_options(
-    args: &mut noargs::RawArgs,
-) -> Result<attini::plan_cmd::PlanAgentOptions, RunError> {
-    let model: String = noargs::opt("model")
-        .ty("NAME")
-        .doc("Model name")
-        .default(DEFAULT_MODEL)
-        .env("ATTINI_MODEL_NAME")
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let system: Option<String> = noargs::opt("system")
-        .ty("TEXT")
-        .doc("Optional system prompt prepended to the conversation")
-        .take(args)
-        .present_and_then(|o| o.value().parse())?;
-    let show_reasoning = noargs::flag("show-reasoning")
-        .doc("Print reasoning_content deltas to stderr")
-        .take(args)
-        .is_present();
-    let skill_name: Option<String> = noargs::opt("skill")
-        .ty("NAME")
-        .doc("Load the named skill and prepend its SKILL.md body as a system message")
-        .take(args)
-        .present_and_then(|o| o.value().parse())?;
-    let mut read_paths: Vec<std::path::PathBuf> = Vec::new();
-    loop {
-        let taken = noargs::opt("read-path")
-            .ty("PATH")
-            .doc("Extra workspace-external read-only path prefix for this invocation only")
-            .take(args);
-        if !taken.is_present() {
-            break;
-        }
-        let s: String = taken.then(|o| o.value().parse())?;
-        read_paths.push(std::path::PathBuf::from(s));
-    }
-    let turn_tool_call_limit: usize = noargs::opt("turn-tool-call-limit")
-        .ty("N")
-        .doc("Maximum tool calls admitted per model turn")
-        .default(DEFAULT_TURN_TOOL_CALL_LIMIT_STR)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let tool_call_rate_raw: String = noargs::opt("tool-call-rate")
-        .ty("CALLS/SECS|none")
-        .doc("Sliding-window rate cap on admitted tool calls")
-        .default(DEFAULT_TOOL_CALL_RATE_STR)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let session_tool_call_max_raw: String = noargs::opt("session-tool-call-max")
-        .ty("N|none")
-        .doc("Invocation-scope backstop on admitted tool calls")
-        .default(DEFAULT_SESSION_TOOL_CALL_MAX_STR)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    Ok(attini::plan_cmd::PlanAgentOptions {
-        model,
-        system_prompt: system,
-        skill_name,
-        show_reasoning,
-        read_paths,
-        turn_tool_call_limit,
-        tool_call_rate: parse_tool_call_rate(&tool_call_rate_raw)?,
-        session_tool_call_max: parse_session_tool_call_max(&session_tool_call_max_raw)?,
-    })
-}
-
-fn try_run_plan_create(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
-    if !noargs::cmd("create")
-        .doc("Run a read-only planning agent that submits a sealed Markdown plan")
-        .take(args)
-        .is_present()
-    {
-        return Ok(None);
+        return Ok(false);
     }
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
-        .doc("Planner session name; directory is .attini/<NAME>/")
+        .doc("Session name; directory is .attini/<NAME>/")
         .default("main")
         .take(args)
         .then(|o| o.value().parse())?;
-    let output: Option<std::path::PathBuf> = noargs::opt("output")
-        .short('o')
-        .ty("PATH")
-        .doc("Plan output path (workspace-relative .md; refuses to overwrite). Omit for a managed path under .attini/<SESSION>/plans/")
-        .take(args)
-        .present_and_then(|o| o.value().parse())?;
-    let options = parse_plan_agent_options(args)?;
-    let prompt: String = noargs::arg("<PROMPT>")
-        .doc("User prompt describing the plan to produce")
-        .take(args)
-        .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(None);
+        return Ok(false);
     }
-    let exit = attini::plan_cmd::run_create(&session_name, output.as_deref(), &options, &prompt)
-        .map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(Some(exit))
-}
-
-fn try_run_plan_check(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
-    if !noargs::cmd("check")
-        .doc("Validate a plan's structure, seal, and confirmations; report executability")
-        .take(args)
-        .is_present()
-    {
-        return Ok(None);
-    }
-    let plan_path: String = noargs::arg("<PLAN.md>")
-        .doc("Path to the plan file")
-        .take(args)
-        .then(|a| a.value().parse())?;
-    if args.metadata().help_mode {
-        return Ok(None);
-    }
-    let exit = attini::plan_cmd::run_check(std::path::Path::new(&plan_path))
-        .map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(Some(exit))
-}
-
-fn try_run_plan_ok(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
-    if !noargs::cmd("ok")
-        .doc("Approve a plan: update confirmation checkboxes and re-seal it")
-        .take(args)
-        .is_present()
-    {
-        return Ok(None);
-    }
-    let all = noargs::flag("all")
-        .short('a')
-        .doc("Check all-ok and uncheck every individual confirmation")
-        .take(args)
-        .is_present();
-    let plan_path: String = noargs::arg("<PLAN.md>")
-        .doc("Path to the plan file")
-        .take(args)
-        .then(|a| a.value().parse())?;
-    let mut item_ids: Vec<String> = Vec::new();
-    loop {
-        let taken = noargs::arg("[ITEM_ID]")
-            .doc("Confirmation id(s) to check; unchecks all-ok. Mutually exclusive with -a")
-            .take(args);
-        if !taken.is_present() {
-            break;
-        }
-        let s: String = taken.then(|a| a.value().parse())?;
-        item_ids.push(s);
-    }
-    if args.metadata().help_mode {
-        return Ok(None);
-    }
-    if all && !item_ids.is_empty() {
-        return Err(RunError::Runtime(
-            "-a / --all and ITEM_ID are mutually exclusive".to_string(),
-        ));
-    }
-    let exit = attini::plan_cmd::run_ok(std::path::Path::new(&plan_path), all, &item_ids)
-        .map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(Some(exit))
-}
-
-fn try_run_plan_run(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
-    if !noargs::cmd("run")
-        .doc("Execute a sealed plan with its actions as invocation-limited authorization")
-        .take(args)
-        .is_present()
-    {
-        return Ok(None);
-    }
-    let session_name: Option<String> = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session to run in (defaults to the session inferred from a managed plan path, else main)")
-        .take(args)
-        .present_and_then(|o| o.value().parse())?;
-    let options = parse_plan_agent_options(args)?;
-    let plan_path: String = noargs::arg("<PLAN.md>")
-        .doc("Path to the sealed plan file")
-        .take(args)
-        .then(|a| a.value().parse())?;
-    if args.metadata().help_mode {
-        return Ok(None);
-    }
-    let exit = attini::plan_cmd::run_run(
-        session_name.as_deref(),
-        std::path::Path::new(&plan_path),
-        &options,
-    )
-    .map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(Some(exit))
-}
-
-fn try_run_plan_close(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
-    if !noargs::cmd("close")
-        .doc("Move a managed plan into its session's plans/closed/ directory")
-        .take(args)
-        .is_present()
-    {
-        return Ok(None);
-    }
-    let plan_path: String = noargs::arg("<PLAN.md>")
-        .doc("Path to the managed plan file")
-        .take(args)
-        .then(|a| a.value().parse())?;
-    if args.metadata().help_mode {
-        return Ok(None);
-    }
-    let exit = attini::plan_cmd::run_close(std::path::Path::new(&plan_path))
-        .map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(Some(exit))
+    session_cmd::run_plan_view(&session_name).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(true)
 }
 
 fn parse_tool_call_rate(raw: &str) -> Result<Option<RateLimit>, RunError> {

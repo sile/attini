@@ -1,7 +1,6 @@
 //! Sync single-turn agent loop for `attini agent`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
@@ -13,9 +12,8 @@ use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::plan::ApprovedPlan;
 use crate::sansio::agent::{
-    CommandError, CommandInvocation, PatchInvocation, PatchPreview, PlanProposeInvocation,
-    ReadOnlyTool, SkillLoadInvocation, SubagentRunInvocation, SubmitPlanInvocation,
-    ToolExecutionError, ToolOutcome,
+    CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
+    SkillLoadInvocation, SubagentRunInvocation, ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
@@ -213,10 +211,6 @@ pub struct AgentConfig {
     /// [`Authorization::ApprovedPlan`]; every other entry point uses
     /// the default `PerTool`.
     pub authorization: Authorization,
-    /// When set (by `plan create`), a successful `submit_plan`
-    /// terminal tool call writes the rendered plan to this path and
-    /// ends the invocation.
-    pub plan_output_path: Option<std::path::PathBuf>,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -245,9 +239,6 @@ pub enum Continuation {
 pub enum RunOutcome {
     /// Normal exit with the process exit code.
     Exit(ExitCode),
-    /// A planning-mode `submit_plan` terminal tool wrote a plan and
-    /// ended the invocation. Carries the written plan path.
-    PlanSubmitted(PathBuf),
 }
 
 pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
@@ -286,7 +277,6 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
 
     let (reason, exit_code) = match &outcome {
         Ok(Driven::Completed) => (InvocationEndReason::Completed, EXIT_OK),
-        Ok(Driven::PlanSubmitted(_)) => (InvocationEndReason::Completed, EXIT_OK),
         Ok(Driven::AwaitingApproval) => (
             InvocationEndReason::AwaitingApproval,
             EXIT_AWAITING_APPROVAL,
@@ -308,7 +298,6 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
     match outcome {
-        Ok(Driven::PlanSubmitted(path)) => Ok(RunOutcome::PlanSubmitted(path)),
         Ok(_) => Ok(RunOutcome::Exit(ExitCode::from(exit_code))),
         Err(e) => {
             eprintln!("attini: {e}");
@@ -319,8 +308,6 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
 
 enum Driven {
     Completed,
-    /// A planning-mode `submit_plan` terminal tool wrote a plan.
-    PlanSubmitted(PathBuf),
     AwaitingApproval,
     /// Invocation-scope tool-call backstop tripped
     /// ([`AgentConfig::session_tool_call_max`]).
@@ -539,19 +526,6 @@ fn drive(
         messages.push(assistant);
 
         if call_result.tool_calls.is_empty() {
-            // In planning mode the invocation must end with
-            // `submit_plan`; a bare final response gets a corrective
-            // prompt and the loop retries (bounded by max_turns).
-            if cfg.mode == Mode::Planning {
-                let corrective = "You did not call submit_plan. Investigate the workspace and \
-                    end your reply by calling the submit_plan tool with the final plan.";
-                session.append(&SessionRecord::User {
-                    ts: now_unix_millis(),
-                    text: corrective.to_string(),
-                })?;
-                messages.push(ChatMessage::User(corrective.to_string()));
-                continue;
-            }
             return Ok(Driven::Completed);
         }
 
@@ -567,7 +541,6 @@ fn drive(
                 "command" => counters.tool_calls_by_kind.command += 1,
                 "skill_load" => counters.tool_calls_by_kind.skill_load += 1,
                 "subagent_run" => counters.tool_calls_by_kind.subagent_run += 1,
-                "submit_plan" => counters.tool_calls_by_kind.submit_plan += 1,
                 _ => counters.tool_calls_by_kind.unknown += 1,
             }
             match gate.admit(Instant::now()) {
@@ -664,15 +637,6 @@ fn drive(
                 ToolKind::SubagentRun => {
                     let content = run_subagent_run(tc, cfg, counters);
                     append_tool(session, &mut messages, &tc.id, content)?;
-                }
-                ToolKind::SubmitPlan => {
-                    if let Some(path) = run_submit_plan(tc, cfg, session, &mut messages, counters)?
-                    {
-                        return Ok(Driven::PlanSubmitted(path));
-                    }
-                }
-                ToolKind::Plan => {
-                    run_plan_propose(tc, session, &mut messages, counters)?;
                 }
                 ToolKind::Unknown => {
                     let content = tool_error_json(
@@ -956,176 +920,6 @@ fn run_subagent_run(tc: &ToolCall, cfg: &AgentConfig, counters: &mut Counters) -
     }
 }
 
-/// Dispatch a `submit_plan` terminal tool call in planning mode:
-/// render the structured plan components into a sealed Markdown plan
-/// file, write it atomically (refusing to overwrite), append the
-/// `PlanCreated` session record and the tool record, and end the
-/// invocation. A `None` return means the arguments were invalid: the
-/// error tool result was appended and the loop should continue so the
-/// model can retry.
-fn run_submit_plan(
-    tc: &ToolCall,
-    cfg: &AgentConfig,
-    session: &mut Session,
-    messages: &mut Vec<ChatMessage>,
-    counters: &mut Counters,
-) -> io::Result<Option<std::path::PathBuf>> {
-    let inv = match SubmitPlanInvocation::parse(&tc.arguments_json) {
-        Ok(inv) => inv,
-        Err(err) => {
-            counters.tool_errors += 1;
-            eprintln!("[submit_plan] parse err: {err:?}");
-            let content = tool_error_json_from(&err);
-            append_tool(session, messages, &tc.id, content)?;
-            return Ok(None);
-        }
-    };
-    let output = cfg.plan_output_path.as_ref().ok_or_else(|| {
-        io::Error::other("submit_plan called but no plan output path is configured")
-    })?;
-    if output.exists() {
-        return Err(io::Error::other(format!(
-            "refusing to overwrite existing plan file {}",
-            output.display()
-        )));
-    }
-
-    write_plan_from_invocation(&inv, output, session, messages, &tc.id, counters)?;
-    Ok(Some(output.clone()))
-}
-
-/// Non-terminal `plan` tool dispatcher. Writes a sealed plan artifact
-/// under the session's `plans/` directory (auto-named, O_EXCL) and
-/// returns without ending the invocation.
-fn run_plan_propose(
-    tc: &ToolCall,
-    session: &mut Session,
-    messages: &mut Vec<ChatMessage>,
-    counters: &mut Counters,
-) -> io::Result<()> {
-    let inv = match SubmitPlanInvocation::parse(&tc.arguments_json) {
-        Ok(inv) => inv,
-        Err(err) => {
-            counters.tool_errors += 1;
-            eprintln!("[plan] parse err: {err:?}");
-            let content = tool_error_json_from(&err);
-            append_tool(session, messages, &tc.id, content)?;
-            return Ok(());
-        }
-    };
-    let output = next_plan_output(session.dir())?;
-    write_plan_from_invocation(&inv, &output, session, messages, &tc.id, counters)?;
-    Ok(())
-}
-
-/// Render a [`SubmitPlanInvocation`] into a sealed plan file at
-/// `output` (O_EXCL, refusing overwrite), then append the
-/// `PlanCreated` record and a tool result to the conversation.
-/// Shared by the terminal `submit_plan` tool and the non-terminal
-/// `plan` proposal tool.
-fn write_plan_from_invocation(
-    inv: &SubmitPlanInvocation,
-    output: &std::path::Path,
-    session: &mut Session,
-    messages: &mut Vec<ChatMessage>,
-    tool_id: &str,
-    counters: &mut Counters,
-) -> io::Result<()> {
-    let mut confirmations: Vec<crate::plan::Confirmation> =
-        Vec::with_capacity(inv.confirmations.len() + 1);
-    confirmations.push(crate::plan::Confirmation::unchecked(
-        crate::plan::RESERVED_CONFIRMATION_ID,
-        crate::plan::ALL_OK_DESCRIPTION,
-    ));
-    confirmations.extend(
-        inv.confirmations
-            .iter()
-            .map(|c| crate::plan::Confirmation::unchecked(&c.id, &c.description)),
-    );
-    let actions = crate::plan::PlanActions {
-        patches: inv
-            .patches
-            .iter()
-            .map(|p| crate::plan::PlanPatchAction {
-                id: p.id.clone(),
-                path: p.path.clone(),
-                description: p.description.clone(),
-            })
-            .collect(),
-        commands: inv
-            .commands
-            .iter()
-            .map(|c| crate::plan::PlanCommandAction {
-                id: c.id.clone(),
-                argv: c.argv.clone(),
-                description: c.description.clone(),
-            })
-            .collect(),
-    };
-    let text = crate::plan::render_sealed(&inv.body_markdown, &actions, &confirmations)
-        .map_err(|e| io::Error::other(format!("plan render failed: {e}")))?;
-    let plan_sha256 =
-        crate::plan::seal_hash(text.as_bytes()).map_err(|e| io::Error::other(e.to_string()))?;
-
-    write_plan_atomic(output, text.as_bytes())?;
-    eprintln!("[plan] wrote {}", output.display());
-
-    session.append(&SessionRecord::PlanCreated {
-        ts: now_unix_millis(),
-        path: output.display().to_string(),
-        plan_sha256: plan_sha256.clone(),
-    })?;
-    let result = plan_result_json(output, &plan_sha256);
-    append_tool(session, messages, tool_id, result)?;
-    counters.plan_created += 1;
-    Ok(())
-}
-
-/// Pick a fresh `plans/plan-<ts>-<attempt>.md` path under the session
-/// directory, creating the directory if needed.
-fn next_plan_output(session_dir: &std::path::Path) -> io::Result<std::path::PathBuf> {
-    let dir = session_dir.join("plans");
-    std::fs::create_dir_all(&dir)?;
-    let ts = now_unix_millis();
-    for attempt in 0..200u32 {
-        let path = dir.join(format!("plan-{ts:016x}-{attempt:04x}.md"));
-        if !path.exists() {
-            return Ok(path);
-        }
-    }
-    Err(io::Error::other(
-        "could not allocate a unique plan filename",
-    ))
-}
-
-/// Atomically write `bytes` to `path`, failing if the path already
-/// exists (`O_EXCL`).
-fn write_plan_atomic(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write as _;
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(bytes)?;
-    file.flush()
-}
-
-fn plan_result_json(path: &std::path::Path, plan_sha256: &str) -> String {
-    use nojson::DisplayJson;
-    struct Payload<'a> {
-        path: &'a std::path::Path,
-        plan_sha256: &'a str,
-    }
-    impl DisplayJson for Payload<'_> {
-        fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
-            f.object(|f| {
-                f.member("path", self.path.display().to_string())?;
-                f.member("plan_sha256", self.plan_sha256)
-            })
-        }
-    }
-    nojson::Json(Payload { path, plan_sha256 }).to_string()
-}
-
 fn state_str(state: crate::subagent::SubagentState) -> &'static str {
     match state {
         crate::subagent::SubagentState::Completed => "completed",
@@ -1300,15 +1094,11 @@ fn build_tool_defs(mode: Mode, subagent_available: bool) -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
     if !matches!(mode, Mode::Planning) {
         defs.push(PatchInvocation::definition());
-        defs.push(PlanProposeInvocation::definition());
     }
     defs.push(CommandInvocation::definition());
     defs.push(SkillLoadInvocation::definition());
     if subagent_available {
         defs.push(SubagentRunInvocation::definition());
-    }
-    if mode == Mode::Planning {
-        defs.push(SubmitPlanInvocation::definition());
     }
     defs
 }
@@ -1672,8 +1462,6 @@ enum ToolKind {
     Command,
     Skill,
     SubagentRun,
-    SubmitPlan,
-    Plan,
     Unknown,
 }
 
@@ -1684,8 +1472,6 @@ fn classify(name: &str) -> ToolKind {
         "command" => ToolKind::Command,
         "skill_load" => ToolKind::Skill,
         "subagent_run" => ToolKind::SubagentRun,
-        "submit_plan" => ToolKind::SubmitPlan,
-        "plan" => ToolKind::Plan,
         _ => ToolKind::Unknown,
     }
 }
@@ -2305,7 +2091,6 @@ mod tests {
             skill_name: None,
             subagent_available: false,
             authorization: Authorization::PerTool,
-            plan_output_path: None,
         }
     }
 
@@ -2459,73 +2244,18 @@ mod tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn build_tool_defs_exposes_plan_only_outside_planning_mode() {
-        let normal = build_tool_defs(Mode::Default, true);
-        assert!(
-            normal.iter().any(|d| d.name == "plan"),
-            "`plan` tool missing in normal mode"
-        );
-        assert!(
-            !normal.iter().any(|d| d.name == "submit_plan"),
-            "`submit_plan` must not be exposed in normal mode"
-        );
-
-        let planning = build_tool_defs(Mode::Planning, true);
-        assert!(
-            !planning.iter().any(|d| d.name == "plan"),
-            "`plan` tool must not be exposed in planning mode"
-        );
-        assert!(
-            planning.iter().any(|d| d.name == "submit_plan"),
-            "`submit_plan` must be exposed in planning mode"
-        );
-    }
-
-    // -------------------------------------------------------------
-    // next_plan_output / write_plan_atomic
-    // -------------------------------------------------------------
-
-    fn temp_plan_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("attini-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
-
-    #[test]
-    fn write_plan_atomic_refuses_to_overwrite() {
-        let dir = temp_plan_dir("plan-ow");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("p.md");
-
-        write_plan_atomic(&path, b"first").unwrap();
-        assert!(path.exists());
-
-        // O_EXCL must reject a second write to the same path.
-        assert!(write_plan_atomic(&path, b"second").is_err());
-
-        // The original content is left untouched.
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn next_plan_output_creates_plans_dir_and_skips_existing() {
-        let dir = temp_plan_dir("plan-next");
-        let p1 = next_plan_output(&dir).unwrap();
-
-        // The session-local plans/ directory is created on demand.
-        assert!(dir.join("plans").is_dir());
-        // Allocating a path must not create the file yet.
-        assert!(!p1.exists());
-
-        write_plan_atomic(&p1, b"x").unwrap();
-
-        // A second allocation must not hand out the already-taken path.
-        let p2 = next_plan_output(&dir).unwrap();
-        assert_ne!(p1, p2);
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn build_tool_defs_exposes_no_plan_tools() {
+        for mode in [Mode::Default, Mode::Planning] {
+            let defs = build_tool_defs(mode, true);
+            assert!(
+                !defs.iter().any(|d| d.name == "plan"),
+                "`plan` tool must not be exposed"
+            );
+            assert!(
+                !defs.iter().any(|d| d.name == "submit_plan"),
+                "`submit_plan` tool must not be exposed"
+            );
+        }
     }
 
     // -------------------------------------------------------------
