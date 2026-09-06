@@ -10,7 +10,6 @@ use nojson::DisplayJson;
 
 use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
-use crate::plan::ApprovedPlan;
 use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
     SkillLoadInvocation, SubagentRunInvocation, ToolExecutionError, ToolOutcome,
@@ -467,7 +466,7 @@ fn drive(
         }
     }
 
-    let tools = build_tool_defs(cfg.mode, cfg.subagent_available);
+    let tools = build_tool_defs(cfg.subagent_available);
     let rules = permissions::load(&cfg.session_name)?;
     let mut gate = ToolCallGate::new(cfg);
 
@@ -600,19 +599,10 @@ fn drive(
                     append_tool(session, &mut messages, &tc.id, content)?;
                 }
                 ToolKind::Patch => {
-                    if let Authorization::ApprovedPlan(plan) = &cfg.authorization {
-                        run_plan_patch(tc, executor, session, &mut messages, counters, plan)?;
-                    } else {
-                        match dispatch_patch_unapproved(
-                            tc,
-                            executor,
-                            session,
-                            &mut messages,
-                            counters,
-                        )? {
-                            PatchDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
-                            PatchDispatch::Continue => {}
-                        }
+                    match dispatch_patch_unapproved(tc, executor, session, &mut messages, counters)?
+                    {
+                        PatchDispatch::Awaiting => return Ok(Driven::AwaitingApproval),
+                        PatchDispatch::Continue => {}
                     }
                 }
                 ToolKind::Command => {
@@ -878,10 +868,6 @@ fn run_subagent_run(tc: &ToolCall, cfg: &AgentConfig, counters: &mut Counters) -
         &inv.prompt,
         &cfg.model,
         cfg.mode,
-        match &cfg.authorization {
-            Authorization::ApprovedPlan(plan) => Some(plan),
-            Authorization::PerTool => None,
-        },
     ) {
         Ok(status) => {
             eprintln!(
@@ -1122,11 +1108,9 @@ fn is_safe_boundary(msg: &ChatMessage) -> bool {
     }
 }
 
-fn build_tool_defs(mode: Mode, subagent_available: bool) -> Vec<ToolDef> {
+fn build_tool_defs(subagent_available: bool) -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
-    if !matches!(mode, Mode::Planning) {
-        defs.push(PatchInvocation::definition());
-    }
+    defs.push(PatchInvocation::definition());
     defs.push(CommandInvocation::definition());
     defs.push(SkillLoadInvocation::definition());
     if subagent_available {
@@ -1192,44 +1176,6 @@ fn dispatch_command(
             append_tool(session, messages, &tc.id, content)?;
             Ok(CommandDispatch::Continue)
         }
-        Judgment::PlanAction { action_id } => {
-            let plan = match authorization {
-                Authorization::ApprovedPlan(plan) => plan,
-                Authorization::PerTool => unreachable!("PlanAction requires ApprovedPlan"),
-            };
-            eprintln!("[command] plan action '{action_id}': {display}");
-            append_plan_action_approval(session, &tc.id, plan, &action_id)?;
-            counters.plan_action_approvals += 1;
-            let content = match run_command_sync(&inv, executor) {
-                Ok(s) => s,
-                Err(err) => {
-                    let (code, msg) = err.to_code_and_message();
-                    counters.tool_errors += 1;
-                    let payload = tool_error_json(code, &msg);
-                    append_tool(session, messages, &tc.id, payload)?;
-                    return Ok(CommandDispatch::Continue);
-                }
-            };
-            append_tool(session, messages, &tc.id, content)?;
-            Ok(CommandDispatch::Continue)
-        }
-        Judgment::PlanActionNotApproved => {
-            let message = format!(
-                "plan action not approved: {} is not listed in the approved plan. \
-                 Stop and propose the exact action to add.",
-                display
-            );
-            eprintln!("[command] plan_action_not_approved: {display}");
-            counters.plan_action_rejections += 1;
-            counters.tool_errors += 1;
-            append_tool(
-                session,
-                messages,
-                &tc.id,
-                tool_error_json("plan_action_not_approved", &message),
-            )?;
-            Ok(CommandDispatch::Continue)
-        }
         Judgment::AutoDeny(dec) => {
             let dec_display = shell_escape_argv(&dec.argv_prefix);
             eprintln!(
@@ -1245,36 +1191,6 @@ fn dispatch_command(
                     "auto-denied by {} rule argv_prefix {:?}",
                     dec.scope.as_str(),
                     dec.argv_prefix
-                ),
-            );
-            counters.tool_errors += 1;
-            append_tool(session, messages, &tc.id, content)?;
-            Ok(CommandDispatch::Continue)
-        }
-        Judgment::PlanReject { reason } => {
-            eprintln!(
-                "[command] plan_mode reject ({}): {}",
-                reason.as_str(),
-                display
-            );
-            let sidecar = AutoDecidedBy {
-                scope: "plan".to_string(),
-                argv_prefix: Vec::new(),
-                reason: format!("plan_mode_reject:{}", reason.as_str()),
-                plan_sha256: None,
-                action_id: None,
-            };
-            session.append(&SessionRecord::ToolApproval {
-                ts: now_unix_millis(),
-                call_id: tc.id.clone(),
-                decision: ApprovalDecision::Reject,
-                auto_decided_by: Some(sidecar),
-            })?;
-            let content = tool_error_json(
-                "plan_mode",
-                &format!(
-                    "plan mode: command rejected ({}). drop --plan to run manually.",
-                    reason.as_str()
                 ),
             );
             counters.tool_errors += 1;
@@ -1311,94 +1227,6 @@ fn append_auto_approval(
         decision,
         auto_decided_by: Some(sidecar),
     })
-}
-
-/// Record a `ToolApproval` for an approved-plan action.
-fn append_plan_action_approval(
-    session: &mut Session,
-    call_id: &str,
-    plan: &ApprovedPlan,
-    action_id: &str,
-) -> io::Result<()> {
-    let sidecar = AutoDecidedBy {
-        scope: "plan".to_string(),
-        argv_prefix: Vec::new(),
-        reason: "plan_action".to_string(),
-        plan_sha256: Some(plan.plan_sha256.clone()),
-        action_id: Some(action_id.to_string()),
-    };
-    session.append(&SessionRecord::ToolApproval {
-        ts: now_unix_millis(),
-        call_id: call_id.to_string(),
-        decision: ApprovalDecision::Approve,
-        auto_decided_by: Some(sidecar),
-    })
-}
-
-/// Apply a patch under an approved plan: every edit target path must
-/// be listed in the plan's patch actions. Unlisted paths are surfaced
-/// as a `plan_action_not_approved` error tool result (never a pending)
-/// and the batch is not applied.
-fn run_plan_patch(
-    tc: &ToolCall,
-    executor: &ToolExecutor,
-    session: &mut Session,
-    messages: &mut Vec<ChatMessage>,
-    counters: &mut Counters,
-    plan: &ApprovedPlan,
-) -> io::Result<()> {
-    let inv = match PatchInvocation::parse(&tc.arguments_json) {
-        Ok(inv) => inv,
-        Err(err) => {
-            let content = tool_error_json("patch_args", &format!("{err:?}"));
-            eprintln!("[patch] parse err: {err:?}");
-            counters.tool_errors += 1;
-            counters.plan_action_rejections += 1;
-            return append_tool(session, messages, &tc.id, content);
-        }
-    };
-    let mut missing: Vec<String> = Vec::new();
-    let mut action_ids: Vec<String> = Vec::new();
-    for edit in &inv.edits {
-        match plan.actions.patch_by_path(edit.path()) {
-            Some(action) => action_ids.push(action.id.clone()),
-            None => missing.push(edit.path().to_string()),
-        }
-    }
-    if !missing.is_empty() {
-        let message = format!(
-            "plan action not approved: patch paths {:?} are not listed in the approved plan. \
-             Stop and propose the exact paths to add.",
-            missing
-        );
-        eprintln!("[patch] plan_action_not_approved: {missing:?}");
-        counters.plan_action_rejections += 1;
-        counters.tool_errors += 1;
-        return append_tool(
-            session,
-            messages,
-            &tc.id,
-            tool_error_json("plan_action_not_approved", &message),
-        );
-    }
-    let (hashes, _preview) = executor
-        .preview_patch(&inv)
-        .map_err(|e| io::Error::other(format!("patch preview: {e:?}")))?;
-    let paths = executor
-        .apply_patch(&inv, &hashes)
-        .map_err(|e| io::Error::other(format!("patch apply: {e:?}")))?;
-    let action_id = action_ids.first().cloned().unwrap_or_default();
-    append_plan_action_approval(session, &tc.id, plan, &action_id)?;
-    counters.plan_action_approvals += 1;
-    eprintln!(
-        "[patch] plan action: {}",
-        paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    append_tool(session, messages, &tc.id, patch_result_json(&paths))
 }
 
 /// Suggest the two `attini session grant` invocations that would
@@ -1774,12 +1602,12 @@ fn repair_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<OrphanedT
                     if placed.contains(&tc.id) {
                         continue;
                     }
-                    if let Some(queue) = tools_by_call.get_mut(&tc.id) {
-                        if let Some(tool_msg) = queue.pop_front() {
-                            repaired.push(tool_msg);
-                            placed.insert(tc.id.clone());
-                            continue;
-                        }
+                    if let Some(queue) = tools_by_call.get_mut(&tc.id)
+                        && let Some(tool_msg) = queue.pop_front()
+                    {
+                        repaired.push(tool_msg);
+                        placed.insert(tc.id.clone());
+                        continue;
                     }
                     let content = tool_error_json(
                         "unanswered_tool_call",
@@ -2277,17 +2105,15 @@ mod tests {
 
     #[test]
     fn build_tool_defs_exposes_no_plan_tools() {
-        for mode in [Mode::Default, Mode::Planning] {
-            let defs = build_tool_defs(mode, true);
-            assert!(
-                !defs.iter().any(|d| d.name == "plan"),
-                "`plan` tool must not be exposed"
-            );
-            assert!(
-                !defs.iter().any(|d| d.name == "submit_plan"),
-                "`submit_plan` tool must not be exposed"
-            );
-        }
+        let defs = build_tool_defs(true);
+        assert!(
+            !defs.iter().any(|d| d.name == "plan"),
+            "`plan` tool must not be exposed"
+        );
+        assert!(
+            !defs.iter().any(|d| d.name == "submit_plan"),
+            "`submit_plan` tool must not be exposed"
+        );
     }
 
     // -------------------------------------------------------------

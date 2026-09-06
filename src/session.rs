@@ -272,10 +272,8 @@ pub fn read_chat_message_with_ts(path: &Path, all: bool) -> io::Result<Vec<ChatM
             }
         }
     }
-    if !all {
-        if let Some(cutoff) = latest_cutoff {
-            records.retain(|r| r.ts > cutoff);
-        }
+    if !all && let Some(cutoff) = latest_cutoff {
+        records.retain(|r| r.ts > cutoff);
     }
     Ok(records)
 }
