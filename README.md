@@ -87,18 +87,18 @@ current directory (the workspace root), the enclosing git repository (when
 present), the current branch, and whether the root is a linked git worktree — so
 the model is aware of which repo/branch it is editing even before the first turn.
 
-When an `attini agent` invocation ends, a one-line diagnostic is printed to
+When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
 ```
-attini: [agent] model=deepseek-v4-flash session=main reason=completed exit=0 turns=3 duration=9.4s prompt=1234 completion=567 ctx=20736/65536
+[agent] model=deepseek-v4-flash session=main ctx=20736/65536
 ```
 
-`model=`/`session=` disambiguate which session and model advanced, `reason=`/`exit=`
-summarise the outcome, `turns=`/`duration=` are the invocation shape, and `ctx=` is
-the **current** conversation size (last per-call `prompt_tokens`, not the
+`model=`/`session=` show which session/model is about to advance, and `ctx=` is
+the **current** conversation size (the last recorded `prompt_tokens`, not the
 cumulative billed total) against the 64 K window — so you can see how close the
-session is to compaction. `ATTINI_STATUS_LINE=0` disables the line.
+session is to compaction before it runs. `ATTINI_STATUS_LINE=0` disables the
+line.
 
 ### Model selection
 

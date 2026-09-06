@@ -273,6 +273,20 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
         model: cfg.model.clone(),
     })?;
 
+    // One-line start-of-invocation breadcrumb to stderr (a diagnostic, not
+    // machine-consumed output). Printed BEFORE the model runs: it tells the
+    // human which session/model is about to advance and how big the current
+    // conversation already is against the context window. `ctx=` comes from
+    // the last recorded `prompt_tokens` (the conversation size so far), not
+    // the cumulative billed total. Disabled with ATTINI_STATUS_LINE=0.
+    if std::env::var("ATTINI_STATUS_LINE").as_deref() != Ok("0") {
+        let ctx_tokens = session.latest_prompt_tokens().ok().flatten().unwrap_or(0);
+        eprintln!(
+            "{}",
+            render_agent_status_line(&cfg.model, &cfg.session_name, ctx_tokens)
+        );
+    }
+
     let mut counters = Counters::default();
     let outcome = drive(&mut session, &executor, &cfg, cont, &mut counters);
 
@@ -298,24 +312,6 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     });
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
-    // One-line end-of-invocation breadcrumb to stderr (a diagnostic, not
-    // machine-consumed output). Tells the human which session/model ran, how
-    // it ended, and how close the conversation is to the context window.
-    // Disabled with ATTINI_STATUS_LINE=0.
-    if std::env::var("ATTINI_STATUS_LINE").as_deref() != Ok("0") {
-        eprintln!(
-            "{}",
-            render_agent_status_line(
-                &cfg.model,
-                &cfg.session_name,
-                reason,
-                exit_code,
-                duration_ms,
-                &counters,
-            )
-        );
-    }
-
     match outcome {
         Ok(_) => Ok(RunOutcome::Exit(ExitCode::from(exit_code))),
         Err(e) => {
@@ -325,42 +321,15 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     }
 }
 
-/// Human-friendly duration for the status line. Sub-second values show
-/// milliseconds; one second and above show one decimal in seconds.
-fn humanise_duration(duration_ms: u64) -> String {
-    if duration_ms < 1000 {
-        format!("{duration_ms}ms")
-    } else {
-        let secs = duration_ms as f64 / 1000.0;
-        format!("{secs:.1}s")
-    }
-}
-
-/// Render the single-line end-of-invocation breadcrumb written to stderr
+/// Render the single-line start-of-invocation breadcrumb written to stderr
 /// by [`run`]. Pure function so the format can be unit-tested without
-/// touching stdout. `ctx=` uses [`Counters::prompt_tokens_last`] (the last
-/// per-call input size = the current conversation size), not the cumulative
-/// `prompt_tokens_billed_total`.
-fn render_agent_status_line(
-    model: &str,
-    session_name: &str,
-    reason: InvocationEndReason,
-    exit_code: u8,
-    duration_ms: u64,
-    counters: &Counters,
-) -> String {
+/// touching stdout. `ctx=` is the current conversation size (the last
+/// recorded `prompt_tokens`) handed in by the caller; it is not the
+/// cumulative billed total.
+fn render_agent_status_line(model: &str, session_name: &str, ctx_tokens: u64) -> String {
     format!(
-        "attini: [agent] model={} session={} reason={} exit={} turns={} duration={} prompt={} completion={} ctx={}/{}",
-        model,
-        session_name,
-        reason.as_str(),
-        exit_code,
-        counters.turns,
-        humanise_duration(duration_ms),
-        counters.prompt_tokens_billed_total,
-        counters.completion_tokens_total,
-        counters.prompt_tokens_last,
-        MODEL_CONTEXT_TOKENS,
+        "[agent] model={} session={} ctx={}/{}",
+        model, session_name, ctx_tokens, MODEL_CONTEXT_TOKENS,
     )
 }
 
@@ -3025,62 +2994,23 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // render_agent_status_line / humanise_duration
+    // render_agent_status_line
     // -------------------------------------------------------------
 
     #[test]
-    fn humanise_duration_sub_second_shows_ms() {
-        assert_eq!(humanise_duration(0), "0ms");
-        assert_eq!(humanise_duration(999), "999ms");
-    }
-
-    #[test]
-    fn humanise_duration_seconds_shows_one_decimal() {
-        assert_eq!(humanise_duration(1000), "1.0s");
-        assert_eq!(humanise_duration(9400), "9.4s");
-    }
-
-    #[test]
     fn status_line_render_includes_session_and_ctx() {
-        let counters = Counters {
-            turns: 3,
-            prompt_tokens_billed_total: 1234,
-            completion_tokens_total: 567,
-            prompt_tokens_last: 20736,
-            ..Counters::default()
-        };
-        let line = render_agent_status_line(
-            "deepseek-v4-flash",
-            "main",
-            InvocationEndReason::Completed,
-            EXIT_OK,
-            9400,
-            &counters,
-        );
+        let line = render_agent_status_line("deepseek-v4-flash", "main", 20736);
         assert_eq!(
             line,
-            "attini: [agent] model=deepseek-v4-flash session=main reason=completed exit=0 turns=3 duration=9.4s prompt=1234 completion=567 ctx=20736/65536"
+            "[agent] model=deepseek-v4-flash session=main ctx=20736/65536"
         );
     }
 
     #[test]
-    fn status_line_uses_last_prompt_tokens_not_cumulative_for_ctx() {
-        let counters = Counters {
-            prompt_tokens_billed_total: 99999,
-            prompt_tokens_last: 1000,
-            ..Counters::default()
-        };
-        let line = render_agent_status_line(
-            "m",
-            "s",
-            InvocationEndReason::AwaitingApproval,
-            EXIT_AWAITING_APPROVAL,
-            5,
-            &counters,
-        );
+    fn status_line_uses_passed_ctx_as_current_size() {
+        let line = render_agent_status_line("m", "s", 1000);
         assert!(line.contains("ctx=1000/65536"));
-        assert!(line.contains("prompt=99999"));
-        assert!(line.contains("reason=awaiting_approval"));
-        assert!(line.contains("exit=10"));
+        assert!(line.contains("model=m"));
+        assert!(line.contains("session=s"));
     }
 }
