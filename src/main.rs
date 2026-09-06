@@ -644,8 +644,8 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutco
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
         .doc(
-            "Write to workspace-wide .attini/permissions.json instead of session-local \
-             (mutually exclusive with -s / --session)",
+            "Write to workspace-wide .attini/permissions.json instead of session-local; \
+             -s / --session (or ATTINI_SESSION_NAME) is ignored when set",
         )
         .take(args)
         .is_present();
@@ -659,11 +659,6 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutco
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
-    }
-    if workspace && session_name != "main" {
-        return Err(RunError::Runtime(
-            "-s / --session and --workspace are mutually exclusive".to_string(),
-        ));
     }
     let scope = if workspace {
         attini::permissions::GrantScope::Workspace
@@ -704,7 +699,7 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, R
         .take(args)
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
-        .doc("Write to workspace-wide .attini/permissions.json instead of session-local (mutually exclusive with -s / --session)")
+        .doc("Write to workspace-wide .attini/permissions.json instead of session-local; -s / --session (or ATTINI_SESSION_NAME) is ignored when set")
         .take(args)
         .is_present();
     // argv-prefix as variadic positional args: read until args is exhausted.
@@ -727,15 +722,6 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, R
     }
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
-    }
-    // -s explicitly given AND --workspace both present is ambiguous; we can't detect
-    // the "explicit" -s from noargs (default fills in), so we only reject the pair when
-    // --workspace is set and NAME is not the default. That's imperfect (user could set -s main
-    // + --workspace and we'd accept) but matches user intent for the common case.
-    if workspace && session_name != "main" {
-        return Err(RunError::Runtime(
-            "-s / --session and --workspace are mutually exclusive".to_string(),
-        ));
     }
     let scope = if workspace {
         attini::permissions::GrantScope::Workspace
