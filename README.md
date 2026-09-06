@@ -82,6 +82,11 @@ roots and referenced by absolute path (readable with the `read` tool).
 `--max-tokens N` caps the completion-token budget for every model call in the
 run. When omitted the model's own default is used.
 
+The system prompt also includes a `# Workspace context` block that names the
+current directory (the workspace root), the enclosing git repository (when
+present), the current branch, and whether the root is a linked git worktree — so
+the model is aware of which repo/branch it is editing even before the first turn.
+
 ### Model selection
 
 - Default model: `deepseek-v4-flash` (override with `--model`)

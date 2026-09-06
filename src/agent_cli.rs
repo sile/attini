@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
-use std::path::PathBuf;
-use std::process::{Command, ExitCode};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use nojson::DisplayJson;
@@ -749,6 +749,9 @@ fn resolve_references(
 
 fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
+    messages.push(ChatMessage::System(render_workspace_context(
+        &cfg.workspace_root,
+    )));
     if let Some(mem) = crate::memories::load(&cfg.session_name)? {
         messages.push(ChatMessage::System(mem));
     }
@@ -844,6 +847,72 @@ fn render_scratchpad_note(session_name: &str) -> String {
          not tracked, `patch` writes are permitted but are shown for approval, \
          like any other non-tracked write.\n"
     )
+}
+
+/// Render a best-effort `# Workspace context` block so the model can
+/// see where the session is rooted: the absolute current directory
+/// (the workspace root), the enclosing git repository (when present),
+/// the current branch, and
+/// whether the root is a linked git worktree. Branch / repo awareness
+/// is the main value — without it the model edits files without
+/// knowing which repo or branch it is on.
+///
+/// Never noisy or fatal: any git failure degrades to just the
+/// workspace path line, and stderr is swallowed so a missing / invalid
+/// repo does not clutter the prompt or duplicate the warning that
+/// `probe_git_state` emits.
+fn render_workspace_context(root: &Path) -> String {
+    let mut out = String::from("# Workspace context\n\n");
+    out.push_str(&format!(
+        "- Current directory: {} (workspace root)\n",
+        root.display()
+    ));
+
+    // Best-effort git probe. Call via `git -C <root>` so the current
+    // working dir is irrelevant and a linked worktree resolves to its
+    // own toplevel / index.
+    fn git_quiet(root: &Path, args: &[&str]) -> Option<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+
+    let toplevel = git_quiet(root, &["rev-parse", "--show-toplevel"]);
+    let branch = git_quiet(root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let git_dir = git_quiet(root, &["rev-parse", "--absolute-git-dir"]);
+
+    match &toplevel {
+        Some(top) => {
+            out.push_str(&format!("- Git repository: {}\n", top));
+            if let Some(br) = &branch {
+                out.push_str(&format!("- Current branch: {}\n", br));
+            }
+            // A linked worktree reports a git dir under
+            // `<repo>/.git/worktrees/<name>`; a normal repo's git dir is
+            // the `.git` dir itself. Only surface the *fact* that the
+            // root is a linked worktree — the raw git-dir path is an
+            // implementation detail that adds nothing for the model.
+            if let Some(gd) = &git_dir
+                && (gd.contains("/worktrees/") || gd.contains("\\worktrees\\"))
+            {
+                out.push_str("- Linked worktree\n");
+            }
+        }
+        None => {
+            out.push_str("- Not inside a git repository\n");
+        }
+    }
+    out
 }
 
 /// Resolve and load a CLI-selected skill. Called at the start of a
@@ -2131,6 +2200,30 @@ mod tests {
             },
             ts,
         }
+    }
+
+    #[test]
+    fn workspace_context_degrades_when_not_a_repo() {
+        // Deterministic: a non-existent path is never a git repo, so the
+        // block must degrade gracefully while still reporting the root.
+        let ctx = render_workspace_context(Path::new("/definitely/not/a/repo"));
+        assert!(ctx.starts_with("# Workspace context\n\n"));
+        assert!(ctx.contains("- Current directory: /definitely/not/a/repo"));
+        assert!(ctx.contains("- Not inside a git repository"));
+    }
+
+    #[test]
+    fn workspace_context_is_well_formed_in_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = render_workspace_context(&cwd);
+        assert!(ctx.starts_with("# Workspace context\n\n"));
+        assert!(ctx.contains(&format!("- Current directory: {}", cwd.display())));
+        // Either it found a git repo (and names it) or it did not; both
+        // are acceptable. The key requirement is it never panics and
+        // always states git status.
+        let has_status =
+            ctx.contains("- Git repository: ") || ctx.contains("- Not inside a git repository");
+        assert!(has_status, "context should state git status: {ctx}");
     }
 
     #[test]
