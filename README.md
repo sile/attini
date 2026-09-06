@@ -87,6 +87,19 @@ current directory (the workspace root), the enclosing git repository (when
 present), the current branch, and whether the root is a linked git worktree — so
 the model is aware of which repo/branch it is editing even before the first turn.
 
+When an `attini agent` invocation ends, a one-line diagnostic is printed to
+stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
+
+```
+attini: [agent] model=deepseek-v4-flash session=main reason=completed exit=0 turns=3 duration=9.4s prompt=1234 completion=567 ctx=20736/65536
+```
+
+`model=`/`session=` disambiguate which session and model advanced, `reason=`/`exit=`
+summarise the outcome, `turns=`/`duration=` are the invocation shape, and `ctx=` is
+the **current** conversation size (last per-call `prompt_tokens`, not the
+cumulative billed total) against the 64 K window — so you can see how close the
+session is to compaction. `ATTINI_STATUS_LINE=0` disables the line.
+
 ### Model selection
 
 - Default model: `deepseek-v4-flash` (override with `--model`)
@@ -168,3 +181,4 @@ session — it is picked up on the next `attini agent` call.
 | `ATTINI_SESSION_NAME` | Default session name when `-s/--session` (or a positional `<SESSION>`) is omitted. Precedence: CLI flag, then this env var, then `main`. |
 | `ATTINI_MODEL_NAME` | Default model name when `--model` is omitted. Precedence: CLI flag, then this env var, then the built-in default. |
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
+| `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line end-of-invocation status that `attini agent` prints to stderr. Unset (or any other value) keeps it on. |

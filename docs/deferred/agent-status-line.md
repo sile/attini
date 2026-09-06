@@ -1,9 +1,9 @@
-# Agent command status line (proposal, not implemented)
+# Agent command status line (implemented)
 
-**Status:** Proposal / design note. Not implemented. This document records the idea
-of printing a one-line status when an `attini agent` invocation ends, so the human
-can tell which session and model were used and what the invocation did, and how to
-implement it.
+**Status:** Implemented. The one-line status is printed to stderr at the end of each
+`attini agent` invocation (disabled with `ATTINI_STATUS_LINE=0`). This document
+records the design that was implemented; the in-repo code and README are the source
+of truth for the current behaviour.
 
 ## Problem
 
@@ -149,7 +149,9 @@ command tool. Same location, separate concern.
 
 ## Decision
 
-**Proposal / not implemented.** Recorded so the idea is not lost. Implement when a
-single-line end-of-invocation diagnostic is wanted; the MVP is the stderr line with
-`model=` + `session=` + `reason=` + `duration=`, plus `ctx=` via a
-`prompt_tokens_last` counter.
+**Implemented.** The MVP was built exactly as scoped: a stderr line with `model=` +
+`session=` + `reason=` + `exit=` + `turns=` + `duration=` + `prompt=` +
+`completion=` + `ctx=`, where `ctx=` comes from a new `prompt_tokens_last` counter
+(the last per-call input size, not the cumulative billed total). Default is on;
+`ATTINI_STATUS_LINE=0` disables it. The format helper `render_agent_status_line` is a
+pure function, unit-tested; `humanise_duration` renders `ms` / one-decimal `s`.

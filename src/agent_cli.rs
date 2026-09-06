@@ -39,6 +39,11 @@ pub struct Counters {
     pub tool_calls_by_kind: ToolCallsByKind,
     pub tool_errors: u64,
     pub prompt_tokens_billed_total: u64,
+    /// Latest per-call `prompt_tokens` from the most recent successful
+    /// model call. Unlike [`Counters::prompt_tokens_billed_total`]
+    /// (a cumulative sum over the invocation), this reflects the *current*
+    /// conversation size and is what the status line's `ctx=` shows.
+    pub prompt_tokens_last: u64,
     pub completion_tokens_total: u64,
     pub prompt_cache_hit_tokens_total: u64,
     pub prompt_cache_miss_tokens_total: u64,
@@ -129,6 +134,11 @@ impl Counters {
 /// leaves room for the next turn's growth plus the memory tier, tool
 /// definitions, and the summarizer's own input.
 pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
+
+/// Full model context window (DeepSeek 64 K) used for the status line's
+/// `ctx=` field, so the human sees how close the conversation is to the
+/// window before compaction.
+pub const MODEL_CONTEXT_TOKENS: u64 = 64 * 1024;
 
 /// Target number of real records to retain past the summary cutoff
 /// when compacting. Actual retention may be a little higher: the
@@ -288,6 +298,24 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     });
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
+    // One-line end-of-invocation breadcrumb to stderr (a diagnostic, not
+    // machine-consumed output). Tells the human which session/model ran, how
+    // it ended, and how close the conversation is to the context window.
+    // Disabled with ATTINI_STATUS_LINE=0.
+    if std::env::var("ATTINI_STATUS_LINE").as_deref() != Ok("0") {
+        eprintln!(
+            "{}",
+            render_agent_status_line(
+                &cfg.model,
+                &cfg.session_name,
+                reason,
+                exit_code,
+                duration_ms,
+                &counters,
+            )
+        );
+    }
+
     match outcome {
         Ok(_) => Ok(RunOutcome::Exit(ExitCode::from(exit_code))),
         Err(e) => {
@@ -295,6 +323,45 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
             Ok(RunOutcome::Exit(ExitCode::from(EXIT_ERROR)))
         }
     }
+}
+
+/// Human-friendly duration for the status line. Sub-second values show
+/// milliseconds; one second and above show one decimal in seconds.
+fn humanise_duration(duration_ms: u64) -> String {
+    if duration_ms < 1000 {
+        format!("{duration_ms}ms")
+    } else {
+        let secs = duration_ms as f64 / 1000.0;
+        format!("{secs:.1}s")
+    }
+}
+
+/// Render the single-line end-of-invocation breadcrumb written to stderr
+/// by [`run`]. Pure function so the format can be unit-tested without
+/// touching stdout. `ctx=` uses [`Counters::prompt_tokens_last`] (the last
+/// per-call input size = the current conversation size), not the cumulative
+/// `prompt_tokens_billed_total`.
+fn render_agent_status_line(
+    model: &str,
+    session_name: &str,
+    reason: InvocationEndReason,
+    exit_code: u8,
+    duration_ms: u64,
+    counters: &Counters,
+) -> String {
+    format!(
+        "attini: [agent] model={} session={} reason={} exit={} turns={} duration={} prompt={} completion={} ctx={}/{}",
+        model,
+        session_name,
+        reason.as_str(),
+        exit_code,
+        counters.turns,
+        humanise_duration(duration_ms),
+        counters.prompt_tokens_billed_total,
+        counters.completion_tokens_total,
+        counters.prompt_tokens_last,
+        MODEL_CONTEXT_TOKENS,
+    )
 }
 
 enum Driven {
@@ -506,6 +573,7 @@ fn drive(
                     prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
                 },
             })?;
+            counters.prompt_tokens_last = usage.prompt_tokens.unwrap_or(0);
             counters.prompt_tokens_billed_total = counters
                 .prompt_tokens_billed_total
                 .saturating_add(usage.prompt_tokens.unwrap_or(0));
@@ -2954,5 +3022,65 @@ mod tests {
         assert_eq!(repaired.len(), 2);
         assert!(matches!(&repaired[0], ChatMessage::Assistant { .. }));
         assert!(matches!(&repaired[1], ChatMessage::Tool { .. }));
+    }
+
+    // -------------------------------------------------------------
+    // render_agent_status_line / humanise_duration
+    // -------------------------------------------------------------
+
+    #[test]
+    fn humanise_duration_sub_second_shows_ms() {
+        assert_eq!(humanise_duration(0), "0ms");
+        assert_eq!(humanise_duration(999), "999ms");
+    }
+
+    #[test]
+    fn humanise_duration_seconds_shows_one_decimal() {
+        assert_eq!(humanise_duration(1000), "1.0s");
+        assert_eq!(humanise_duration(9400), "9.4s");
+    }
+
+    #[test]
+    fn status_line_render_includes_session_and_ctx() {
+        let counters = Counters {
+            turns: 3,
+            prompt_tokens_billed_total: 1234,
+            completion_tokens_total: 567,
+            prompt_tokens_last: 20736,
+            ..Counters::default()
+        };
+        let line = render_agent_status_line(
+            "deepseek-v4-flash",
+            "main",
+            InvocationEndReason::Completed,
+            EXIT_OK,
+            9400,
+            &counters,
+        );
+        assert_eq!(
+            line,
+            "attini: [agent] model=deepseek-v4-flash session=main reason=completed exit=0 turns=3 duration=9.4s prompt=1234 completion=567 ctx=20736/65536"
+        );
+    }
+
+    #[test]
+    fn status_line_uses_last_prompt_tokens_not_cumulative_for_ctx() {
+        let counters = Counters {
+            prompt_tokens_billed_total: 99999,
+            prompt_tokens_last: 1000,
+            ..Counters::default()
+        };
+        let line = render_agent_status_line(
+            "m",
+            "s",
+            InvocationEndReason::AwaitingApproval,
+            EXIT_AWAITING_APPROVAL,
+            5,
+            &counters,
+        );
+        assert!(line.contains("ctx=1000/65536"));
+        assert!(line.contains("prompt=99999"));
+        assert!(line.contains("reason=awaiting_approval"));
+        assert!(line.contains("exit=10"));
     }
 }
