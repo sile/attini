@@ -95,6 +95,11 @@ roots and referenced by absolute path (readable with the `read` tool).
 `patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
 after approval.
 
+For longer tasks the model may keep its own working notes under the session's
+scratchpad directory (`.attini/{NAME}/scratchpad/`) using `patch`; those files are
+not tracked by git and never appear in `git diff`. Because they are non-tracked,
+`patch` writes there are still shown for approval (they are not auto-applied).
+
 ## Current ask (read-only)
 
 `attini ask -s NAME [QUESTION]` asks the model to summarise the current state of a
@@ -110,6 +115,29 @@ naturally.
 attini ask -s main
 attini ask -s main "What is the model currently working on?"
 ```
+
+## Memories
+
+`attini agent` prepends persistent memory from up to three tiers to every
+invocation's system prompt:
+
+| Tier | Path | Scope |
+| --- | --- | --- |
+| Global | `~/.attini/memories.md` | All sessions, all workspaces |
+| Project | `.attini/memories.md` | All sessions in this workspace |
+| Session | `.attini/{NAME}/memories.md` | One session |
+
+Memories are **human-edited**. The model can read them (they are injected as
+context) but has no tool to write them, and `patch` refuses `.attini/*/memories.md`
+for safety. Create a file at any of the paths above by hand; the parent directory
+is created automatically. On every `attini agent` invocation, all existing tiers
+are read and concatenated into a single system message that is prepended before
+any `--system` prompt or skill body. Missing files are silently skipped and empty
+files are ignored.
+
+**Timing:** memories are loaded **once at invocation start**, before the first
+turn. Editing a memory file while a session is running has no effect on that
+session — it is picked up on the next `attini agent` call.
 
 ## Environment variables
 

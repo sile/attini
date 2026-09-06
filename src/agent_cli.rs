@@ -785,6 +785,9 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
         }
         messages.push(ChatMessage::System(ref_block));
     }
+    messages.push(ChatMessage::System(render_scratchpad_note(
+        &cfg.session_name,
+    )));
     for record in session.load_records_since_last_summary()? {
         messages.push(record.message);
     }
@@ -812,6 +815,25 @@ fn render_available_skills(entries: &[SkillEntry]) -> String {
         out.push_str(&format!("- {} — {}\n", entry.name, label));
     }
     out
+}
+
+/// Tell the model it may keep working notes under the session's
+/// scratchpad directory. The patch tool permits writes there (it is
+/// not rejected by the Layer-1 `.attini/` guard), but because the
+/// files are not git-tracked those edits still go through the
+/// approval prompt, so the note is honest about that rather than
+/// promising an auto-approve free zone.
+fn render_scratchpad_note(session_name: &str) -> String {
+    format!(
+        "# Working notes\n\n\
+         You may keep working notes / scratchpad files under \
+         `.attini/{session_name}/scratchpad/` (relative to the workspace root). \
+         This per-session directory is not tracked by git and never appears in \
+         `git diff`. Use it for checklists, intermediate findings, or step lists \
+         that would otherwise clutter the conversation. Because files there are \
+         not tracked, `patch` writes are permitted but are shown for approval, \
+         like any other non-tracked write.\n"
+    )
 }
 
 /// Resolve and load a CLI-selected skill. Called at the start of a
