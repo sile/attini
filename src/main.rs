@@ -95,8 +95,16 @@ fn run() -> Result<RunOutcome, RunError> {
             return Ok(RunOutcome::Ok);
         }
     }
-    if try_run_session(&mut args)? {
-        return Ok(RunOutcome::Ok);
+    match try_run_session(&mut args)? {
+        CommandOutcome::NotHandled => {}
+        CommandOutcome::Done => return Ok(RunOutcome::Ok),
+        CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
+        CommandOutcome::Help => {
+            if let Some(help) = args.finish()? {
+                print!("{help}");
+            }
+            return Ok(RunOutcome::Ok);
+        }
     }
 
     if let Some(help) = args.finish()? {
@@ -401,48 +409,35 @@ fn parse_session_tool_call_max(raw: &str) -> Result<Option<usize>, RunError> {
     Ok(Some(n))
 }
 
-fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("session")
         .doc("Inspect and manage attini agent sessions under .attini/")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
 
-    if try_run_session_list(args)? {
-        return Ok(true);
-    }
-    if try_run_session_show(args)? {
-        return Ok(true);
-    }
-    if try_run_session_tail(args)? {
-        return Ok(true);
-    }
-    if try_run_session_rm(args)? {
-        return Ok(true);
-    }
-    if try_run_session_unlock(args)? {
-        return Ok(true);
-    }
-    if try_run_session_grant(args)? {
-        return Ok(true);
-    }
-    if try_run_session_compact(args)? {
-        return Ok(true);
-    }
-    if try_run_session_prune(args)? {
-        return Ok(true);
-    }
-    if try_run_session_metrics(args)? {
-        return Ok(true);
-    }
-    if try_run_session_grant_read(args)? {
-        return Ok(true);
+    for sub in [
+        try_run_session_list,
+        try_run_session_show,
+        try_run_session_tail,
+        try_run_session_rm,
+        try_run_session_unlock,
+        try_run_session_grant,
+        try_run_session_compact,
+        try_run_session_prune,
+        try_run_session_metrics,
+        try_run_session_grant_read,
+    ] {
+        match sub(args)? {
+            CommandOutcome::NotHandled => {}
+            other => return Ok(other),
+        }
     }
 
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     Err(RunError::Runtime(
         "attini session requires a sub-command (list, show, tail, rm, unlock, grant, grant-read, compact, prune, metrics)"
@@ -450,28 +445,28 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     ))
 }
 
-fn try_run_session_list(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_list(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("list")
         .doc("List all sessions under .attini/ in the current directory")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_list().map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_show(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("show")
         .doc("Show a summary of one session (invocations, message counts, pending)")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let name: String = noargs::arg("<SESSION>")
         .doc("Session name; directory is .attini/<SESSION>/")
@@ -479,19 +474,19 @@ fn try_run_session_show(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .take(args)
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_show(&name).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_tail(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_tail(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("tail")
         .doc("Print the tail of conversation.jsonl (LOCK not acquired)")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let follow = noargs::flag("follow")
         .short('f')
@@ -514,19 +509,19 @@ fn try_run_session_tail(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .take(args)
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_tail(&name, follow, lines).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_rm(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_rm(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("rm")
         .doc("Remove a session directory (refuses if a live process is holding the LOCK)")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let yes = noargs::flag("yes")
         .short('y')
@@ -539,19 +534,19 @@ fn try_run_session_rm(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .take(args)
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_rm(&name, yes).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("unlock")
         .doc("Remove the LOCK file. Refuses if the holder PID is alive unless --force is set")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let force = noargs::flag("force")
         .doc("Remove the LOCK even if the holder PID appears alive (PID reuse escape hatch)")
@@ -563,13 +558,13 @@ fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<bool, RunError> 
         .take(args)
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_unlock(&name, force).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("grant-read")
         .doc(
             "Append a workspace-external read-only path to permissions.json. \
@@ -578,7 +573,7 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunErr
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let session_name: String = noargs::opt("session")
         .short('s')
@@ -603,7 +598,7 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunErr
         .take(args)
         .then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     if workspace && session_name != "main" {
         return Err(RunError::Runtime(
@@ -618,17 +613,17 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<bool, RunErr
     match attini::permissions::grant_read(scope, &path) {
         Ok(attini::permissions::GrantReadOutcome::Appended(p)) => {
             eprintln!("granted read: appended to {}", p.display());
-            Ok(true)
+            Ok(CommandOutcome::Done)
         }
         Ok(attini::permissions::GrantReadOutcome::AlreadyGranted(p)) => {
             eprintln!("already granted (no-op): {}", p.display());
-            Ok(true)
+            Ok(CommandOutcome::Done)
         }
         Err(e) => Err(RunError::Runtime(e.to_string())),
     }
 }
 
-fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("grant")
         .doc(
             "Append an auto-approve permissions rule (argv_prefix) to permissions.json. \
@@ -638,7 +633,7 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let session_name: String = noargs::opt("session")
         .short('s')
@@ -670,7 +665,7 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         argv_prefix.push(s);
     }
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     // -s explicitly given AND --workspace both present is ambiguous; we can't detect
     // the "explicit" -s from noargs (default fills in), so we only reject the pair when
@@ -689,17 +684,17 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
     match attini::permissions::grant(scope, &argv_prefix) {
         Ok(attini::permissions::GrantOutcome::Appended(path)) => {
             eprintln!("granted: appended to {}", path.display());
-            Ok(true)
+            Ok(CommandOutcome::Done)
         }
         Ok(attini::permissions::GrantOutcome::AlreadyGranted(path)) => {
             eprintln!("already granted (no-op): {}", path.display());
-            Ok(true)
+            Ok(CommandOutcome::Done)
         }
         Err(e) => Err(RunError::Runtime(e.to_string())),
     }
 }
 
-fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("metrics")
         .doc(
             "Aggregate metrics from session records. \
@@ -708,7 +703,7 @@ fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<bool, RunError>
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let session_name: String = noargs::opt("session")
         .short('s')
@@ -726,7 +721,7 @@ fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<bool, RunError>
         .take(args)
         .is_present();
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     let scope = if all {
         session_cmd::MetricsScope::All
@@ -734,10 +729,10 @@ fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<bool, RunError>
         session_cmd::MetricsScope::Single(&session_name)
     };
     session_cmd::run_metrics(scope, json).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_prune(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_prune(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("prune")
         .doc(
             "Drop records before the last summary in conversation.jsonl. \
@@ -746,7 +741,7 @@ fn try_run_session_prune(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let session_name: String = noargs::opt("session")
         .short('s')
@@ -761,13 +756,13 @@ fn try_run_session_prune(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .take(args)
         .is_present();
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_prune(&session_name, yes).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
-fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
+fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("compact")
         .doc(
             "Summarise older conversation records and append a summary record. \
@@ -776,7 +771,7 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<bool, RunError>
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let model: String = noargs::opt("model")
         .ty("NAME")
@@ -792,11 +787,11 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<bool, RunError>
         .take(args)
         .then(|o| o.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
     session_cmd::run_compact(&session_name, &model)
         .map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    Ok(CommandOutcome::Done)
 }
 
 #[cfg(test)]
