@@ -100,6 +100,10 @@ scratchpad directory (`.attini/{NAME}/scratchpad/`) using `patch`; those files a
 not tracked by git and never appear in `git diff`. Because they are non-tracked,
 `patch` writes there are still shown for approval (they are not auto-applied).
 
+**Lifecycle:** scratchpad files are not auto-cleaned during a session — there is no
+time- or size-based cleanup. They persist for the life of the session and are
+removed only when the session is deleted with `attini session rm <NAME>`.
+
 ## Current ask (read-only)
 
 `attini ask -s NAME [QUESTION]` asks the model to summarise the current state of a
