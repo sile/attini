@@ -52,16 +52,6 @@ pub struct Counters {
     /// (Aggregates `Err` arising from `load_records_since_last_summary`,
     /// `run_summariser`, or the `?` in `session.append`.)
     pub compaction_failures: u64,
-    /// Number of plans created by `submit_plan` in this invocation.
-    pub plan_created: u64,
-    /// Number of `plan run` invocations (recorded by `plan_cmd`).
-    pub plan_runs: u64,
-    /// Number of plan delegations to child subagents.
-    pub plan_delegations: u64,
-    /// Number of actions approved via an approved plan.
-    pub plan_action_approvals: u64,
-    /// Number of actions rejected as not approved by the plan.
-    pub plan_action_rejections: u64,
 }
 
 /// Per-tool-name buckets for `Counters::tool_calls_by_kind`. Names are
@@ -77,7 +67,6 @@ pub struct ToolCallsByKind {
     pub command: u64,
     pub skill_load: u64,
     pub subagent_run: u64,
-    pub submit_plan: u64,
     pub unknown: u64,
 }
 
@@ -112,10 +101,6 @@ impl Counters {
                 self.tool_calls_by_kind.subagent_run,
             ),
             (
-                "tool_calls.submit_plan".to_string(),
-                self.tool_calls_by_kind.submit_plan,
-            ),
-            (
                 "tool_calls.unknown".to_string(),
                 self.tool_calls_by_kind.unknown,
             ),
@@ -139,17 +124,6 @@ impl Counters {
             ),
             ("compaction_attempts".to_string(), self.compaction_attempts),
             ("compaction_failures".to_string(), self.compaction_failures),
-            ("plan.created".to_string(), self.plan_created),
-            ("plan.runs".to_string(), self.plan_runs),
-            ("plan.delegations".to_string(), self.plan_delegations),
-            (
-                "plan.action_approvals".to_string(),
-                self.plan_action_approvals,
-            ),
-            (
-                "plan.action_rejections".to_string(),
-                self.plan_action_rejections,
-            ),
         ]
     }
 }
@@ -1218,8 +1192,6 @@ fn append_auto_approval(
         scope: dec.scope.as_str().to_string(),
         argv_prefix: dec.argv_prefix.clone(),
         reason: dec.reason.as_str().to_string(),
-        plan_sha256: None,
-        action_id: None,
     };
     session.append(&SessionRecord::ToolApproval {
         ts: now_unix_millis(),
@@ -1680,8 +1652,6 @@ fn repair_orphaned_tool_calls(
                     scope: "repair".to_string(),
                     argv_prefix: Vec::new(),
                     reason: "unanswered_tool_call_repair".to_string(),
-                    plan_sha256: None,
-                    action_id: None,
                 }),
             })?;
             session.append(&SessionRecord::Tool {
