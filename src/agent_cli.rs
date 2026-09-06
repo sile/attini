@@ -2086,7 +2086,7 @@ mod tests {
         let path = dir.join("a.md");
         std::fs::write(&path, "hello reference\n").unwrap();
 
-        let refs = resolve_references(&dir, &[path.clone()]).unwrap();
+        let refs = resolve_references(&dir, std::slice::from_ref(&path)).unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].abs_path, std::fs::canonicalize(&path).unwrap());
         assert_eq!(refs[0].inline.as_deref(), Some("hello reference\n"));
@@ -2101,7 +2101,7 @@ mod tests {
         let big = "x".repeat(REFERENCE_MAX_BYTES + 1);
         std::fs::write(&path, &big).unwrap();
 
-        let refs = resolve_references(&dir, &[path.clone()]).unwrap();
+        let refs = resolve_references(&dir, std::slice::from_ref(&path)).unwrap();
         assert_eq!(refs.len(), 1);
         assert!(refs[0].inline.is_none());
         assert_eq!(refs[0].abs_path, std::fs::canonicalize(&path).unwrap());

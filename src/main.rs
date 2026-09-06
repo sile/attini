@@ -7,6 +7,13 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_RUNTIME: u8 = 1;
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 
+/// Environment variable that supplies a default session name when
+/// `-s/--session` (or a positional `<SESSION>`) is omitted.
+const SESSION_ENV: &str = "ATTINI_SESSION_NAME";
+/// Environment variable that supplies a default model name when
+/// `--model` is omitted.
+const MODEL_ENV: &str = "ATTINI_MODEL_NAME";
+
 // String forms of the tool-call cap defaults, exposed here because
 // noargs' `default()` needs a `&'static str`. Kept in sync with the
 // numeric constants in `attini::agent_cli` by
@@ -60,6 +67,24 @@ impl From<noargs::Error> for RunError {
     fn from(err: noargs::Error) -> Self {
         Self::Usage(err)
     }
+}
+
+/// Resolve a session name from an optional positional `<SESSION>` value,
+/// falling back to the `ATTINI_SESSION_NAME` environment variable. A session
+/// must be named by one of the two; there is no implicit default here,
+/// because some callers (rm, unlock) are destructive.
+fn session_from_pos_or_env(value: Option<String>) -> Result<String, RunError> {
+    if let Some(name) = value.filter(|s| !s.is_empty()) {
+        return Ok(name);
+    }
+    if let Ok(name) = std::env::var(SESSION_ENV)
+        && !name.is_empty()
+    {
+        return Ok(name);
+    }
+    Err(RunError::Runtime(format!(
+        "session name required (positional <SESSION> or env {SESSION_ENV})"
+    )))
 }
 
 fn run() -> Result<RunOutcome, RunError> {
@@ -126,7 +151,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .ty("NAME")
         .doc("Model name")
         .default(DEFAULT_MODEL)
-        .env("ATTINI_MODEL_NAME")
+        .env(MODEL_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let system: Option<String> = noargs::opt("system")
@@ -155,6 +180,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .ty("NAME")
         .doc("Session name; directory is .attini/<NAME>/")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     // --read-path is repeatable; noargs' opt consumes one occurrence
@@ -331,12 +357,14 @@ fn try_run_ask(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
         .ty("NAME")
         .doc("Session name; directory is .attini/<NAME>/")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let model: String = noargs::opt("model")
         .ty("NAME")
         .doc("Model name used for the summariser")
         .default(DEFAULT_MODEL)
+        .env(MODEL_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let limit: Option<usize> = noargs::opt("limit")
@@ -468,11 +496,13 @@ fn try_run_session_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, Ru
     {
         return Ok(CommandOutcome::NotHandled);
     }
-    let name: String = noargs::arg("<SESSION>")
-        .doc("Session name; directory is .attini/<SESSION>/")
-        .example("main")
-        .take(args)
-        .then(|a| a.value().parse())?;
+    let name = session_from_pos_or_env(
+        noargs::arg("<SESSION>")
+            .doc("Session name; directory is .attini/<SESSION>/")
+            .example("main")
+            .take(args)
+            .present_and_then(|a| a.value().parse())?,
+    )?;
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
@@ -503,11 +533,13 @@ fn try_run_session_tail(args: &mut noargs::RawArgs) -> Result<CommandOutcome, Ru
         .default("20")
         .take(args)
         .then(|o| o.value().parse())?;
-    let name: String = noargs::arg("<SESSION>")
-        .doc("Session name")
-        .example("main")
-        .take(args)
-        .then(|a| a.value().parse())?;
+    let name = session_from_pos_or_env(
+        noargs::arg("<SESSION>")
+            .doc("Session name")
+            .example("main")
+            .take(args)
+            .present_and_then(|a| a.value().parse())?,
+    )?;
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
@@ -528,11 +560,13 @@ fn try_run_session_rm(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunE
         .doc("Skip the confirmation prompt (required when stdin is not a TTY)")
         .take(args)
         .is_present();
-    let name: String = noargs::arg("<SESSION>")
-        .doc("Session name")
-        .example("main")
-        .take(args)
-        .then(|a| a.value().parse())?;
+    let name = session_from_pos_or_env(
+        noargs::arg("<SESSION>")
+            .doc("Session name")
+            .example("main")
+            .take(args)
+            .present_and_then(|a| a.value().parse())?,
+    )?;
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
@@ -552,11 +586,13 @@ fn try_run_session_unlock(args: &mut noargs::RawArgs) -> Result<CommandOutcome, 
         .doc("Remove the LOCK even if the holder PID appears alive (PID reuse escape hatch)")
         .take(args)
         .is_present();
-    let name: String = noargs::arg("<SESSION>")
-        .doc("Session name")
-        .example("main")
-        .take(args)
-        .then(|a| a.value().parse())?;
+    let name = session_from_pos_or_env(
+        noargs::arg("<SESSION>")
+            .doc("Session name")
+            .example("main")
+            .take(args)
+            .present_and_then(|a| a.value().parse())?,
+    )?;
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
@@ -580,6 +616,7 @@ fn try_run_session_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutco
         .ty("NAME")
         .doc("Session name; writes to .attini/<NAME>/permissions.json")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
@@ -640,6 +677,7 @@ fn try_run_session_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, R
         .ty("NAME")
         .doc("Session name; writes to .attini/<NAME>/permissions.json")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
@@ -710,6 +748,7 @@ fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
         .ty("NAME")
         .doc("Session name; directory is .attini/<NAME>/")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let all = noargs::flag("all")
@@ -748,6 +787,7 @@ fn try_run_session_prune(args: &mut noargs::RawArgs) -> Result<CommandOutcome, R
         .ty("NAME")
         .doc("Session name; directory is .attini/<NAME>/")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let yes = noargs::flag("yes")
@@ -777,6 +817,7 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
         .ty("NAME")
         .doc("Model name used for the summariser")
         .default(DEFAULT_MODEL)
+        .env(MODEL_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let session_name: String = noargs::opt("session")
@@ -784,6 +825,7 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
         .ty("NAME")
         .doc("Session name; directory is .attini/<NAME>/")
         .default("main")
+        .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     if args.metadata().help_mode {
