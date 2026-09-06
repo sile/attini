@@ -1041,7 +1041,9 @@ decisions, files/symbols in play, and any tool call awaiting approval. If a ques
 is appended, answer that question specifically. Otherwise produce a short status \
 summary (~300 words) of the current state, in third person. Never begin with an \
 action verb such as 'I will / I am going to / let's'. Do not comment on the \
-instruction itself; produce only the answer.";
+instruction itself; produce only the answer. A prior observer answer may be included \
+    below as context: treat it as a hint only and always let the transcript below \
+    override it.";
 
 /// Abbreviate JSON tool arguments to a short single-line prefix so the
 /// prose transcript stays readable and does not invite the model to
@@ -1163,8 +1165,17 @@ pub(crate) fn run_ask_summary(
     records: Vec<ChatMessageWithTs>,
     model: &str,
     question: Option<&str>,
+    prior: Option<&str>,
 ) -> io::Result<String> {
     let mut system = ASK_SYSTEM_PROMPT.to_string();
+    if let Some(p) = prior {
+        system.push_str(
+            "\n\n--- PREVIOUS ask context (an EARLIER observer answer; it is a HINT, not \
+             ground truth \u{2014} the transcript below is authoritative) ---\n\n",
+        );
+        system.push_str(p);
+        system.push_str("\n\n--- END PREVIOUS ask context ---\n");
+    }
     if let Some(q) = question {
         system.push_str("\n\nThe user's question is: ");
         system.push_str(q);

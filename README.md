@@ -115,6 +115,13 @@ observational — adjust the course by running `attini agent -s NAME "<new
 instruction>"` (or a fresh session) and letting the model revise its approach
 naturally.
 
+Each `ask` caches the last two question/answer pairs in `.attini/<NAME>/ask.json`
+and feeds them back (as a non-authoritative hint) on the next `ask`, so a
+follow-up question can build on an earlier answer. The cache is keyed to the
+records actually observed: changing `--all`/`--limit`, or the session advancing,
+produces a different fingerprint and resets the cache (a short `(prior ask context
+reset: ...)` note is printed).
+
 ```sh
 attini ask -s main
 attini ask -s main "What is the model currently working on?"

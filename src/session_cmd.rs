@@ -212,9 +212,76 @@ pub fn run_ask(
         println!("session {name:?}: no conversation records yet");
         return Ok(());
     }
-    let text = agent_cli::run_ask_summary(records, model, question)?;
+    let fingerprint = crate::session::conversation_fingerprint(&records);
+    let prior = crate::session::load_ask_state(&paths.ask)?;
+    let mut state = crate::session::AskState {
+        conversation_fingerprint: fingerprint,
+        entries: Vec::new(),
+    };
+    if let Some(prev) = prior {
+        if prev.conversation_fingerprint == fingerprint && !prev.entries.is_empty() {
+            state.entries = prev.entries;
+        } else if prev.conversation_fingerprint != fingerprint {
+            println!("(prior ask context reset: the observed conversation changed)");
+        }
+    }
+    let prior_text = render_prior_ask_context(&state.entries);
+    let text = agent_cli::run_ask_summary(records, model, question, prior_text.as_deref())?;
     println!("{text}");
+    state.entries.push(crate::session::AskEntry {
+        ts: crate::session::now_unix_millis(),
+        question: question.map(|q| q.to_string()),
+        answer: text,
+    });
+    if state.entries.len() > MAX_ASK_ENTRIES {
+        let start = state.entries.len() - MAX_ASK_ENTRIES;
+        state.entries = state.entries[start..].to_vec();
+    }
+    crate::session::save_ask_state(&paths.ask, &state)?;
     Ok(())
+}
+
+/// Maximum number of Q&A entries kept in `ask.json`. Only the most
+/// recent [`PRIOR_ASK_CONTEXT_ENTRIES`] are injected into the next
+/// `ask`, but a few more are retained so repeated `ask` runs have a
+/// small working window before a conversation change clears them.
+const MAX_ASK_ENTRIES: usize = 20;
+/// Number of previous entries injected as prior context into the next
+/// `attini ask`.
+const PRIOR_ASK_CONTEXT_ENTRIES: usize = 2;
+/// Cap on each prior answer's length when injected, so context stays
+/// a hint rather than a transcript.
+const PRIOR_ANSWER_MAX_CHARS: usize = 2000;
+
+/// Render the most recent [`PRIOR_ASK_CONTEXT_ENTRIES`] cached
+/// Q&A entries as a compact hint block for the next `ask`. Returns
+/// `None` when there is no usable prior context.
+fn render_prior_ask_context(entries: &[crate::session::AskEntry]) -> Option<String> {
+    let tail = entries.len().saturating_sub(PRIOR_ASK_CONTEXT_ENTRIES);
+    let recent = &entries[tail..];
+    if recent.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (i, entry) in recent.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        match &entry.question {
+            Some(q) => out.push_str(&format!("Q: {q}\n")),
+            None => out.push_str("Q: (no question; a status summary)\n"),
+        }
+        let mut answer = entry.answer.clone();
+        if answer.chars().count() > PRIOR_ANSWER_MAX_CHARS {
+            answer = answer
+                .chars()
+                .take(PRIOR_ANSWER_MAX_CHARS)
+                .collect::<String>();
+            answer.push('…');
+        }
+        out.push_str(&format!("A: {answer}"));
+    }
+    Some(out)
 }
 
 // -------------------------------------------------------------------
@@ -1296,6 +1363,41 @@ pub fn run_unlock(name: &str, force: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_prior_ask_context_takes_last_two_and_truncates_answers() {
+        let entries = vec![
+            crate::session::AskEntry {
+                ts: 1,
+                question: Some("q1".to_string()),
+                answer: "a1".to_string(),
+            },
+            crate::session::AskEntry {
+                ts: 2,
+                question: None,
+                answer: "a2".to_string(),
+            },
+            crate::session::AskEntry {
+                ts: 3,
+                question: Some("q3".to_string()),
+                answer: "x".repeat(PRIOR_ANSWER_MAX_CHARS + 50),
+            },
+        ];
+        let rendered = render_prior_ask_context(&entries).expect("prior context");
+        // Only the last two entries (ts 2, ts 3) are rendered.
+        assert!(rendered.contains("(no question; a status summary)"));
+        assert!(rendered.contains("Q: q3"));
+        assert!(!rendered.contains("Q: q1"));
+        // The over-long answer is truncated to the cap plus an ellipsis.
+        assert!(rendered.contains(&"x".repeat(PRIOR_ANSWER_MAX_CHARS)));
+        assert!(!rendered.contains(&"x".repeat(PRIOR_ANSWER_MAX_CHARS + 50)));
+        assert!(rendered.contains('…'));
+    }
+
+    #[test]
+    fn render_prior_ask_context_none_when_empty() {
+        assert!(render_prior_ask_context(&[]).is_none());
+    }
 
     fn tempdir(name: &str) -> std::path::PathBuf {
         let base =

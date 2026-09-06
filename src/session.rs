@@ -297,6 +297,10 @@ pub struct SessionPaths {
     /// this directory regardless of git status; `Session::open`
     /// auto-creates it so the agent can rely on its existence.
     pub scratchpad: PathBuf,
+    /// Cached Q&A state for `attini ask` (`.attini/{NAME}/ask.json`).
+    /// Not part of the conversation; consumed only by the read-only
+    /// `ask` command to give follow-up questions prior context.
+    pub ask: PathBuf,
 }
 
 /// Root directory (`.attini/`) that holds every session in the CWD.
@@ -325,6 +329,7 @@ pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
         pending: dir.join("pending.json"),
         lock: dir.join("LOCK"),
         scratchpad: dir.join("scratchpad"),
+        ask: dir.join("ask.json"),
         dir,
     })
 }
@@ -1501,6 +1506,145 @@ impl Pending {
 }
 
 // -------------------------------------------------------------------
+// ask state (ask.json)
+// -------------------------------------------------------------------
+
+/// One cached Q&A from `attini ask`. Purely advisory: it is never
+/// injected into the agent's conversation, only passed to a later
+/// `attini ask` so a follow-up question can build on a previous
+/// observer answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskEntry {
+    pub ts: u64,
+    pub question: Option<String>,
+    pub answer: String,
+}
+
+/// Snapshot of the question/answer cache for one session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskState {
+    /// FNV-1a fingerprint of the conversation records that produced
+    /// the first entry in this state. `ask` recomputes it for the
+    /// window it actually observed; a mismatch means the observation
+    /// changed (session advanced, or `--all`/`--limit` differs) and
+    /// the cache is discarded rather than trusted.
+    pub conversation_fingerprint: u64,
+    pub entries: Vec<AskEntry>,
+}
+
+impl DisplayJson for AskEntry {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("ts", self.ts)?;
+            f.member("question", &self.question)?;
+            f.member("answer", &self.answer)
+        })
+    }
+}
+
+impl DisplayJson for AskState {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("conversation_fingerprint", self.conversation_fingerprint)?;
+            f.member("entries", &self.entries)
+        })
+    }
+}
+
+impl AskState {
+    fn from_json(value: nojson::RawJsonValue<'_, '_>) -> io::Result<Self> {
+        let map_err = |e: String| io::Error::other(format!("ask.json: {e}"));
+        let conversation_fingerprint: u64 = value
+            .to_member("conversation_fingerprint")
+            .and_then(|m| m.required())
+            .and_then(|m| m.try_into())
+            .map_err(|e| map_err(e.to_string()))?;
+        let iter = value
+            .to_member("entries")
+            .and_then(|m| m.required())
+            .and_then(|m| m.to_array())
+            .map_err(|e| map_err(e.to_string()))?;
+        let mut entries = Vec::new();
+        for elem in iter {
+            entries.push(Self::entry_from_json(elem).map_err(&map_err)?);
+        }
+        Ok(Self {
+            conversation_fingerprint,
+            entries,
+        })
+    }
+
+    fn entry_from_json(value: nojson::RawJsonValue<'_, '_>) -> Result<AskEntry, String> {
+        let ts: u64 = value
+            .to_member("ts")
+            .and_then(|m| m.required())
+            .and_then(|m| m.try_into())
+            .map_err(|e| e.to_string())?;
+        let question = read_optional_string(value, "question")?;
+        let answer = read_string(value, "answer")?;
+        Ok(AskEntry {
+            ts,
+            question,
+            answer,
+        })
+    }
+}
+
+/// Read `ask.json` for a session if present. A missing file yields
+/// `Ok(None)`; malformed content is a hard error (it would silently
+/// break follow-up context otherwise).
+pub fn load_ask_state(path: &Path) -> io::Result<Option<AskState>> {
+    let text = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let json = RawJson::parse(&text).map_err(|e| io::Error::other(format!("ask.json: {e}")))?;
+    AskState::from_json(json.value()).map(Some)
+}
+
+/// Write `ask.json` atomically (temp file in the same directory,
+/// then rename) so a concurrent reader never sees a partial file.
+pub fn save_ask_state(path: &Path, state: &AskState) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ask.json has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ask.json");
+    let tmp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    fs::write(&tmp, Json(state).to_string())?;
+    fs::rename(&tmp, path)
+}
+
+/// FNV-1a (64-bit) of the ordered conversation records. Deterministic
+/// across processes (unlike `DefaultHasher`), and only depends on the
+/// records actually observed — so a different `--all`/`--limit` window
+/// produces a different fingerprint and naturally resets the ask cache.
+pub fn conversation_fingerprint(records: &[ChatMessageWithTs]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for rec in records {
+        for b in rec.ts.to_string().as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xFF;
+        hash = hash.wrapping_mul(PRIME);
+        let body = Json(&rec.message).to_string();
+        for b in body.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xFE;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+// -------------------------------------------------------------------
 // Helpers
 // -------------------------------------------------------------------
 
@@ -1514,6 +1658,53 @@ pub fn now_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_fingerprint_is_deterministic_and_window_sensitive() {
+        let a = ChatMessageWithTs {
+            message: ChatMessage::User("hello".to_string()),
+            ts: 1,
+        };
+        let b = ChatMessageWithTs {
+            message: ChatMessage::User("world".to_string()),
+            ts: 2,
+        };
+        let fp1 = conversation_fingerprint(&[a.clone(), b.clone()]);
+        let fp2 = conversation_fingerprint(&[a.clone(), b.clone()]);
+        assert_eq!(fp1, fp2, "fingerprint must be deterministic");
+
+        let fp_more = conversation_fingerprint(&[a.clone(), b.clone(), a.clone()]);
+        assert_ne!(fp1, fp_more, "adding a record must change the fingerprint");
+
+        let fp_window = conversation_fingerprint(&[b]);
+        assert_ne!(
+            fp1, fp_window,
+            "a different window must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn ask_state_roundtrips_through_json() {
+        let state = AskState {
+            conversation_fingerprint: 42,
+            entries: vec![
+                AskEntry {
+                    ts: 1,
+                    question: Some("what?".to_string()),
+                    answer: "answer one".to_string(),
+                },
+                AskEntry {
+                    ts: 2,
+                    question: None,
+                    answer: "answer two".to_string(),
+                },
+            ],
+        };
+        let json = Json(&state).to_string();
+        let parsed = RawJson::parse(&json).expect("ask.json should parse");
+        let got = AskState::from_json(parsed.value()).expect("ask.json should convert");
+        assert_eq!(got, state);
+    }
 
     #[test]
     fn approval_decision_serialises_stable_strings() {
