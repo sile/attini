@@ -95,17 +95,20 @@ roots and referenced by absolute path (readable with the `read` tool).
 `patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
 after approval.
 
-## Current plan (read-only)
+## Current ask (read-only)
 
-`attini plan -s NAME` shows the current state of a session without touching the
-conversation log: the latest assistant message (the model's most recent statement of
-approach), any tool calls it made, and any tool call currently awaiting approval
-(`pending.json`). It is purely observational — adjust the course by running
-`attini agent -s NAME "<new instruction>"` (or a fresh session) and letting the model
-revise its approach naturally.
+`attini ask -s NAME [QUESTION]` asks the model to summarise the current state of a
+session without touching the conversation log: what is in progress, any pending tool
+call, and (when a `QUESTION` is supplied) a direct answer to that question. Records
+since the last compaction summary are used by default; `--all` uses the whole
+conversation and `--limit N` keeps only the most recent N records. It is purely
+observational — adjust the course by running `attini agent -s NAME "<new
+instruction>"` (or a fresh session) and letting the model revise its approach
+naturally.
 
 ```sh
-attini plan -s main
+attini ask -s main
+attini ask -s main "What is the model currently working on?"
 ```
 
 ## Environment variables

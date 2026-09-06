@@ -148,41 +148,7 @@ impl Session {
     /// summary. When there is no summary, every real record is
     /// returned.
     pub fn load_records_since_last_summary(&self) -> io::Result<Vec<ChatMessageWithTs>> {
-        let file = match File::open(&self.conversation_path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let mut latest_cutoff: Option<u64> = None;
-        let mut records: Vec<ChatMessageWithTs> = Vec::new();
-        for (i, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            match parse_conversation_line_with_meta(&line) {
-                Ok(LineKind::Message { message, ts }) => {
-                    records.push(ChatMessageWithTs { message, ts });
-                }
-                Ok(LineKind::Summary { cutoff_ts }) => {
-                    latest_cutoff = Some(match latest_cutoff {
-                        Some(prev) => prev.max(cutoff_ts),
-                        None => cutoff_ts,
-                    });
-                }
-                Ok(LineKind::Other) => {}
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "malformed conversation record at line {}: {e}",
-                        i + 1
-                    )));
-                }
-            }
-        }
-        if let Some(cutoff) = latest_cutoff {
-            records.retain(|r| r.ts > cutoff);
-        }
-        Ok(records)
+        read_chat_message_with_ts(&self.conversation_path, false)
     }
 
     /// Latest `prompt_tokens` value recorded in `token_usage`
@@ -267,6 +233,51 @@ impl Drop for Session {
         // Drop swallows them.
         let _ = fs::remove_file(&self.lock_path);
     }
+}
+
+/// Read conversation records as [`ChatMessageWithTs`] from a path
+/// without acquiring the session LOCK. When `all` is false, only
+/// records newer than the newest summary's `cutoff_ts` are returned
+/// (matching [`Session::load_records_since_last_summary`]); when true,
+/// every real record is returned, ignoring summaries.
+pub fn read_chat_message_with_ts(path: &Path, all: bool) -> io::Result<Vec<ChatMessageWithTs>> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut latest_cutoff: Option<u64> = None;
+    let mut records: Vec<ChatMessageWithTs> = Vec::new();
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_conversation_line_with_meta(&line) {
+            Ok(LineKind::Message { message, ts }) => {
+                records.push(ChatMessageWithTs { message, ts });
+            }
+            Ok(LineKind::Summary { cutoff_ts }) => {
+                latest_cutoff = Some(match latest_cutoff {
+                    Some(prev) => prev.max(cutoff_ts),
+                    None => cutoff_ts,
+                });
+            }
+            Ok(LineKind::Other) => {}
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "malformed conversation record at line {}: {e}",
+                    i + 1
+                )));
+            }
+        }
+    }
+    if !all {
+        if let Some(cutoff) = latest_cutoff {
+            records.retain(|r| r.ts > cutoff);
+        }
+    }
+    Ok(records)
 }
 
 // -------------------------------------------------------------------

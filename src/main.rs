@@ -35,6 +35,22 @@ enum RunOutcome {
     Exit(ExitCode),
 }
 
+/// Result of probing one top-level command. Lets `run()` short-circuit
+/// once a command is matched, so sibling commands are not recorded as
+/// subcommands in help output.
+#[derive(Debug, Clone, Copy)]
+enum CommandOutcome {
+    /// This top-level command was not the one named on the CLI.
+    NotHandled,
+    /// Matched and completed; stop.
+    Done,
+    /// Matched and requested a process exit; stop with this code.
+    Exit(ExitCode),
+    /// Matched but the user asked for help; stop probing siblings so
+    /// `args.finish()` renders only this command's help.
+    Help,
+}
+
 enum RunError {
     Usage(noargs::Error),
     Runtime(String),
@@ -57,11 +73,27 @@ fn run() -> Result<RunOutcome, RunError> {
     }
     noargs::HELP_FLAG.take_help(&mut args);
 
-    if let Some(exit) = try_run_agent(&mut args)? {
-        return Ok(RunOutcome::Exit(exit));
+    match try_run_agent(&mut args)? {
+        CommandOutcome::NotHandled => {}
+        CommandOutcome::Done => return Ok(RunOutcome::Ok),
+        CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
+        CommandOutcome::Help => {
+            if let Some(help) = args.finish()? {
+                print!("{help}");
+            }
+            return Ok(RunOutcome::Ok);
+        }
     }
-    if try_run_plan(&mut args)? {
-        return Ok(RunOutcome::Ok);
+    match try_run_ask(&mut args)? {
+        CommandOutcome::NotHandled => {}
+        CommandOutcome::Done => return Ok(RunOutcome::Ok),
+        CommandOutcome::Exit(_) => unreachable!("attini ask never exits"),
+        CommandOutcome::Help => {
+            if let Some(help) = args.finish()? {
+                print!("{help}");
+            }
+            return Ok(RunOutcome::Ok);
+        }
     }
     if try_run_session(&mut args)? {
         return Ok(RunOutcome::Ok);
@@ -73,13 +105,13 @@ fn run() -> Result<RunOutcome, RunError> {
     Ok(RunOutcome::Ok)
 }
 
-fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunError> {
+fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("agent")
         .doc("Run one turn of the sync CLI agent against a persistent session")
         .take(args)
         .is_present()
     {
-        return Ok(None);
+        return Ok(CommandOutcome::NotHandled);
     }
 
     let model: String = noargs::opt("model")
@@ -197,7 +229,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         .present_and_then(|a| a.value().parse())?;
 
     if args.metadata().help_mode {
-        return Ok(None);
+        return Ok(CommandOutcome::Help);
     }
 
     let tool_call_rate = parse_tool_call_rate(&tool_call_rate_raw)?;
@@ -270,21 +302,21 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<Option<ExitCode>, RunErro
         authorization,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
-        agent_cli::RunOutcome::Exit(code) => Ok(Some(code)),
+        agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
     }
 }
 
 // -------------------------------------------------------------------
-// `attini plan` command family
+// `attini ask` command family
 // -------------------------------------------------------------------
 
-fn try_run_plan(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
-    if !noargs::cmd("plan")
-        .doc("Show the current plan: latest assistant message + any pending tool call (read-only)")
+fn try_run_ask(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("ask")
+        .doc("Ask the model about the current state of a session (read-only)")
         .take(args)
         .is_present()
     {
-        return Ok(false);
+        return Ok(CommandOutcome::NotHandled);
     }
     let session_name: String = noargs::opt("session")
         .short('s')
@@ -293,11 +325,32 @@ fn try_run_plan(args: &mut noargs::RawArgs) -> Result<bool, RunError> {
         .default("main")
         .take(args)
         .then(|o| o.value().parse())?;
+    let model: String = noargs::opt("model")
+        .ty("NAME")
+        .doc("Model name used for the summariser")
+        .default(DEFAULT_MODEL)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let limit: Option<usize> = noargs::opt("limit")
+        .ty("N")
+        .doc("Only summarise the most recent N conversation records")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<usize>())?;
+    let all = noargs::flag("all")
+        .doc("Summarise the entire conversation, ignoring the last summary cutoff")
+        .take(args)
+        .is_present();
+    let question: Option<String> = noargs::arg("[QUESTION]")
+        .doc("Optional question to focus the model's answer on the current state")
+        .example("What is the model currently working on?")
+        .take(args)
+        .present_and_then(|a| a.value().parse())?;
     if args.metadata().help_mode {
-        return Ok(false);
+        return Ok(CommandOutcome::Help);
     }
-    session_cmd::run_plan_view(&session_name).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(true)
+    session_cmd::run_ask(&session_name, question.as_deref(), &model, limit, all)
+        .map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(CommandOutcome::Done)
 }
 
 fn parse_tool_call_rate(raw: &str) -> Result<Option<RateLimit>, RunError> {

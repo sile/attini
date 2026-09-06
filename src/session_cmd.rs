@@ -11,9 +11,8 @@ use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
 
 use crate::agent_cli;
 use crate::session::{
-    ConversationSummary, LockStatus, Session, SessionPaths, inspect_lock,
-    read_conversation_records, read_pending_summary, scan_conversation, session_paths,
-    session_root,
+    ConversationSummary, LockStatus, Session, SessionPaths, inspect_lock, read_pending_summary,
+    scan_conversation, session_paths, session_root,
 };
 
 pub fn run_list() -> io::Result<()> {
@@ -186,10 +185,15 @@ fn print_summary(s: &ConversationSummary) {
     }
 }
 
-/// Read-only "current plan" view. Renders the latest assistant
-/// message (the model's most recent statement of intent / approach)
-/// plus any pending tool call. Never writes to the conversation.
-pub fn run_plan_view(name: &str) -> io::Result<()> {
+/// Read-only model summary of a session's current state. Never
+/// writes to the conversation.
+pub fn run_ask(
+    name: &str,
+    question: Option<&str>,
+    model: &str,
+    limit: Option<usize>,
+    all: bool,
+) -> io::Result<()> {
     let paths = session_paths(name)?;
     if !paths.dir.try_exists()? {
         return Err(io::Error::new(
@@ -197,55 +201,17 @@ pub fn run_plan_view(name: &str) -> io::Result<()> {
             format!("session {name:?} not found ({})", paths.dir.display()),
         ));
     }
-    let records = read_conversation_records(&paths.conversation)?;
-    let latest_assistant = records.iter().rev().find_map(|r| match r {
-        crate::session::SessionRecord::Assistant {
-            ts,
-            content,
-            reasoning,
-            tool_calls,
-        } => Some((*ts, content.as_str(), reasoning.as_deref(), tool_calls)),
-        _ => None,
-    });
-
-    println!("session: {name}");
-    match latest_assistant {
-        Some((ts, content, reasoning, tool_calls)) => {
-            println!("  last_assistant ts: {ts}");
-            if !content.trim().is_empty() {
-                println!("\n  --- last assistant message ---\n");
-                println!("{content}");
-            } else {
-                println!("  last assistant message: (empty)");
-            }
-            if !tool_calls.is_empty() {
-                println!("\n  tool_calls:");
-                for tc in tool_calls {
-                    println!("    {}({})", tc.function_name, tc.arguments_json);
-                }
-            }
-            if let Some(r) = reasoning {
-                if !r.trim().is_empty() {
-                    println!("\n  --- reasoning ---\n");
-                    println!("{r}");
-                }
-            }
-        }
-        None => println!("  last_assistant: (no assistant message yet)"),
+    let mut records = crate::session::read_chat_message_with_ts(&paths.conversation, all)?;
+    if let Some(limit) = limit {
+        let start = records.len().saturating_sub(limit);
+        records = records[start..].to_vec();
     }
-
-    let pending = read_pending_summary(&paths.pending)?;
-    match pending {
-        Some(p) => {
-            println!("\n  pending:");
-            println!("    call_id: {}", p.call_id);
-            println!("    tool_kind: {:?}", p.tool_kind);
-            println!("    function_name: {}", p.function_name);
-            println!("    ts: {}", p.ts);
-            println!("    preview: {}", p.preview);
-        }
-        None => println!("\n  pending: (none)"),
+    if records.is_empty() {
+        println!("session {name:?}: no conversation records yet");
+        return Ok(());
     }
+    let text = agent_cli::run_ask_summary(records, model, question)?;
+    println!("{text}");
     Ok(())
 }
 

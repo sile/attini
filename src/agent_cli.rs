@@ -1006,7 +1006,18 @@ pub fn compact_conversation(session: &mut Session, model: &str) -> io::Result<()
     Ok(())
 }
 
-fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<String> {
+const ASK_SYSTEM_PROMPT: &str = "You are clarifying the current state of a coding-agent \
+session for a human. Read the conversation that follows and answer directly and \
+concisely about what is happening now: unfinished work, decisions, files/symbols in \
+play, and any tool call awaiting approval. If a question is appended, answer that \
+question specifically. Otherwise produce a short status summary (~300 words) of the \
+current state. Do not comment on the instruction itself; produce only the answer.";
+
+fn call_summariser_model(
+    model: &str,
+    system: String,
+    records: Vec<ChatMessageWithTs>,
+) -> io::Result<String> {
     // The records being summarised may contain an assistant message
     // whose tool_calls are only partially answered (e.g. a session
     // that previously suspended awaiting approval). Repair the message
@@ -1016,7 +1027,7 @@ fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<St
     // records are about to be folded into a summary.
     let chat_messages: Vec<ChatMessage> = records.into_iter().map(|r| r.message).collect();
     let (chat_messages, _) = repair_messages(&chat_messages);
-    let mut messages = vec![ChatMessage::System(SUMMARIZER_SYSTEM_PROMPT.to_string())];
+    let mut messages = vec![ChatMessage::System(system)];
     messages.extend(chat_messages);
     let request = ChatRequest::new(model.to_string(), messages);
     let mut sink = io::sink();
@@ -1032,6 +1043,27 @@ fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<St
              (both content and reasoning_content were empty)",
         )
     })
+}
+
+fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<String> {
+    call_summariser_model(model, SUMMARIZER_SYSTEM_PROMPT.to_string(), records)
+}
+
+/// Read-only model summarisation used by `attini ask`. Unlike
+/// `run_summariser` this never persists anything; it just answers a
+/// (optional) question about the current session state.
+pub(crate) fn run_ask_summary(
+    records: Vec<ChatMessageWithTs>,
+    model: &str,
+    question: Option<&str>,
+) -> io::Result<String> {
+    let mut system = ASK_SYSTEM_PROMPT.to_string();
+    if let Some(q) = question {
+        system.push_str("\n\nThe user's question is: ");
+        system.push_str(q);
+        system.push('\n');
+    }
+    call_summariser_model(model, system, records)
 }
 
 /// Pick a usable summary from a [`CallResult`]: prefer `content` and
