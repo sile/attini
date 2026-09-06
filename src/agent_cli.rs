@@ -1031,12 +1031,107 @@ pub fn compact_conversation(session: &mut Session, model: &str) -> io::Result<()
     Ok(())
 }
 
-const ASK_SYSTEM_PROMPT: &str = "You are clarifying the current state of a coding-agent \
-session for a human. Read the conversation that follows and answer directly and \
-concisely about what is happening now: unfinished work, decisions, files/symbols in \
-play, and any tool call awaiting approval. If a question is appended, answer that \
-question specifically. Otherwise produce a short status summary (~300 words) of the \
-current state. Do not comment on the instruction itself; produce only the answer.";
+const ASK_SYSTEM_PROMPT: &str = "You are an OUTSIDE observer reading a recording of a \
+coding-agent session. You are NOT the coding assistant and you are NOT continuing \
+its work: do not emit tool calls, do not write plan steps, do not pick up an \
+unfinished action, do not reproduce the session's agentic wording. Read the session \
+transcript below (rendered as plain prose; tool calls and results are abbreviated) \
+and answer directly and concisely about what is happening now: unfinished work, \
+decisions, files/symbols in play, and any tool call awaiting approval. If a question \
+is appended, answer that question specifically. Otherwise produce a short status \
+summary (~300 words) of the current state, in third person. Never begin with an \
+action verb such as 'I will / I am going to / let's'. Do not comment on the \
+instruction itself; produce only the answer.";
+
+/// Abbreviate JSON tool arguments to a short single-line prefix so the
+/// prose transcript stays readable and does not invite the model to
+/// reproduce the raw agentic tool-call format.
+fn abbreviate_args(args_json: &str) -> String {
+    let t = args_json.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let mut cleaned = String::new();
+    for c in t.chars().take(90) {
+        cleaned.push(if c == '\n' { ' ' } else { c });
+    }
+    if t.chars().count() > 90 {
+        cleaned.push('…');
+    }
+    cleaned
+}
+
+/// Render conversation records as a plain third-person prose transcript
+/// with tool calls and results abbreviated. This deliberately strips the
+/// raw `tool_calls`/`tool` JSON and any `<invoke>`-style XML so a
+/// summariser model does not imitate the coding-agent's tool-calling
+/// format and instead behaves as an outside observer.
+fn render_records_prose(records: &[ChatMessageWithTs]) -> String {
+    let mut out = String::new();
+    for rec in records {
+        match &rec.message {
+            ChatMessage::System(s) => out.push_str(&format!("[system] {}\n", s.trim())),
+            ChatMessage::User(s) => out.push_str(&format!("user: {}\n", s.trim())),
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                let c = content.trim();
+                let mut lines = Vec::new();
+                if !c.is_empty() {
+                    lines.push(c.to_string());
+                }
+                for tc in tool_calls {
+                    let a = abbreviate_args(&tc.arguments_json);
+                    if a.is_empty() {
+                        lines.push(format!("  [tool call: {}]", tc.function_name));
+                    } else {
+                        lines.push(format!("  [tool call: {} ({})]", tc.function_name, a));
+                    }
+                }
+                if !lines.is_empty() {
+                    out.push_str(&format!("assistant: {}\n", lines.join("\n")));
+                }
+            }
+            ChatMessage::Tool { content, .. } => {
+                let t = content.trim();
+                let brief = if t.is_empty() {
+                    String::new()
+                } else {
+                    let mut s = String::new();
+                    for c in t.chars().take(200) {
+                        s.push(c);
+                    }
+                    if t.chars().count() > 200 {
+                        s.push('…');
+                    }
+                    s
+                };
+                out.push_str(&format!("  [tool result: {}]\n", brief));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn call_summariser_messages(model: &str, messages: Vec<ChatMessage>) -> io::Result<String> {
+    let request = ChatRequest::new(model.to_string(), messages);
+    let mut sink = io::sink();
+    let mut sinks = ProgressSinks {
+        content: &mut sink,
+        reasoning: None,
+    };
+    let result = curl::call(&request, &mut sinks)
+        .map_err(|e| io::Error::other(format!("summariser call failed: {e}")))?;
+    pick_summary_text(&result).ok_or_else(|| {
+        io::Error::other(
+            "summariser returned empty content \
+             (both content and reasoning_content were empty)",
+        )
+    })
+}
 
 fn call_summariser_model(
     model: &str,
@@ -1054,20 +1149,7 @@ fn call_summariser_model(
     let (chat_messages, _) = repair_messages(&chat_messages);
     let mut messages = vec![ChatMessage::System(system)];
     messages.extend(chat_messages);
-    let request = ChatRequest::new(model.to_string(), messages);
-    let mut sink = io::sink();
-    let mut sinks = ProgressSinks {
-        content: &mut sink,
-        reasoning: None,
-    };
-    let result = curl::call(&request, &mut sinks)
-        .map_err(|e| io::Error::other(format!("summariser call failed: {e}")))?;
-    pick_summary_text(&result).ok_or_else(|| {
-        io::Error::other(
-            "summariser returned empty content \
-             (both content and reasoning_content were empty)",
-        )
-    })
+    call_summariser_messages(model, messages)
 }
 
 fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<String> {
@@ -1088,7 +1170,10 @@ pub(crate) fn run_ask_summary(
         system.push_str(q);
         system.push('\n');
     }
-    call_summariser_model(model, system, records)
+    system.push_str("\n\n--- BEGIN SESSION TRANSCRIPT (prose) ---\n\n");
+    system.push_str(&render_records_prose(&records));
+    system.push_str("\n--- END SESSION TRANSCRIPT ---\n");
+    call_summariser_messages(model, vec![ChatMessage::System(system)])
 }
 
 /// Pick a usable summary from a [`CallResult`]: prefer `content` and
@@ -2262,6 +2347,65 @@ mod tests {
     fn pick_summary_text_returns_none_when_reasoning_is_none() {
         let r = call_result("", None);
         assert_eq!(pick_summary_text(&r), None);
+    }
+
+    // -----------------------------------------------------------------
+    // abbreviate_args / render_records_prose
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn abbreviate_args_strips_newlines_and_truncates() {
+        let long = "{\"path\":\"src/agent_cli.rs\",\n\"pattern\":\"".repeat(40);
+        let out = abbreviate_args(&long);
+        assert!(!out.contains('\n'));
+        assert!(out.chars().count() <= 91); // 90 + ellipsis
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn abbreviate_args_handles_empty() {
+        assert_eq!(abbreviate_args(""), "");
+        assert_eq!(abbreviate_args("   "), "");
+    }
+
+    #[test]
+    fn render_records_prose_strips_raw_tool_format() {
+        let records = vec![
+            user(1),
+            ChatMessageWithTs {
+                message: ChatMessage::Assistant {
+                    content: "looking at the file".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        function_name: "search".to_string(),
+                        arguments_json: "{\"pattern\":\"foo\"}".to_string(),
+                    }],
+                },
+                ts: 2,
+            },
+            ChatMessageWithTs {
+                message: ChatMessage::Tool {
+                    tool_call_id: "call_1".to_string(),
+                    content: "a file
+"
+                    .repeat(300),
+                },
+                ts: 3,
+            },
+        ];
+        let out = render_records_prose(&records);
+        assert!(out.contains("user: u1"));
+        assert!(out.contains("assistant: looking at the file"));
+        assert!(out.contains("[tool call: search ({\"pattern\":\"foo\"})]"));
+        assert!(out.contains("[tool result: a file"));
+        // Raw JSON / agentic XML must not leak into the rendered prose.
+        assert!(!out.contains("tool_calls"));
+        assert!(!out.contains("<invoke"));
+        assert!(!out.contains("function_name"));
+        // Tool result is truncated (~200-char brief), not the full ~2100 chars.
+        assert!(out.len() < 600);
+        assert!(out.contains('…'));
     }
 
     // -----------------------------------------------------------------
