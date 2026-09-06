@@ -135,11 +135,6 @@ impl Counters {
 /// definitions, and the summarizer's own input.
 pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
 
-/// Full model context window (DeepSeek 64 K) used for the status line's
-/// `ctx=` field, so the human sees how close the conversation is to the
-/// window before compaction.
-pub const MODEL_CONTEXT_TOKENS: u64 = 64 * 1024;
-
 /// Target number of real records to retain past the summary cutoff
 /// when compacting. Actual retention may be a little higher: the
 /// cutoff snaps toward the tail until it lands on a User record or
@@ -276,9 +271,10 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     // One-line start-of-invocation breadcrumb to stderr (a diagnostic, not
     // machine-consumed output). Printed BEFORE the model runs: it tells the
     // human which session/model is about to advance and how big the current
-    // conversation already is against the context window. `ctx=` comes from
-    // the last recorded `prompt_tokens` (the conversation size so far), not
-    // the cumulative billed total. Disabled with ATTINI_STATUS_LINE=0.
+    // conversation already is (the last recorded `prompt_tokens`). `ctx=`
+    // comes from the last recorded `prompt_tokens` (the conversation size
+    // so far), not the cumulative billed total. Disabled with
+    // ATTINI_STATUS_LINE=0.
     if std::env::var("ATTINI_STATUS_LINE").as_deref() != Ok("0") {
         let ctx_tokens = session.latest_prompt_tokens().ok().flatten().unwrap_or(0);
         eprintln!(
@@ -328,8 +324,8 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
 /// cumulative billed total.
 fn render_agent_status_line(model: &str, session_name: &str, ctx_tokens: u64) -> String {
     format!(
-        "[agent] model={} session={} ctx={}/{}",
-        model, session_name, ctx_tokens, MODEL_CONTEXT_TOKENS,
+        "[agent] model={} session={} ctx={}",
+        model, session_name, ctx_tokens,
     )
 }
 
@@ -3002,14 +2998,14 @@ mod tests {
         let line = render_agent_status_line("deepseek-v4-flash", "main", 20736);
         assert_eq!(
             line,
-            "[agent] model=deepseek-v4-flash session=main ctx=20736/65536"
+            "[agent] model=deepseek-v4-flash session=main ctx=20736"
         );
     }
 
     #[test]
     fn status_line_uses_passed_ctx_as_current_size() {
         let line = render_agent_status_line("m", "s", 1000);
-        assert!(line.contains("ctx=1000/65536"));
+        assert!(line.contains("ctx=1000"));
         assert!(line.contains("model=m"));
         assert!(line.contains("session=s"));
     }
