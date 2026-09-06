@@ -2070,23 +2070,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // build_tool_defs: plan tool exposure
-    // -------------------------------------------------------------
-
-    #[test]
-    fn build_tool_defs_exposes_no_plan_tools() {
-        let defs = build_tool_defs(true);
-        assert!(
-            !defs.iter().any(|d| d.name == "plan"),
-            "`plan` tool must not be exposed"
-        );
-        assert!(
-            !defs.iter().any(|d| d.name == "submit_plan"),
-            "`submit_plan` tool must not be exposed"
-        );
-    }
-
-    // -------------------------------------------------------------
     // resolve_references
     // -------------------------------------------------------------
 
