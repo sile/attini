@@ -142,6 +142,30 @@ pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
 /// of `assistant -> tool` records stays together.
 pub const KEEP_RECENT_RECORDS_TARGET: usize = 10;
 
+/// Maximum prose characters sent to the summariser in a single
+/// compaction pass. Roughly tokens ≈ chars/4 for ASCII-heavy tool
+/// output, so 200 000 chars ≈ 50 000 tokens — inside even a 64 K
+/// context with room for the ~500-word response. When the rendered
+/// transcript exceeds this the newest portion is kept and the
+/// oldest records are dropped.
+pub const SUMMARY_MAX_CHARS: usize = 200_000;
+
+/// Maximum prose characters kept from a single assistant/user record
+/// before it is truncated in a summary transcript.
+pub const SUMMARY_RECORD_MAX_CHARS: usize = 16_000;
+
+/// Maximum prose characters kept from a single tool result in a
+/// summary transcript.
+pub const SUMMARY_TOOL_RESULT_MAX_CHARS: usize = 200;
+
+/// Maximum raw character size of the retained record tail after a
+/// compaction pass. If the newest records themselves are enormous
+/// (a giant tool result), the cutoff walks further back so they are
+/// folded into the summary rather than left to blow up the main
+/// model call. 250 000 chars ≈ 62 000 tokens, inside even a 64 K
+/// context; normal recent tails are far smaller and unaffected.
+pub const RETAINED_TAIL_MAX_CHARS: usize = 250_000;
+
 pub struct AgentConfig {
     pub session_name: String,
     pub model: String,
@@ -1015,21 +1039,30 @@ pub fn compact_conversation(
     max_tokens: Option<u64>,
 ) -> io::Result<()> {
     let records = session.load_records_since_last_summary()?;
-    let keep_start = safe_tail_start(&records, KEEP_RECENT_RECORDS_TARGET);
-    if keep_start == 0 {
+    let Some(keep_start) = compaction_cutoff(
+        &records,
+        KEEP_RECENT_RECORDS_TARGET,
+        RETAINED_TAIL_MAX_CHARS,
+    ) else {
         eprintln!("[compaction] no records eligible for summarisation. skipping.");
         return Ok(());
-    }
-    let to_summarise: Vec<ChatMessageWithTs> = records[..keep_start].to_vec();
+    };
+    let to_summarise: Vec<ChatMessageWithTs> = if keep_start == records.len() {
+        // Folding every record; the retained tail is empty so the
+        // summary alone becomes the history for the next call.
+        records.clone()
+    } else {
+        records[..keep_start].to_vec()
+    };
     let record_count = to_summarise.len();
     let since_ts = to_summarise
         .first()
         .map(|r| r.ts)
-        .expect("keep_start > 0 so to_summarise is non-empty");
+        .expect("to_summarise is non-empty");
     let cutoff_ts = to_summarise
         .last()
         .map(|r| r.ts)
-        .expect("keep_start > 0 so to_summarise is non-empty");
+        .expect("to_summarise is non-empty");
 
     let text = run_summariser(model, to_summarise, max_tokens)?;
     let words = text.split_whitespace().count();
@@ -1131,6 +1164,99 @@ fn render_records_prose(records: &[ChatMessageWithTs]) -> String {
     out
 }
 
+/// Truncate a prose segment to `max_chars` characters, keeping the
+/// head and appending a marker that notes how many were dropped.
+fn truncate_prose(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars).collect();
+    format!("{head}…[truncated {} chars]", count - max_chars)
+}
+
+/// Render a single record into a bounded prose block for the
+/// summariser. Assistant/user content is capped, tool-call arguments
+/// are abbreviated, and tool results are truncated to a short line, so
+/// an enormous conversation (huge tool results) never blows up the
+/// summariser request.
+fn render_summary_block(rec: &ChatMessageWithTs) -> String {
+    match &rec.message {
+        ChatMessage::System(s) => format!(
+            "[system] {}\n",
+            truncate_prose(s.trim(), SUMMARY_RECORD_MAX_CHARS)
+        ),
+        ChatMessage::User(s) => format!(
+            "user: {}\n",
+            truncate_prose(s.trim(), SUMMARY_RECORD_MAX_CHARS)
+        ),
+        ChatMessage::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            let mut lines = Vec::new();
+            let c = content.trim();
+            if !c.is_empty() {
+                lines.push(truncate_prose(c, SUMMARY_RECORD_MAX_CHARS));
+            }
+            for tc in tool_calls {
+                let a = abbreviate_args(&tc.arguments_json);
+                if a.is_empty() {
+                    lines.push(format!("  [tool call: {}]", tc.function_name));
+                } else {
+                    lines.push(format!("  [tool call: {} ({})]", tc.function_name, a));
+                }
+            }
+            if lines.is_empty() {
+                String::new()
+            } else {
+                format!("assistant: {}\n", lines.join("\n"))
+            }
+        }
+        ChatMessage::Tool { content, .. } => {
+            let t = content.trim();
+            let brief = truncate_prose(t, SUMMARY_TOOL_RESULT_MAX_CHARS);
+            format!("  [tool result: {}]\n", brief)
+        }
+    }
+}
+
+/// Render conversation records into a bounded prose transcript for the
+/// summariser. Each record is rendered into a small bounded block, and
+/// the blocks are kept newest-first until the total reaches
+/// [`SUMMARY_MAX_CHARS`]; older blocks are dropped. When anything is
+/// dropped a note is prepended so the resulting summary reflects the
+/// most recent state.
+fn render_summary_transcript(records: &[ChatMessageWithTs]) -> String {
+    let blocks: Vec<String> = records.iter().map(render_summary_block).collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut dropped_oldest = false;
+    for block in blocks.iter().rev() {
+        let len = block.chars().count();
+        if total + len > SUMMARY_MAX_CHARS {
+            dropped_oldest = true;
+            break;
+        }
+        kept.push(block.clone());
+        total += len;
+    }
+    let mut out = String::new();
+    if dropped_oldest {
+        out.push_str(
+            "[Note: the earliest records of this segment were dropped to fit the \
+             summariser's context window; the transcript below is the most recent \
+             portion, so the summary should reflect the current state.]\n\n",
+        );
+    }
+    for block in kept.into_iter().rev() {
+        out.push_str(&block);
+        out.push('\n');
+    }
+    out
+}
+
 fn call_summariser_messages(
     model: &str,
     messages: Vec<ChatMessage>,
@@ -1152,37 +1278,24 @@ fn call_summariser_messages(
     })
 }
 
-fn call_summariser_model(
-    model: &str,
-    system: String,
-    records: Vec<ChatMessageWithTs>,
-    max_tokens: Option<u64>,
-) -> io::Result<String> {
-    // The records being summarised may contain an assistant message
-    // whose tool_calls are only partially answered (e.g. a session
-    // that previously suspended awaiting approval). Repair the message
-    // list in-memory before sending so the summariser request observes
-    // the same tool_call/tool invariant the main chat request does;
-    // the synthetic results do not need to be persisted because these
-    // records are about to be folded into a summary.
-    let chat_messages: Vec<ChatMessage> = records.into_iter().map(|r| r.message).collect();
-    let (chat_messages, _) = repair_messages(&chat_messages);
-    let mut messages = vec![ChatMessage::System(system)];
-    messages.extend(chat_messages);
-    call_summariser_messages(model, messages, max_tokens)
-}
-
 fn run_summariser(
     model: &str,
     records: Vec<ChatMessageWithTs>,
     max_tokens: Option<u64>,
 ) -> io::Result<String> {
-    call_summariser_model(
-        model,
-        SUMMARIZER_SYSTEM_PROMPT.to_string(),
-        records,
-        max_tokens,
-    )
+    // Render the records as a bounded prose transcript rather than
+    // sending the raw ChatMessages. Raw messages include the full
+    // tool-result JSON, which can be enormous and push the request
+    // past the model context window so compaction fails and the
+    // invocation later fails too. The prose form preserves the
+    // semantic thread (assistant conclusions, decisions, file/symbol
+    // mentions) while keeping each tool result to a short line.
+    let transcript = render_summary_transcript(&records);
+    let messages = vec![
+        ChatMessage::System(SUMMARIZER_SYSTEM_PROMPT.to_string()),
+        ChatMessage::User(transcript),
+    ];
+    call_summariser_messages(model, messages, max_tokens)
 }
 
 /// Read-only model summarisation used by `attini ask`. Unlike
@@ -1269,6 +1382,78 @@ fn is_safe_boundary(msg: &ChatMessage) -> bool {
         ChatMessage::Assistant { tool_calls, .. } => tool_calls.is_empty(),
         _ => false,
     }
+}
+
+/// Rough byte length of a message's payload. Used purely as an
+/// order-of-magnitude heuristic for the retained-tail budget; an
+/// ASCII-heavy tool result's bytes closely track its token count.
+fn message_raw_char_len(msg: &ChatMessage) -> usize {
+    match msg {
+        ChatMessage::System(s) => s.len(),
+        ChatMessage::User(s) => s.len(),
+        ChatMessage::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+        } => {
+            content.len()
+                + reasoning_content.as_deref().map_or(0, |r| r.len())
+                + tool_calls
+                    .iter()
+                    .map(|tc| tc.function_name.len() + tc.arguments_json.len())
+                    .sum::<usize>()
+        }
+        ChatMessage::Tool { content, .. } => content.len(),
+    }
+}
+
+/// Choose the compaction cutoff, returning `None` when there is
+/// nothing to compact (too few records) and `Some(keep_start)`
+/// otherwise. `keep_start` is the index where the retained tail
+/// begins; `Some(n)` (the record count) means fold every record into
+/// the summary, leaving an empty retained tail.
+///
+/// Beyond the record-count target in [`safe_tail_start`], the cutoff
+/// is walked **forward** while the retained tail's raw size exceeds
+/// `max_tail_chars`. A retained tail that is oversized because of a
+/// huge record at the very end (a session suspended right after a
+/// giant tool result) cannot be shrunk by folding older records, so
+/// the walk folds toward the end and finally folds everything.
+fn compaction_cutoff(
+    records: &[ChatMessageWithTs],
+    target_keep: usize,
+    max_tail_chars: usize,
+) -> Option<usize> {
+    let n = records.len();
+    if n <= target_keep {
+        return None;
+    }
+    let mut keep_start = safe_tail_start(records, target_keep);
+    // If the retained tail cannot fit, fold its oldest part by moving
+    // the cutoff toward the end, stopping at a safe boundary so an
+    // `assistant -> tool` pair is never split.
+    while keep_start < n {
+        let tail_chars: usize = records[keep_start..]
+            .iter()
+            .map(|r| message_raw_char_len(&r.message))
+            .sum();
+        if tail_chars <= max_tail_chars {
+            break;
+        }
+        let mut next = keep_start + 1;
+        while next < n && !is_safe_boundary(&records[next].message) {
+            next += 1;
+        }
+        // `next` may reach `n`, which folds everything.
+        keep_start = next;
+    }
+    if keep_start == 0 {
+        // The whole history fits the budget but no safe boundary exists
+        // in the initial retained window: nothing to safely fold, so
+        // skip compaction rather than summarise the entire conversation.
+        return None;
+    }
+    Some(keep_start)
 }
 
 fn build_tool_defs(subagent_available: bool) -> Vec<ToolDef> {
@@ -2114,6 +2299,138 @@ mod tests {
             content: "{}".to_string(),
         }));
         assert!(!is_safe_boundary(&ChatMessage::System("s".to_string())));
+    }
+
+    fn big_user(ts: u64, len: usize) -> ChatMessageWithTs {
+        ChatMessageWithTs {
+            message: ChatMessage::User(format!("u{ts}:{}", "x".repeat(len))),
+            ts,
+        }
+    }
+
+    #[test]
+    fn truncate_prose_keeps_head_and_notes_dropped_chars() {
+        let s = "abcdefghij".repeat(2000); // 20_000 chars
+        let out = truncate_prose(&s, 1000);
+        assert!(out.starts_with("abc"));
+        assert!(out.contains("[truncated 19000 chars]"));
+        assert!(out.chars().count() < 2000);
+    }
+
+    #[test]
+    fn render_summary_transcript_fits_all_within_budget() {
+        let records = vec![user(1), assistant_plain(2), tool(3)];
+        let out = render_summary_transcript(&records);
+        assert!(!out.contains("[Note:"), "unexpected note: {out}");
+        assert!(out.contains("user: u1"));
+        assert!(out.contains("assistant: a2"));
+        assert!(out.contains("[tool result:"));
+    }
+
+    #[test]
+    fn render_summary_transcript_drops_oldest_when_over_budget() {
+        // Each record is over SUMMARY_RECORD_MAX_CHARS so each renders
+        // to ~SUMMARY_RECORD_MAX_CHARS of prose + a truncation marker.
+        // Fourteen such blocks exceed SUMMARY_MAX_CHARS, so the newest
+        // ones are kept and the oldest are dropped (with a note).
+        let mut records = Vec::new();
+        for i in 1..=14 {
+            records.push(big_user(i, SUMMARY_RECORD_MAX_CHARS + 100));
+        }
+        let out = render_summary_transcript(&records);
+        assert!(out.contains("[Note:"), "expected a truncation note");
+        assert!(out.contains("u14:"), "newest record should be kept");
+        let kept_oldest_marker = records
+            .len()
+            .checked_sub(2)
+            .map(|_| format!("u{}:", records.len().saturating_sub(2)))
+            .unwrap_or_default();
+        // The newest two are definitely kept; the absolute oldest is dropped.
+        assert!(!out.contains("u1:"), "oldest record should be dropped");
+        assert!(
+            out.contains(&kept_oldest_marker),
+            "a kept record ({kept_oldest_marker}) should be present"
+        );
+    }
+
+    #[test]
+    fn render_summary_block_truncates_huge_tool_result() {
+        let huge = "y".repeat(50_000);
+        let rec = ChatMessageWithTs {
+            message: ChatMessage::Tool {
+                tool_call_id: "call_1".to_string(),
+                content: huge,
+            },
+            ts: 1,
+        };
+        let out = render_summary_block(&rec);
+        assert!(
+            out.contains("[truncated"),
+            "tool result not truncated: {}",
+            out.len()
+        );
+        assert!(out.chars().count() < 1_000);
+    }
+
+    fn big_tool(ts: u64, len: usize) -> ChatMessageWithTs {
+        ChatMessageWithTs {
+            message: ChatMessage::Tool {
+                tool_call_id: format!("call_{ts}"),
+                content: "z".repeat(len),
+            },
+            ts,
+        }
+    }
+
+    #[test]
+    fn compaction_cutoff_returns_none_when_too_short() {
+        let records = vec![user(1), assistant_plain(2)];
+        assert_eq!(compaction_cutoff(&records, 10, 1000), None);
+    }
+
+    #[test]
+    fn compaction_cutoff_returns_safe_tail_start_within_budget() {
+        let records = vec![
+            user(1),
+            assistant_plain(2),
+            user(3),
+            assistant_plain(4),
+            user(5),
+        ];
+        let keep = safe_tail_start(&records, 2);
+        assert!(keep > 0);
+        assert_eq!(compaction_cutoff(&records, 2, 100_000), Some(keep));
+    }
+
+    #[test]
+    fn compaction_cutoff_folds_huge_tail_to_the_end() {
+        // A giant tool result sits at the very end, with no safe
+        // boundary after it. The retained tail cannot be shrunk by
+        // folding older records, so the cutoff walks to the end and
+        // everything is folded into the summary.
+        let records = vec![
+            user(1),
+            assistant_plain(2),
+            assistant_with_tool_call(3),
+            big_tool(4, 50_000),
+        ];
+        assert_eq!(compaction_cutoff(&records, 2, 100), Some(records.len()));
+    }
+
+    #[test]
+    fn compaction_cutoff_folds_middle_huge_record_normally() {
+        // A huge tool result before a clearly safe recent tail does not
+        // force fold-all: safe_tail_start already lands after it.
+        let records = vec![
+            user(1),
+            assistant_with_tool_call(2),
+            big_tool(3, 50_000),
+            user(4),
+            assistant_plain(5),
+        ];
+        let keep = safe_tail_start(&records, 2);
+        assert!(keep > 0 && keep < records.len());
+        assert_eq!(compaction_cutoff(&records, 2, 100), Some(keep));
     }
 
     // -------------------------------------------------------------
