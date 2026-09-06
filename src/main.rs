@@ -13,6 +13,9 @@ const SESSION_ENV: &str = "ATTINI_SESSION_NAME";
 /// Environment variable that supplies a default model name when
 /// `--model` is omitted.
 const MODEL_ENV: &str = "ATTINI_MODEL_NAME";
+/// Environment variable that supplies a default completion-token cap when
+/// `--max-tokens` is omitted.
+const MAX_TOKENS_ENV: &str = "ATTINI_MAX_TOKENS";
 
 // String forms of the tool-call cap defaults, exposed here because
 // noargs' `default()` needs a `&'static str`. Kept in sync with the
@@ -258,6 +261,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     let max_tokens: Option<u64> = noargs::opt("max-tokens")
         .ty("N")
         .doc("Maximum completion tokens per model call; `none` uses the model default")
+        .env(MAX_TOKENS_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
 
@@ -385,6 +389,7 @@ fn try_run_ask(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     let max_tokens: Option<u64> = noargs::opt("max-tokens")
         .ty("N")
         .doc("Maximum tokens for the summariser response")
+        .env(MAX_TOKENS_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
     let question: Option<String> = noargs::arg("[QUESTION]")
@@ -849,6 +854,7 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
     let max_tokens: Option<u64> = noargs::opt("max-tokens")
         .ty("N")
         .doc("Maximum tokens for the summariser response")
+        .env(MAX_TOKENS_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
     if args.metadata().help_mode {
