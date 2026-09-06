@@ -255,6 +255,11 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         )
         .take(args)
         .present_and_then(|o| o.value().parse())?;
+    let max_tokens: Option<u64> = noargs::opt("max-tokens")
+        .ty("N")
+        .doc("Maximum completion tokens per model call; `none` uses the model default")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
 
     let prompt: Option<String> = noargs::arg("[PROMPT]")
         .doc("User prompt (required unless --approve or --reject is given)")
@@ -321,6 +326,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     let cfg = AgentConfig {
         session_name,
         model,
+        max_tokens,
         workspace_root,
         system_prompt: system,
         show_reasoning,
@@ -376,6 +382,11 @@ fn try_run_ask(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
         .doc("Summarise the entire conversation, ignoring the last summary cutoff")
         .take(args)
         .is_present();
+    let max_tokens: Option<u64> = noargs::opt("max-tokens")
+        .ty("N")
+        .doc("Maximum tokens for the summariser response")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
     let question: Option<String> = noargs::arg("[QUESTION]")
         .doc("Optional question to focus the model's answer on the current state")
         .example("What is the model currently working on?")
@@ -384,8 +395,15 @@ fn try_run_ask(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
-    session_cmd::run_ask(&session_name, question.as_deref(), &model, limit, all)
-        .map_err(|e| RunError::Runtime(e.to_string()))?;
+    session_cmd::run_ask(
+        &session_name,
+        question.as_deref(),
+        &model,
+        limit,
+        all,
+        max_tokens,
+    )
+    .map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 
@@ -828,10 +846,15 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
         .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
+    let max_tokens: Option<u64> = noargs::opt("max-tokens")
+        .ty("N")
+        .doc("Maximum tokens for the summariser response")
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
-    session_cmd::run_compact(&session_name, &model)
+    session_cmd::run_compact(&session_name, &model, max_tokens)
         .map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }

@@ -204,6 +204,10 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDef>,
+    /// Maximum completion tokens the model may emit in one call.
+    /// `None` omits the field so the upstream model applies its own
+    /// default; `Some(n)` caps the response size (and cost).
+    pub max_tokens: Option<u64>,
 }
 
 impl ChatRequest {
@@ -212,11 +216,17 @@ impl ChatRequest {
             model: model.into(),
             messages,
             tools: Vec::new(),
+            max_tokens: None,
         }
     }
 
     pub fn with_tools(mut self, tools: Vec<ToolDef>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -234,6 +244,9 @@ impl DisplayJson for ChatRequest {
             f.member("messages", &self.messages)?;
             f.member("stream", true)?;
             f.member("stream_options", &StreamOptions)?;
+            if let Some(max_tokens) = self.max_tokens {
+                f.member("max_tokens", max_tokens)?;
+            }
             if !self.tools.is_empty() {
                 f.member("tools", &self.tools)?;
             }
@@ -449,6 +462,21 @@ mod tests {
         );
         let json = request.to_json_string();
         assert!(json.contains(r#""content":"line1\nline2\t\"quoted\"""#));
+    }
+
+    #[test]
+    fn chat_request_serialises_max_tokens_when_present() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())])
+            .with_max_tokens(Some(512));
+        let json = request.to_json_string();
+        assert!(json.contains(r#""max_tokens":512"#), "unexpected: {json}");
+    }
+
+    #[test]
+    fn chat_request_omits_max_tokens_when_absent() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())]);
+        let json = request.to_json_string();
+        assert!(!json.contains("max_tokens"), "unexpected: {json}");
     }
 
     #[test]

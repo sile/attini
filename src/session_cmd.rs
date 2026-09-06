@@ -195,6 +195,7 @@ pub fn run_ask(
     model: &str,
     limit: Option<usize>,
     all: bool,
+    max_tokens: Option<u64>,
 ) -> io::Result<()> {
     let paths = session_paths(name)?;
     if !paths.dir.try_exists()? {
@@ -226,7 +227,8 @@ pub fn run_ask(
         }
     }
     let prior_text = render_prior_ask_context(&state.entries);
-    let text = agent_cli::run_ask_summary(records, model, question, prior_text.as_deref())?;
+    let text =
+        agent_cli::run_ask_summary(records, model, question, prior_text.as_deref(), max_tokens)?;
     println!("{text}");
     state.entries.push(crate::session::AskEntry {
         ts: crate::session::now_unix_millis(),
@@ -1202,7 +1204,7 @@ fn rewrite_from_offset(path: &Path, offset: u64) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
-pub fn run_compact(session_name: &str, model: &str) -> io::Result<()> {
+pub fn run_compact(session_name: &str, model: &str, max_tokens: Option<u64>) -> io::Result<()> {
     let paths = session_paths(session_name)?;
     if !paths.dir.try_exists()? {
         return Err(io::Error::new(
@@ -1230,7 +1232,7 @@ pub fn run_compact(session_name: &str, model: &str) -> io::Result<()> {
         ));
     }
     let mut session = Session::open(session_name)?;
-    let result = agent_cli::compact_conversation(&mut session, model);
+    let result = agent_cli::compact_conversation(&mut session, model, max_tokens);
     // Close explicitly so LOCK unlink errors are surfaced, but drop
     // ordering already covers the happy path.
     let _ = session.close();

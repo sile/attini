@@ -145,6 +145,9 @@ pub const KEEP_RECENT_RECORDS_TARGET: usize = 10;
 pub struct AgentConfig {
     pub session_name: String,
     pub model: String,
+    /// Maximum completion tokens per model call. `None` uses the
+    /// model's own default; `Some(n)` caps response size / cost.
+    pub max_tokens: Option<u64>,
     pub workspace_root: PathBuf,
     pub system_prompt: Option<String>,
     pub show_reasoning: bool,
@@ -363,7 +366,7 @@ fn drive(
     counters: &mut Counters,
 ) -> io::Result<Driven> {
     if matches!(cont, Continuation::Prompt(_)) {
-        try_auto_compact(session, &cfg.model, counters)?;
+        try_auto_compact(session, &cfg.model, counters, cfg.max_tokens)?;
     }
 
     let is_prompt = matches!(cont, Continuation::Prompt(_));
@@ -450,8 +453,9 @@ fn drive(
 
     for _ in 0..cfg.max_turns {
         gate.begin_turn();
-        let request =
-            ChatRequest::new(cfg.model.clone(), messages.clone()).with_tools(tools.clone());
+        let request = ChatRequest::new(cfg.model.clone(), messages.clone())
+            .with_tools(tools.clone())
+            .with_max_tokens(cfg.max_tokens);
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
         let call_result = {
@@ -971,7 +975,12 @@ Aim for ~500 words of plain prose. Do not include markdown code fences \
 unless quoting a short critical excerpt. Do not comment on the \
 summarization itself; produce only the summary.";
 
-fn try_auto_compact(session: &mut Session, model: &str, counters: &mut Counters) -> io::Result<()> {
+fn try_auto_compact(
+    session: &mut Session,
+    model: &str,
+    counters: &mut Counters,
+    max_tokens: Option<u64>,
+) -> io::Result<()> {
     if session.load_pending()?.is_some() {
         return Ok(());
     }
@@ -985,7 +994,7 @@ fn try_auto_compact(session: &mut Session, model: &str, counters: &mut Counters)
         "[compaction] previous prompt was {latest} tokens (threshold {COMPACTION_TRIGGER_TOKENS}), summarising..."
     );
     counters.compaction_attempts += 1;
-    if let Err(e) = compact_conversation(session, model) {
+    if let Err(e) = compact_conversation(session, model, max_tokens) {
         counters.compaction_failures += 1;
         eprintln!("[compaction] failed, continuing with full history: {e}");
     }
@@ -1000,7 +1009,11 @@ fn try_auto_compact(session: &mut Session, model: &str, counters: &mut Counters)
 /// Exposed to `session_cmd` for the manual `attini session compact`
 /// subcommand. Callers are expected to have already checked that
 /// the session is idle (no LOCK holder, no `pending.json`).
-pub fn compact_conversation(session: &mut Session, model: &str) -> io::Result<()> {
+pub fn compact_conversation(
+    session: &mut Session,
+    model: &str,
+    max_tokens: Option<u64>,
+) -> io::Result<()> {
     let records = session.load_records_since_last_summary()?;
     let keep_start = safe_tail_start(&records, KEEP_RECENT_RECORDS_TARGET);
     if keep_start == 0 {
@@ -1018,7 +1031,7 @@ pub fn compact_conversation(session: &mut Session, model: &str) -> io::Result<()
         .map(|r| r.ts)
         .expect("keep_start > 0 so to_summarise is non-empty");
 
-    let text = run_summariser(model, to_summarise)?;
+    let text = run_summariser(model, to_summarise, max_tokens)?;
     let words = text.split_whitespace().count();
 
     session.append(&SessionRecord::Summary {
@@ -1118,8 +1131,12 @@ fn render_records_prose(records: &[ChatMessageWithTs]) -> String {
     out
 }
 
-fn call_summariser_messages(model: &str, messages: Vec<ChatMessage>) -> io::Result<String> {
-    let request = ChatRequest::new(model.to_string(), messages);
+fn call_summariser_messages(
+    model: &str,
+    messages: Vec<ChatMessage>,
+    max_tokens: Option<u64>,
+) -> io::Result<String> {
+    let request = ChatRequest::new(model.to_string(), messages).with_max_tokens(max_tokens);
     let mut sink = io::sink();
     let mut sinks = ProgressSinks {
         content: &mut sink,
@@ -1139,6 +1156,7 @@ fn call_summariser_model(
     model: &str,
     system: String,
     records: Vec<ChatMessageWithTs>,
+    max_tokens: Option<u64>,
 ) -> io::Result<String> {
     // The records being summarised may contain an assistant message
     // whose tool_calls are only partially answered (e.g. a session
@@ -1151,11 +1169,20 @@ fn call_summariser_model(
     let (chat_messages, _) = repair_messages(&chat_messages);
     let mut messages = vec![ChatMessage::System(system)];
     messages.extend(chat_messages);
-    call_summariser_messages(model, messages)
+    call_summariser_messages(model, messages, max_tokens)
 }
 
-fn run_summariser(model: &str, records: Vec<ChatMessageWithTs>) -> io::Result<String> {
-    call_summariser_model(model, SUMMARIZER_SYSTEM_PROMPT.to_string(), records)
+fn run_summariser(
+    model: &str,
+    records: Vec<ChatMessageWithTs>,
+    max_tokens: Option<u64>,
+) -> io::Result<String> {
+    call_summariser_model(
+        model,
+        SUMMARIZER_SYSTEM_PROMPT.to_string(),
+        records,
+        max_tokens,
+    )
 }
 
 /// Read-only model summarisation used by `attini ask`. Unlike
@@ -1166,6 +1193,7 @@ pub(crate) fn run_ask_summary(
     model: &str,
     question: Option<&str>,
     prior: Option<&str>,
+    max_tokens: Option<u64>,
 ) -> io::Result<String> {
     let mut system = ASK_SYSTEM_PROMPT.to_string();
     if let Some(p) = prior {
@@ -1184,7 +1212,7 @@ pub(crate) fn run_ask_summary(
     system.push_str("\n\n--- BEGIN SESSION TRANSCRIPT (prose) ---\n\n");
     system.push_str(&render_records_prose(&records));
     system.push_str("\n--- END SESSION TRANSCRIPT ---\n");
-    call_summariser_messages(model, vec![ChatMessage::System(system)])
+    call_summariser_messages(model, vec![ChatMessage::System(system)], max_tokens)
 }
 
 /// Pick a usable summary from a [`CallResult`]: prefer `content` and
@@ -2100,6 +2128,7 @@ mod tests {
         AgentConfig {
             session_name: String::new(),
             model: String::new(),
+            max_tokens: None,
             workspace_root: PathBuf::new(),
             system_prompt: None,
             show_reasoning: false,

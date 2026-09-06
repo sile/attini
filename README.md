@@ -70,7 +70,7 @@ Streams the response to stdout. The tool loop is not run.
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill NAME] [--read-path PATH ...] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill NAME] [--read-path PATH ...] [--max-tokens N] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -78,6 +78,9 @@ UTF-8 file into the system prompt before the first turn, so context is present
 without a `read` round-trip. Relative paths resolve against the workspace root.
 Files larger than 32 KiB are not inlined; instead they are granted as extra read
 roots and referenced by absolute path (readable with the `read` tool).
+
+`--max-tokens N` caps the completion-token budget for every model call in the
+run. When omitted the model's own default is used.
 
 ### Model selection
 
@@ -110,7 +113,8 @@ removed only when the session is deleted with `attini session rm <NAME>`.
 session without touching the conversation log: what is in progress, any pending tool
 call, and (when a `QUESTION` is supplied) a direct answer to that question. Records
 since the last compaction summary are used by default; `--all` uses the whole
-conversation and `--limit N` keeps only the most recent N records. It is purely
+conversation and `--limit N` keeps only the most recent N records.
+`--max-tokens N` caps the summariser response size. It is purely
 observational — adjust the course by running `attini agent -s NAME "<new
 instruction>"` (or a fresh session) and letting the model revise its approach
 naturally.
