@@ -12,7 +12,7 @@ use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
-    SkillLoadInvocation, SubagentRunInvocation, ToolExecutionError, ToolOutcome,
+    SkillLoadInvocation, ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
@@ -66,7 +66,6 @@ pub struct ToolCallsByKind {
     pub patch: u64,
     pub command: u64,
     pub skill_load: u64,
-    pub subagent_run: u64,
     pub unknown: u64,
 }
 
@@ -95,10 +94,6 @@ impl Counters {
             (
                 "tool_calls.skill_load".to_string(),
                 self.tool_calls_by_kind.skill_load,
-            ),
-            (
-                "tool_calls.subagent_run".to_string(),
-                self.tool_calls_by_kind.subagent_run,
             ),
             (
                 "tool_calls.unknown".to_string(),
@@ -202,10 +197,6 @@ pub struct AgentConfig {
     /// Applies only to fresh invocations; combining with `--approve`
     /// / `--reject` is rejected in `main.rs`.
     pub skill_name: Option<String>,
-    /// Whether the `subagent_run` tool should be advertised to the
-    /// model. `main.rs` sets this to true only when
-    /// `ATTINI_IS_SUBAGENT` is unset (so subagents cannot recurse).
-    pub subagent_available: bool,
     /// How side-effecting tool calls are authorized in this
     /// invocation. `plan run` supplies
     /// [`Authorization::ApprovedPlan`]; every other entry point uses
@@ -471,7 +462,7 @@ fn drive(
         }
     }
 
-    let tools = build_tool_defs(cfg.subagent_available);
+    let tools = build_tool_defs();
     let rules = permissions::load(&cfg.session_name)?;
     let mut gate = ToolCallGate::new(cfg);
 
@@ -555,7 +546,6 @@ fn drive(
                 "patch" => counters.tool_calls_by_kind.patch += 1,
                 "command" => counters.tool_calls_by_kind.command += 1,
                 "skill_load" => counters.tool_calls_by_kind.skill_load += 1,
-                "subagent_run" => counters.tool_calls_by_kind.subagent_run += 1,
                 _ => counters.tool_calls_by_kind.unknown += 1,
             }
             match gate.admit(Instant::now()) {
@@ -653,14 +643,6 @@ fn drive(
                         // Left unanswered; cancelled on resume.
                     } else {
                         let content = run_skill_load(tc, counters);
-                        append_tool(session, &mut messages, &tc.id, content)?;
-                    }
-                }
-                ToolKind::SubagentRun => {
-                    if suspending {
-                        // Left unanswered; cancelled on resume.
-                    } else {
-                        let content = run_subagent_run(tc, cfg, counters);
                         append_tool(session, &mut messages, &tc.id, content)?;
                     }
                 }
@@ -914,71 +896,6 @@ fn run_skill_load(tc: &ToolCall, counters: &mut Counters) -> String {
             eprintln!("[skill_load] {}: {message}", inv.name);
             tool_error_json(code, &message)
         }
-    }
-}
-
-/// Dispatch a `subagent_run` tool call: parse, self-exec a child
-/// `attini agent` in the named session and block until it reaches a
-/// terminal state, then return the child's session name, state, and
-/// latest assistant content (or a `tool_error_json` on failure).
-fn run_subagent_run(tc: &ToolCall, cfg: &AgentConfig, counters: &mut Counters) -> String {
-    let inv = match SubagentRunInvocation::parse(&tc.arguments_json) {
-        Ok(inv) => inv,
-        Err(err) => {
-            counters.tool_errors += 1;
-            eprintln!("[subagent_run] parse err: {err:?}");
-            return tool_error_json_from(&err);
-        }
-    };
-    match crate::subagent::run(
-        inv.session_name.as_deref(),
-        &inv.prompt,
-        &cfg.model,
-        cfg.mode,
-    ) {
-        Ok(status) => {
-            eprintln!(
-                "[subagent_run] {}: {}",
-                status.session_name,
-                state_str(status.state)
-            );
-            use nojson::DisplayJson;
-            struct Payload<'a> {
-                session_name: &'a str,
-                state: &'static str,
-                content: &'a str,
-            }
-            impl DisplayJson for Payload<'_> {
-                fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
-                    f.object(|f| {
-                        f.member("session_name", self.session_name)?;
-                        f.member("state", self.state)?;
-                        f.member("content", self.content)
-                    })
-                }
-            }
-            nojson::Json(Payload {
-                session_name: &status.session_name,
-                state: state_str(status.state),
-                content: &status.content,
-            })
-            .to_string()
-        }
-        Err(e) => {
-            counters.tool_errors += 1;
-            let (code, message) = e.to_code_and_message();
-            eprintln!("[subagent_run] failed: {message}");
-            tool_error_json(code, &message)
-        }
-    }
-}
-
-fn state_str(state: crate::subagent::SubagentState) -> &'static str {
-    match state {
-        crate::subagent::SubagentState::Completed => "completed",
-        crate::subagent::SubagentState::AwaitingApproval => "awaiting_approval",
-        crate::subagent::SubagentState::Error => "error",
-        crate::subagent::SubagentState::Crashed => "crashed",
     }
 }
 
@@ -1456,14 +1373,11 @@ fn compaction_cutoff(
     Some(keep_start)
 }
 
-fn build_tool_defs(subagent_available: bool) -> Vec<ToolDef> {
+fn build_tool_defs() -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
     defs.push(PatchInvocation::definition());
     defs.push(CommandInvocation::definition());
     defs.push(SkillLoadInvocation::definition());
-    if subagent_available {
-        defs.push(SubagentRunInvocation::definition());
-    }
     defs
 }
 
@@ -1679,7 +1593,6 @@ enum ToolKind {
     Patch,
     Command,
     Skill,
-    SubagentRun,
     Unknown,
 }
 
@@ -1689,7 +1602,6 @@ fn classify(name: &str) -> ToolKind {
         "patch" => ToolKind::Patch,
         "command" => ToolKind::Command,
         "skill_load" => ToolKind::Skill,
-        "subagent_run" => ToolKind::SubagentRun,
         _ => ToolKind::Unknown,
     }
 }
@@ -2457,7 +2369,6 @@ mod tests {
             tool_call_rate: rate,
             session_tool_call_max: session_max,
             skill_name: None,
-            subagent_available: false,
             authorization: Authorization::PerTool,
         }
     }

@@ -484,60 +484,6 @@ const SKILL_LOAD_PARAMS_SCHEMA: &str = r#"{
 "required":["name"]
 }"#;
 
-/// Run a child `attini agent` synchronously in a separate session and
-/// block until it reaches a terminal state. Returns the child's
-/// session name, terminal state, and latest assistant content.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubagentRunInvocation {
-    pub prompt: String,
-    pub session_name: Option<String>,
-}
-
-impl SubagentRunInvocation {
-    pub fn definition() -> ToolDef {
-        ToolDef {
-            name: "subagent_run".to_string(),
-            description: "Run a child attini agent synchronously in a separate session and \
-                 block until it finishes. The child runs with its own session, permissions, \
-                 and metrics, isolated from the parent's conversation and state."
-                .to_string(),
-            parameters_json: SUBAGENT_RUN_PARAMS_SCHEMA.to_string(),
-        }
-    }
-
-    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
-        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
-        let root = json.value();
-        let prompt = required_string(root, "prompt")?;
-        if prompt.trim().is_empty() {
-            return Err(ToolExecutionError::ArgumentsParseFailed(
-                "subagent_run: prompt must not be empty".to_string(),
-            ));
-        }
-        let session_name = optional_string(root, "session_name")?;
-        if let Some(name) = &session_name
-            && name.trim().is_empty()
-        {
-            return Err(ToolExecutionError::ArgumentsParseFailed(
-                "subagent_run: session_name must not be empty".to_string(),
-            ));
-        }
-        Ok(Self {
-            prompt,
-            session_name,
-        })
-    }
-}
-
-const SUBAGENT_RUN_PARAMS_SCHEMA: &str = r#"{
-"type":"object",
-"properties":{
-"prompt":{"type":"string","description":"Initial user prompt for the child agent."},
-"session_name":{"type":"string","description":"Optional session name for the child. Omit to auto-generate a `subagent-<timestamp>-<hex>` name. An idle existing session is reused."}
-},
-"required":["prompt"]
-}"#;
-
 fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
     let value = root
         .to_member(name)

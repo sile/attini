@@ -362,7 +362,6 @@ struct ToolCallCounts {
     patch: u64,
     command: u64,
     skill_load: u64,
-    subagent_run: u64,
     unknown: u64,
 }
 
@@ -374,7 +373,6 @@ impl ToolCallCounts {
             + self.patch
             + self.command
             + self.skill_load
-            + self.subagent_run
             + self.unknown
     }
 }
@@ -529,10 +527,6 @@ fn absorb_metrics_line(
                 .tool_calls
                 .skill_load
                 .saturating_add(get("tool_calls.skill_load")?);
-            agg.tool_calls.subagent_run = agg
-                .tool_calls
-                .subagent_run
-                .saturating_add(get("tool_calls.subagent_run")?);
             agg.tool_calls.unknown = agg
                 .tool_calls
                 .unknown
@@ -614,15 +608,13 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
     println!("  turns: {}", mx.turns);
     println!("  tool_calls: {} total", mx.tool_calls.total());
     println!(
-        "    list={}  read={}  search={}  patch={}  command={}  skill_load={}  \
-         subagent_run={}  unknown={}",
+        "    list={}  read={}  search={}  patch={}  command={}  skill_load={}  unknown={}",
         mx.tool_calls.list,
         mx.tool_calls.read,
         mx.tool_calls.search,
         mx.tool_calls.patch,
         mx.tool_calls.command,
         mx.tool_calls.skill_load,
-        mx.tool_calls.subagent_run,
         mx.tool_calls.unknown,
     );
     println!("    errors={}", mx.tool_errors);
@@ -954,7 +946,6 @@ impl DisplayJson for ToolCallsByKindJson<'_> {
             f.member("patch", self.0.patch)?;
             f.member("command", self.0.command)?;
             f.member("skill_load", self.0.skill_load)?;
-            f.member("subagent_run", self.0.subagent_run)?;
             f.member("unknown", self.0.unknown)
         })
     }
@@ -1587,10 +1578,9 @@ mod tests {
             patch: 4,
             command: 5,
             skill_load: 6,
-            subagent_run: 7,
             unknown: 9,
         };
-        assert_eq!(counts.total(), 37);
+        assert_eq!(counts.total(), 30);
     }
 
     #[test]
