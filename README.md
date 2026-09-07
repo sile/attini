@@ -16,6 +16,38 @@ A DeepSeek-powered coding agent prototype.
 - Enforced constraints include workspace-boundary checks, file-size limits, and
   search-result limits
 
+## Design philosophy
+
+attini is a **semi-autonomous coding agent that values controllability and
+understandability over autonomy**. It is deliberately explicit and
+conservative: it prefers that the human tells it exactly what to do, rather
+than letting the agent infer or guess:
+
+- **Context is requested, not discovered.** The agent does not go looking for
+  context: files are loaded only when you name them (`--reference PATH`,
+  `--skill PATH`), and no tool lets the model pull in skill or memory content
+  at runtime. The only context injected without being named is the
+  `# Workspace context` block, a fixed, always-on part of every session's base
+  prompt that is documented and predictable rather than discovered on demand.
+- **State changes are surfaced.** `patch` shows a preview (SHA-256 hashes + a
+  diff summary) and waits for approval on any non-tracked write; the model's
+  in-flight intent is observable via `attini ask` / `session show`; and a
+  one-line status is printed to stderr so you always know which session/model
+  is advancing. Diagnostic output never pollutes stdout.
+- **No silent side effects.** The workspace boundary is enforced on every read
+  and write, destructive operations require explicit confirmation, and a
+  non-tracked file never silently overwrites a tracked one. Where a behaviour
+  is too risky to do safely, attini refuses rather than guesses — for example
+  rejecting multiple edits to the same path in one `patch`, or refusing to
+  write `.attini/*/memories.md`.
+- **Human-edited state, model-extended space.** Persistent context such as
+  memories is written by humans only. The model can work freely in its own
+  scratchpad, but every write there still passes through approval.
+
+This is why, for instance, skills take an explicit `--skill PATH` instead of
+being auto-discovered from `~/.attini/skills` or `.attini/skills` — context
+should enter a session only because the human asked for it.
+
 ## Requirements
 
 - Rust 1.93+ (`edition = 2024`)
