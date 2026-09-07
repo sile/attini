@@ -91,6 +91,8 @@ lives) plus failures, and on non-zero exit keeps the full output.
   (`cargo`, `git`, `grep`) without adding tools. The dead
   `COMMAND_MAX_STREAM_BYTES` constant (see `docs/bug/command-max-stream-bytes.md`)
   should also be wired in as a cap.
+  **A is now superseded** by a far cheaper alternative: a repository-level
+  `.cargo/config.toml` with `[term] quiet = true`. See "Alternative to A" below.
 * **B. Dedicated tools** (`run_tests`, `git_status`, ...) — structurally clearer
   but adds surface area, maintenance, and is Rust-specific. Only worth it if A
   proves insufficient.
@@ -98,13 +100,55 @@ lives) plus failures, and on non-zero exit keeps the full output.
   persist `reasoning` for `--show-reasoning` but strip it when the conversation
   is rebuilt for the API.
 
+## Alternative to A: `.cargo/config.toml` `[term] quiet = true`
+
+Reconsidering A against a config-only alternative produced a direct
+measurement. `[term] quiet = true` does **not** work via `[alias]` — cargo
+does not allow user aliases to shadow built-in commands (`[alias] test =
+"test -q"` is rejected with the warning "user-defined alias `test` is ignored,
+because it is shadowed by a built-in command"). But the `[term]` setting does
+work and is measured to behave exactly as desired:
+
+| cargo command | `[term] quiet = true` output |
+|---|---|
+| `cargo test` (pass) | per-test boilerplate dropped; only `test result: ok. N passed; 0 failed` | 
+| `cargo test` (fail) | panic message, `---- stdout ----`, `test result: FAILED` all preserved | 
+| `cargo build` (warnings) | `warning:` lines fully displayed | 
+| `cargo fmt --check` | `Diff in ...` fully displayed | 
+
+Concretely, a synthetic crate gave `cargo test` output of 339 bytes with
+quiet (vs. multi-KB without), and the failing case kept the full panic
+diagnostic. `cargo build` warnings and `cargo fmt --check` diffs are unaffected
+— quiet only suppresses the per-test/"running N tests" lines on `cargo test`
+stdout.
+
+**Why this matters:** the `cargo test` noise (1.4 MB, 69 calls) is the largest
+single tool-output contributor after `read`. A one-line config file removes
+that noise with no model-facing tool change, no risk of the model forgetting to
+opt in, and no `COMMAND_MAX_STREAM_BYTES` rewiring. It is effectively the best
+form of "A" for the dominant case.
+
+**Trade-offs to record:**
+* It applies globally to every cargo invocation in the repo, not just the
+  ones the model explicitly requests.
+* It does not cap absolute output size; a pathological cargo invocation could
+  still be huge. `COMMAND_MAX_STREAM_BYTES` remains the real cap and should
+  still be wired in if absolute bounds matter.
+* It cannot help non-cargo commands (`git`, `bash`, `grep`) — those still need
+  either A or dedicated tools if they turn out noisy.
+
 ## Decision
 
 * **C done** (`52a9ee6`): restored assistant records no longer re-send
   `reasoning_content` to the model unless the answer lives entirely in it.
   See "Option C implementation" below.
-* **A next**: add `--summary`-style trimming to `command` output handling and
-  wire in `COMMAND_MAX_STREAM_BYTES`. Removes the `cargo test` noise (1.4 MB).
+* **A** is **not** the recommended next step. The recommended next step is
+  simply to add `.cargo/config.toml` with `[term] quiet = true` to the repo
+  (one line, no tool change). This removes the `cargo test` noise that A was
+  designed for, with far less surface area. Keep A as a fallback if cargo-adjacent
+  commands or non-cargo commands later prove noisy. The dead
+  `COMMAND_MAX_STREAM_BYTES` wiring is independent and still valuable as a
+  hard bound.
 * **B**: not recommended unless A is insufficient.
 * **read re-read**: acknowledged, but a caching design is a larger separate
   effort; not part of this change.
@@ -137,5 +181,6 @@ A/B verification:
   API request body's assistant messages no longer carry `reasoning_content`.
 * Measure the new `ask`/`agent` request size against the same history to see
   the reduction.
-* After A, observe a fresh `cargo test` tool result to confirm it is reduced to
-  the tail + failure details.
+* After adding `.cargo/config.toml` with `[term] quiet = true`, observe a fresh
+  `cargo test` tool result to confirm the per-test boilerplate is gone and only
+  `test result: ...` (plus any panic details on failure) remains.
