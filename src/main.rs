@@ -103,16 +103,16 @@ fn append_stdin_aux(prompt: String, stdin_text: &str) -> String {
     format!("{prompt}\n\n--- stdin ---\n{stdin_text}\n--- end stdin ---")
 }
 
-/// Read the `--stdin` auxiliary prompt content. Errors when stdin is a
-/// terminal (it would block forever) or exceeds [`MAX_STDIN_BYTES`].
-/// Returns `None` (and warns) when input is empty.
+/// Read the `--stdin` auxiliary prompt content. Reads until EOF, so a
+/// terminal caller is told to finish with Ctrl+D (or Ctrl+C to cancel).
+/// Errors when input exceeds [`MAX_STDIN_BYTES`]. Returns `None` (and
+/// warns) when input is empty.
 fn read_stdin_auxiliary() -> Result<Option<String>, RunError> {
     if std::io::stdin().is_terminal() {
-        return Err(RunError::Runtime(
-            "--stdin was given but standard input is a terminal; pipe text into stdin \
-             (e.g. `... | attini agent \"...\" --stdin`)"
-                .to_string(),
-        ));
+        eprintln!(
+            "note: --stdin: reading from the terminal; type your text and press EOF (Ctrl+D) to \
+             send, or Ctrl+C to cancel"
+        );
     }
     let mut buf = Vec::new();
     std::io::stdin()
@@ -331,7 +331,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .short('I')
         .doc(
             "Read standard input and append it to the prompt as auxiliary content \
-             (not a file). Errors if stdin is a terminal; caps at 1 MiB.",
+             (not a file). Reads until EOF (from a terminal, press Ctrl+D); caps at 1 MiB.",
         )
         .take(args)
         .is_present();
