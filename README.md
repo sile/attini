@@ -82,32 +82,6 @@ export DEEPSEEK_API_KEY=sk-...
 # export DEEPSEEK_API_KEY=local
 ```
 
-### Interactive TUI
-
-```sh
-attini tui [--model NAME] [--transcript PATH] [--metrics-snapshot-interval SECONDS]
-```
-
-Starts the agent with the current directory as the workspace.
-
-`--transcript PATH` (optional) appends a JSON Lines session log to `PATH` for
-later inspection with `jq`. The file is opened in append mode; each session
-begins with a `session_start` record and ends with `session_end`. If the
-file cannot be opened `attini tui` exits with a non-zero status.
-
-`--metrics-snapshot-interval SECONDS` (optional, requires `--transcript`)
-appends a `metrics_snapshot` record every `SECONDS` seconds, containing every
-`AgentMetrics` counter as of that instant. Useful for tracking accumulator
-trends over long sessions with `jq 'select(.kind=="metrics_snapshot")'`.
-
-### One-shot chat
-
-```sh
-attini chat [--model NAME] [--system TEXT] [--show-reasoning] "<PROMPT>"
-```
-
-Streams the response to stdout. The tool loop is not run.
-
 ### Agent CLI (`attini agent`)
 
 ```sh
