@@ -307,15 +307,19 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .default(DEFAULT_SESSION_TOOL_CALL_MAX_STR)
         .take(args)
         .then(|o| o.value().parse())?;
-    let skill_name: Option<String> = noargs::opt("skill")
-        .ty("NAME")
+    let skill_path: Option<std::path::PathBuf> = noargs::opt("skill")
+        .short('S')
+        .ty("PATH")
         .doc(
-            "Load the named skill (directory under ~/.attini/skills or .attini/skills) \
-             and prepend its SKILL.md body as a system message before PROMPT. \
+            "Load a skill (a directory containing SKILL.md, or a SKILL.md file) \
+             and prepend its body as a system message before PROMPT. Relative \
+             paths resolve against the workspace root. There is no implicit \
+             skill discovery — the path must be given explicitly. \
              Cannot be combined with --approve or --reject.",
         )
         .take(args)
-        .present_and_then(|o| o.value().parse())?;
+        .present_and_then(|o| o.value().parse::<String>())?
+        .map(std::path::PathBuf::from);
     let max_tokens: Option<u64> = noargs::opt("max-tokens")
         .ty("N")
         .doc("Maximum completion tokens per model call; `none` uses the model default")
@@ -353,7 +357,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
             "--approve and --reject are mutually exclusive".to_string(),
         ));
     }
-    if skill_name.is_some() && (approve || reject) {
+    if skill_path.is_some() && (approve || reject) {
         return Err(RunError::Runtime(
             "--skill cannot be combined with --approve or --reject".to_string(),
         ));
@@ -420,7 +424,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         turn_tool_call_limit,
         tool_call_rate,
         session_tool_call_max,
-        skill_name,
+        skill_path,
         authorization,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {

@@ -70,7 +70,7 @@ Streams the response to stdout. The tool loop is not run.
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill NAME] [--read-path PATH ...] [--max-tokens N] [--stdin] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--stdin] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -92,6 +92,14 @@ be quoted or passed via `--stdin`.
 
 `--max-tokens N` caps the completion-token budget for every model call in the
 run. When omitted the model's own default is used.
+
+`--skill PATH` / `-S PATH` loads a skill: either a directory containing `SKILL.md`,
+or a `SKILL.md` file directly. Its body is prepended to the system prompt before
+the first turn. Relative paths resolve against the workspace root. There is **no
+implicit skill discovery** — attini never scans `~/.attini/skills` or
+`.attini/skills`, and the model has no `skill_load` tool. Context enters only
+because you asked for it, explicitly, at invocation start. `--skill` cannot be
+combined with `--approve` or `--reject`.
 
 The system prompt also includes a `# Workspace context` block that names the
 current directory (the workspace root), the enclosing git repository (when

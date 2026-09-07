@@ -434,56 +434,6 @@ const COMMAND_PARAMS_SCHEMA: &str = r#"{
 "required":["argv"]
 }"#;
 
-/// Request the shell to load a skill body by name and return its
-/// contents verbatim as the tool result. The set of installable
-/// skills is advertised at conversation start in an "Available
-/// skills" system message. The shell handles filesystem resolution;
-/// parsing / schema live here in sansio.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillLoadInvocation {
-    /// Directory name of the skill under a skill root.
-    pub name: String,
-}
-
-impl SkillLoadInvocation {
-    /// Wire definition advertised to the model alongside
-    /// [`ReadOnlyTool::definitions`], [`PatchInvocation::definition`],
-    /// and [`CommandInvocation::definition`].
-    pub fn definition() -> ToolDef {
-        ToolDef {
-            name: "skill_load".to_string(),
-            description: "Load a skill body and follow its instructions. \
-                 Skill names are listed in the 'Available skills' system \
-                 message. The full SKILL.md body is returned verbatim as \
-                 the tool result; if the skill needs arguments, the user \
-                 provides them in the same turn's message."
-                .to_string(),
-            parameters_json: SKILL_LOAD_PARAMS_SCHEMA.to_string(),
-        }
-    }
-
-    /// Parse the JSON `arguments` supplied by the model.
-    pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
-        let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
-        let root = json.value();
-        let name = required_string(root, "name")?;
-        if name.trim().is_empty() {
-            return Err(ToolExecutionError::ArgumentsParseFailed(
-                "skill_load: name must not be empty".to_string(),
-            ));
-        }
-        Ok(Self { name })
-    }
-}
-
-const SKILL_LOAD_PARAMS_SCHEMA: &str = r#"{
-"type":"object",
-"properties":{
-"name":{"type":"string","description":"Skill name (directory name under a skill root)."}
-},
-"required":["name"]
-}"#;
-
 fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, ToolExecutionError> {
     let value = root
         .to_member(name)

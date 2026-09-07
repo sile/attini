@@ -12,7 +12,7 @@ use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
-    SkillLoadInvocation, ToolExecutionError, ToolOutcome,
+    ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
@@ -20,7 +20,7 @@ use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
     Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
 };
-use crate::skills::{self, SkillEntry};
+use crate::skills;
 use crate::tools::ToolExecutor;
 
 pub const EXIT_OK: u8 = 0;
@@ -70,7 +70,6 @@ pub struct ToolCallsByKind {
     pub search: u64,
     pub patch: u64,
     pub command: u64,
-    pub skill_load: u64,
     pub unknown: u64,
 }
 
@@ -95,10 +94,6 @@ impl Counters {
             (
                 "tool_calls.command".to_string(),
                 self.tool_calls_by_kind.command,
-            ),
-            (
-                "tool_calls.skill_load".to_string(),
-                self.tool_calls_by_kind.skill_load,
             ),
             (
                 "tool_calls.unknown".to_string(),
@@ -197,11 +192,12 @@ pub struct AgentConfig {
     /// stops the loop with [`InvocationEndReason::SessionToolCallExhausted`].
     /// `None` disables the check.
     pub session_tool_call_max: Option<usize>,
-    /// Optional CLI-selected skill. When set, the resolved SKILL.md
-    /// body is prepended as a system message before the first turn.
-    /// Applies only to fresh invocations; combining with `--approve`
-    /// / `--reject` is rejected in `main.rs`.
-    pub skill_name: Option<String>,
+    /// Optional CLI-selected skill path. When set, the SKILL.md body
+    /// (either the file itself or SKILL.md inside the directory) is
+    /// prepended as a system message before the first turn. Applies
+    /// only to fresh invocations; combining with `--approve` /
+    /// `--reject` is rejected in `main.rs`.
+    pub skill_path: Option<PathBuf>,
     /// How side-effecting tool calls are authorized in this
     /// invocation. `plan run` supplies
     /// [`Authorization::ApprovedPlan`]; every other entry point uses
@@ -578,7 +574,6 @@ fn drive(
                 "search" => counters.tool_calls_by_kind.search += 1,
                 "patch" => counters.tool_calls_by_kind.patch += 1,
                 "command" => counters.tool_calls_by_kind.command += 1,
-                "skill_load" => counters.tool_calls_by_kind.skill_load += 1,
                 _ => counters.tool_calls_by_kind.unknown += 1,
             }
             match gate.admit(Instant::now()) {
@@ -669,14 +664,6 @@ fn drive(
                     )? {
                         parked.push(pending);
                         suspending = true;
-                    }
-                }
-                ToolKind::Skill => {
-                    if suspending {
-                        // Left unanswered; cancelled on resume.
-                    } else {
-                        let content = run_skill_load(tc, counters);
-                        append_tool(session, &mut messages, &tc.id, content)?;
                     }
                 }
                 ToolKind::Unknown => {
@@ -802,15 +789,11 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
         };
         messages.push(ChatMessage::System(format!("{header}{}", summary.text)));
     }
-    let discovered = skills::discover_all();
-    if !discovered.is_empty() {
-        messages.push(ChatMessage::System(render_available_skills(&discovered)));
-    }
     if let Some(sys) = &cfg.system_prompt {
         messages.push(ChatMessage::System(sys.clone()));
     }
-    if let Some(name) = &cfg.skill_name {
-        let body = load_cli_skill_body(name)?;
+    if let Some(path) = &cfg.skill_path {
+        let body = load_cli_skill_body(&cfg.workspace_root, path)?;
         messages.push(ChatMessage::System(body));
     }
     let references = resolve_references(&cfg.workspace_root, &cfg.reference_paths)?;
@@ -838,29 +821,6 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
         messages.push(record.message);
     }
     Ok(messages)
-}
-
-/// Format the discovery listing that goes into the system prompt so
-/// the model knows which skills are available. Missing descriptions
-/// fall back to `(no description)` silently; oversize / broken
-/// skills carry an explanatory marker so the user can spot them but
-/// the listing is not otherwise noisy.
-fn render_available_skills(entries: &[SkillEntry]) -> String {
-    let mut out = String::from("# Available skills\n\n");
-    for entry in entries {
-        let label = if entry.oversized {
-            "(too large; skill_load will fail)".to_string()
-        } else if entry.broken {
-            "(cannot read SKILL.md)".to_string()
-        } else {
-            entry
-                .description
-                .clone()
-                .unwrap_or_else(|| "(no description)".to_string())
-        };
-        out.push_str(&format!("- {} — {}\n", entry.name, label));
-    }
-    out
 }
 
 /// Tell the model it may keep working notes under the session's
@@ -948,57 +908,16 @@ fn render_workspace_context(root: &Path) -> String {
     out
 }
 
-/// Resolve and load a CLI-selected skill. Called at the start of a
-/// fresh `attini agent --skill NAME` invocation. Any failure
+/// Resolve and load a CLI-selected skill path. Called at the start of
+/// a fresh `attini agent --skill <PATH>` invocation. Any failure
 /// (missing / too large / bad UTF-8) is surfaced as a startup
 /// `io::Error` so the user sees the reason immediately, rather than
 /// the model getting a mysterious empty system message.
-fn load_cli_skill_body(name: &str) -> io::Result<String> {
-    let Some(dir) = skills::resolve_skill_dir(name) else {
-        return Err(io::Error::other(format!(
-            "--skill {name}: no SKILL.md found under any skill root"
-        )));
-    };
-    let skill_md = dir.join("SKILL.md");
-    skills::load_body(&skill_md).map_err(|e| {
+fn load_cli_skill_body(workspace_root: &Path, path: &Path) -> io::Result<String> {
+    skills::load_from_path(workspace_root, path).map_err(|e| {
         let (_, msg) = e.to_code_and_message();
-        io::Error::other(format!("--skill {name}: {msg}"))
+        io::Error::other(format!("--skill {}: {msg}", path.display()))
     })
-}
-
-/// Dispatch a `skill_load` tool call: parse, resolve, load, return
-/// the tool_result content (either the skill body verbatim or a
-/// `tool_error_json`). Increments `tool_errors` on failure.
-fn run_skill_load(tc: &ToolCall, counters: &mut Counters) -> String {
-    let inv = match SkillLoadInvocation::parse(&tc.arguments_json) {
-        Ok(inv) => inv,
-        Err(err) => {
-            counters.tool_errors += 1;
-            eprintln!("[skill_load] parse err: {err:?}");
-            return tool_error_json_from(&err);
-        }
-    };
-    let Some(dir) = skills::resolve_skill_dir(&inv.name) else {
-        counters.tool_errors += 1;
-        eprintln!("[skill_load] not found: {}", inv.name);
-        return tool_error_json(
-            "skill_not_found",
-            &format!("no SKILL.md found for skill {:?}", inv.name),
-        );
-    };
-    let skill_md = dir.join("SKILL.md");
-    match skills::load_body(&skill_md) {
-        Ok(body) => {
-            eprintln!("[skill_load] {}", inv.name);
-            body
-        }
-        Err(e) => {
-            counters.tool_errors += 1;
-            let (code, message) = e.to_code_and_message();
-            eprintln!("[skill_load] {}: {message}", inv.name);
-            tool_error_json(code, &message)
-        }
-    }
 }
 
 // -------------------------------------------------------------------
@@ -1479,7 +1398,6 @@ fn build_tool_defs() -> Vec<ToolDef> {
     let mut defs = ReadOnlyTool::definitions();
     defs.push(PatchInvocation::definition());
     defs.push(CommandInvocation::definition());
-    defs.push(SkillLoadInvocation::definition());
     defs
 }
 
@@ -1694,7 +1612,6 @@ enum ToolKind {
     ReadOnly,
     Patch,
     Command,
-    Skill,
     Unknown,
 }
 
@@ -1703,7 +1620,6 @@ fn classify(name: &str) -> ToolKind {
         "list" | "read" | "search" => ToolKind::ReadOnly,
         "patch" => ToolKind::Patch,
         "command" => ToolKind::Command,
-        "skill_load" => ToolKind::Skill,
         _ => ToolKind::Unknown,
     }
 }
@@ -2494,7 +2410,7 @@ mod tests {
             turn_tool_call_limit: turn_limit,
             tool_call_rate: rate,
             session_tool_call_max: session_max,
-            skill_name: None,
+            skill_path: None,
             authorization: Authorization::PerTool,
         }
     }

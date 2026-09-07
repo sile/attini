@@ -361,19 +361,12 @@ struct ToolCallCounts {
     search: u64,
     patch: u64,
     command: u64,
-    skill_load: u64,
     unknown: u64,
 }
 
 impl ToolCallCounts {
     fn total(&self) -> u64 {
-        self.list
-            + self.read
-            + self.search
-            + self.patch
-            + self.command
-            + self.skill_load
-            + self.unknown
+        self.list + self.read + self.search + self.patch + self.command + self.unknown
     }
 }
 
@@ -523,10 +516,6 @@ fn absorb_metrics_line(
                 .tool_calls
                 .command
                 .saturating_add(get("tool_calls.command")?);
-            agg.tool_calls.skill_load = agg
-                .tool_calls
-                .skill_load
-                .saturating_add(get("tool_calls.skill_load")?);
             agg.tool_calls.unknown = agg
                 .tool_calls
                 .unknown
@@ -608,13 +597,12 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
     println!("  turns: {}", mx.turns);
     println!("  tool_calls: {} total", mx.tool_calls.total());
     println!(
-        "    list={}  read={}  search={}  patch={}  command={}  skill_load={}  unknown={}",
+        "    list={}  read={}  search={}  patch={}  command={}  unknown={}",
         mx.tool_calls.list,
         mx.tool_calls.read,
         mx.tool_calls.search,
         mx.tool_calls.patch,
         mx.tool_calls.command,
-        mx.tool_calls.skill_load,
         mx.tool_calls.unknown,
     );
     println!("    errors={}", mx.tool_errors);
@@ -945,7 +933,6 @@ impl DisplayJson for ToolCallsByKindJson<'_> {
             f.member("search", self.0.search)?;
             f.member("patch", self.0.patch)?;
             f.member("command", self.0.command)?;
-            f.member("skill_load", self.0.skill_load)?;
             f.member("unknown", self.0.unknown)
         })
     }
@@ -1577,10 +1564,9 @@ mod tests {
             search: 3,
             patch: 4,
             command: 5,
-            skill_load: 6,
             unknown: 9,
         };
-        assert_eq!(counts.total(), 30);
+        assert_eq!(counts.total(), 24);
     }
 
     #[test]

@@ -1,35 +1,28 @@
-//! Filesystem-facing side of the skill system: enumerate available
-//! skills from `~/.attini/skills/{NAME}/SKILL.md` (global) and
-//! `.attini/skills/{NAME}/SKILL.md` (project), load a skill body with
-//! byte-cap enforcement, extract the `description:` line from the
-//! YAML-shaped frontmatter (attini only reads that one field), and
-//! substitute `$ARGUMENTS` in the body.
+//! Filesystem-facing side of the skill system: load a skill body
+//! (SKILL.md) from a user-supplied path with byte-cap enforcement and
+//! UTF-8 validation.
 //!
-//! The pure `SkillLoadInvocation` (tool schema + JSON parse) lives in
-//! `crate::sansio::agent` alongside the other tool definitions.
-//! `crate::agent_cli` glues the two sides together in the `drive`
-//! tool-call loop.
+//! Skills are selected explicitly via `attini agent --skill <PATH>`.
+//! There is no filesystem discovery, no "Available skills" listing, and
+//! no model-driven `skill_load` tool. Context enters only because the
+//! human asked for it, at invocation start — mirroring attini's
+//! explicit / controllable philosophy.
 //!
-//! Resolution order: project (`.attini/skills`) first, then global
-//! (`~/.attini/skills`). Project wins on same-name collision.
-//! `HOME` unset → global tier silently skipped (memories.rs falls
-//! back to `.` and double-reads the project file, but skills do not
-//! to keep listings clean).
+//! `crate::agent_cli` resolves `--skill <PATH>` (relative paths against
+//! the workspace root) and calls [`load_from_path`] at the start of a
+//! fresh invocation.
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
-
-use crate::session::session_root;
+use std::path::Path;
 
 pub const SKILL_MAX_BYTES: usize = 256 * 1024;
 
 const SKILL_FILENAME: &str = "SKILL.md";
-const SKILLS_SUBDIR: &str = "skills";
 
 #[derive(Debug)]
 pub enum SkillLoadError {
-    /// No SKILL.md found under any known root.
+    /// No SKILL.md at the given path (or the path does not exist).
     NotFound,
     /// SKILL.md size exceeds [`SKILL_MAX_BYTES`].
     TooLarge { bytes: u64 },
@@ -46,7 +39,7 @@ impl SkillLoadError {
         match self {
             Self::NotFound => (
                 "skill_not_found",
-                "no SKILL.md found under any skill root".to_string(),
+                "no SKILL.md found at the given path".to_string(),
             ),
             Self::TooLarge { bytes } => (
                 "skill_too_large",
@@ -68,116 +61,23 @@ impl std::fmt::Display for SkillLoadError {
     }
 }
 
-/// One entry in the discovery listing that gets prepended to the
-/// system prompt so the model knows which skills are available.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillEntry {
-    pub name: String,
-    /// Extracted from the frontmatter's `description:` line; `None`
-    /// if the field is missing, empty, or uses an unsupported YAML
-    /// form (block scalar).
-    pub description: Option<String>,
-    /// Absolute path of the skill directory (contains SKILL.md).
-    pub path: PathBuf,
-    /// `true` if SKILL.md size exceeds [`SKILL_MAX_BYTES`]; discovery
-    /// still lists it (with a warning marker) so users can spot the
-    /// bad skill, but `skill_load` will error out.
-    pub oversized: bool,
-    /// `true` if the SKILL.md size probe failed (missing / permission
-    /// error). Listed with a note so the user is aware.
-    pub broken: bool,
-}
-
-/// Roots consulted in order. First = global, last = project (project
-/// wins on collision because we insert-overwrite in `discover_all`).
-fn skill_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = crate::memories::home_dir() {
-        roots.push(home.join(".attini").join(SKILLS_SUBDIR));
-    }
-    roots.push(session_root().join(SKILLS_SUBDIR));
-    roots
-}
-
-/// Return the directory of the named skill, honoring project-over-
-/// global precedence. Used by both `skill_load` (fs I/O side) and
-/// discovery to guarantee they resolve the same file.
-pub fn resolve_skill_dir(name: &str) -> Option<PathBuf> {
-    resolve_skill_dir_in(&skill_roots(), name)
-}
-
-/// Explicit-roots variant of [`resolve_skill_dir`], useful for tests
-/// that need isolation from `HOME` and CWD. `roots` is interpreted
-/// low-precedence-first (the last entry wins on same-name collision,
-/// matching the default `[global, project]` order).
-pub fn resolve_skill_dir_in(roots: &[PathBuf], name: &str) -> Option<PathBuf> {
-    for root in roots.iter().rev() {
-        let candidate = root.join(name);
-        if candidate.join(SKILL_FILENAME).is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Enumerate every skill dir under any known root, deduped by name
-/// with project winning over global. Returns entries sorted by name.
-pub fn discover_all() -> Vec<SkillEntry> {
-    discover_all_in(&skill_roots())
-}
-
-/// Explicit-roots variant of [`discover_all`], useful for tests.
-/// `roots` is interpreted low-precedence-first: entries from later
-/// roots overwrite entries with the same name from earlier ones.
-pub fn discover_all_in(roots: &[PathBuf]) -> Vec<SkillEntry> {
-    use std::collections::BTreeMap;
-    let mut by_name: BTreeMap<String, SkillEntry> = BTreeMap::new();
-    for root in roots {
-        let read_dir = match fs::read_dir(root) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let skill_md = path.join(SKILL_FILENAME);
-            if !skill_md.is_file() {
-                continue;
-            }
-            let (description, oversized, broken) = probe_skill(&skill_md);
-            by_name.insert(
-                name.to_string(),
-                SkillEntry {
-                    name: name.to_string(),
-                    description,
-                    path: path.clone(),
-                    oversized,
-                    broken,
-                },
-            );
-        }
-    }
-    by_name.into_values().collect()
-}
-
-fn probe_skill(skill_md: &Path) -> (Option<String>, bool, bool) {
-    let metadata = match fs::metadata(skill_md) {
-        Ok(m) => m,
-        Err(_) => return (None, false, true),
+/// Resolve a `--skill <PATH>` value against `base_dir` (the workspace
+/// root) and load its SKILL.md.
+///
+/// If `path` is a directory, `SKILL.md` inside it is used; if `path`
+/// is a file, the file is used directly.
+pub fn load_from_path(base_dir: &Path, path: &Path) -> Result<String, SkillLoadError> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
     };
-    let size = metadata.len();
-    if size > SKILL_MAX_BYTES as u64 {
-        return (None, true, false);
-    }
-    match fs::read_to_string(skill_md) {
-        Ok(text) => (extract_description(&text), false, false),
-        Err(_) => (None, false, true),
-    }
+    let skill_md = if resolved.is_dir() {
+        resolved.join(SKILL_FILENAME)
+    } else {
+        resolved
+    };
+    load_body(&skill_md)
 }
 
 /// Load SKILL.md as UTF-8 text after verifying it fits within
@@ -199,158 +99,10 @@ pub fn load_body(skill_md: &Path) -> Result<String, SkillLoadError> {
     String::from_utf8(bytes).map_err(|_| SkillLoadError::NotUtf8)
 }
 
-/// Extract the `description:` value from the YAML-shaped frontmatter
-/// of a SKILL.md body. Only handles the flat single-line form; block
-/// scalars (`description: |` / `description: >`) resolve to `None`.
-///
-/// Rules: the first non-empty line must be exactly `---`; scan lines
-/// up to the closing `---` for the first `description:` prefix at
-/// column 0 (case-sensitive); trim the value, strip a matched outer
-/// quote pair, and return `None` on empty / block-scalar / missing.
-pub fn extract_description(text: &str) -> Option<String> {
-    // Step 2: identify the frontmatter block. The first non-empty
-    // line must be exactly "---" (no surrounding whitespace).
-    let mut lines = text.lines();
-    let first_non_empty = loop {
-        match lines.next() {
-            Some(line) if line.trim().is_empty() => continue,
-            Some(line) => break line,
-            None => return None,
-        }
-    };
-    if first_non_empty != "---" {
-        return None;
-    }
-    // Collect lines until the closing "---".
-    let mut frontmatter: Vec<&str> = Vec::new();
-    let mut closed = false;
-    for line in lines {
-        if line == "---" {
-            closed = true;
-            break;
-        }
-        frontmatter.push(line);
-    }
-    if !closed {
-        return None;
-    }
-    // Step 3: find the first line starting with `description:` at
-    // column 0, case-sensitive.
-    let raw_value = frontmatter
-        .iter()
-        .find_map(|line| line.strip_prefix("description:"))?;
-    // Step 4-6: trim whitespace, reject block scalars, strip an
-    // outermost matching quote pair.
-    let trimmed = raw_value.trim();
-    if trimmed.starts_with('|') || trimmed.starts_with('>') {
-        return None;
-    }
-    let unquoted = strip_matched_quotes(trimmed);
-    if unquoted.is_empty() {
-        None
-    } else {
-        Some(unquoted.to_string())
-    }
-}
-
-fn strip_matched_quotes(s: &str) -> &str {
-    for quote in ['"', '\''] {
-        if s.len() >= 2 && s.starts_with(quote) && s.ends_with(quote) {
-            return &s[1..s.len() - 1];
-        }
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------
-    // extract_description
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn extract_description_returns_value_from_flat_frontmatter() {
-        let text = "---\nname: foo\ndescription: hello world\n---\n\nbody\n";
-        assert_eq!(extract_description(text), Some("hello world".to_string()));
-    }
-
-    #[test]
-    fn extract_description_none_when_no_frontmatter() {
-        let text = "# Just body\n\ndescription: not here\n";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_tolerates_leading_blank_lines_before_frontmatter() {
-        let text = "\n\n---\ndescription: hi\n---\nbody";
-        assert_eq!(extract_description(text), Some("hi".to_string()));
-    }
-
-    #[test]
-    fn extract_description_none_when_frontmatter_unclosed() {
-        let text = "---\ndescription: hi\n(no closing marker)\nbody";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_none_for_empty_value() {
-        let text = "---\ndescription:\n---\nbody";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_strips_matched_double_quotes() {
-        let text = "---\ndescription: \"quoted value\"\n---\nbody";
-        assert_eq!(extract_description(text), Some("quoted value".to_string()));
-    }
-
-    #[test]
-    fn extract_description_strips_matched_single_quotes() {
-        let text = "---\ndescription: 'quoted value'\n---\nbody";
-        assert_eq!(extract_description(text), Some("quoted value".to_string()));
-    }
-
-    #[test]
-    fn extract_description_does_not_strip_mismatched_quotes() {
-        let text = "---\ndescription: \"mismatched'\n---\nbody";
-        assert_eq!(extract_description(text), Some("\"mismatched'".to_string()));
-    }
-
-    #[test]
-    fn extract_description_none_for_block_scalar_pipe() {
-        let text = "---\ndescription: |\n  multi\n  line\n---\nbody";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_none_for_block_scalar_gt() {
-        let text = "---\ndescription: >\n  folded\n---\nbody";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_ignores_capitalised_key() {
-        let text = "---\nDescription: nope\n---\nbody";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_ignores_indented_key() {
-        let text = "---\n  description: indented\n---\nbody";
-        assert_eq!(extract_description(text), None);
-    }
-
-    #[test]
-    fn extract_description_takes_first_of_multiple_occurrences() {
-        let text = "---\ndescription: first\ndescription: second\n---\nbody";
-        assert_eq!(extract_description(text), Some("first".to_string()));
-    }
-
-    // -----------------------------------------------------------------
-    // load_body
-    // -----------------------------------------------------------------
+    use std::path::PathBuf;
 
     fn tempdir(label: &str) -> PathBuf {
         let dir =
@@ -367,6 +119,44 @@ mod tests {
         fs::write(&path, "---\ndescription: hi\n---\nbody").expect("write");
         let body = load_body(&path).expect("load ok");
         assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn load_from_path_accepts_a_directory_containing_skill_md() {
+        let dir = tempdir("load_path_dir");
+        fs::write(dir.join("SKILL.md"), "body-dir").expect("write");
+        let parent = dir.parent().unwrap().to_path_buf();
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let body = load_from_path(&parent, Path::new(&name)).expect("load");
+        assert_eq!(body, "body-dir");
+    }
+
+    #[test]
+    fn load_from_path_accepts_a_skill_md_file_directly() {
+        let dir = tempdir("load_path_file");
+        let file = dir.join("custom.md");
+        fs::write(&file, "body-file").expect("write");
+        let body = load_from_path(&dir, Path::new("custom.md")).expect("load");
+        assert_eq!(body, "body-file");
+    }
+
+    #[test]
+    fn load_from_path_resolves_absolute_paths_without_base() {
+        let dir = tempdir("load_path_abs");
+        let file = dir.join("SKILL.md");
+        fs::write(&file, "body-abs").expect("write");
+        // Pass an absolute path; base is ignored.
+        let body = load_from_path(Path::new("/nonexistent-base"), &file).expect("load");
+        assert_eq!(body, "body-abs");
+    }
+
+    #[test]
+    fn load_from_path_missing_path_returns_not_found() {
+        let dir = tempdir("load_path_missing");
+        match load_from_path(&dir, Path::new("nope")) {
+            Err(SkillLoadError::NotFound) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -412,10 +202,6 @@ mod tests {
             other => panic!("expected NotUtf8, got {other:?}"),
         }
     }
-
-    // -----------------------------------------------------------------
-    // to_code_and_message
-    // -----------------------------------------------------------------
 
     #[test]
     fn to_code_and_message_maps_variants_to_stable_error_codes() {
