@@ -1336,9 +1336,19 @@ fn parse_conversation_line(line: &str) -> Result<Option<ChatMessage>, String> {
             let content = read_string(value, "content")?;
             let reasoning = read_optional_string(value, "reasoning")?;
             let tool_calls = read_tool_calls(value)?;
+            // Reasoning is the model's private CoT trace. It is persisted
+            // for observability but is not replayed into later invocations:
+            // re-sending it bloats every request and can anchor the model
+            // to stale thinking. The lone exception is a turn that carried
+            // its answer entirely in `reasoning` (blank content, no tool
+            // calls); promote that to content so the answer is not lost.
+            let (content, reasoning_content) = match (content, reasoning) {
+                (c, Some(r)) if c.is_empty() && tool_calls.is_empty() => (r, None),
+                (c, _) => (c, None),
+            };
             Ok(Some(ChatMessage::Assistant {
                 content,
-                reasoning_content: reasoning,
+                reasoning_content,
                 tool_calls,
             }))
         }
@@ -1781,11 +1791,41 @@ mod tests {
                 tool_calls,
             } => {
                 assert_eq!(content, "hi");
-                assert_eq!(reasoning_content.as_deref(), Some("because"));
+                // Reasoning is stripped on replay when content or tool_calls
+                // already carry the turn; it is not re-sent to the model.
+                assert_eq!(reasoning_content.as_deref(), None);
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].id, "call_1");
                 assert_eq!(tool_calls[0].function_name, "read");
                 assert_eq!(tool_calls[0].arguments_json, r#"{"path":"src/foo.rs"}"#);
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_reasoning_promoted_when_it_carries_the_answer() {
+        let record = SessionRecord::Assistant {
+            ts: 1,
+            // Some reasoning-capable models answer in `reasoning` while
+            // leaving `content` blank; the answer must not be lost.
+            content: String::new(),
+            reasoning: Some("the actual answer".to_string()),
+            tool_calls: vec![],
+        };
+        let line = nojson::Json(&record).to_string();
+        let parsed = parse_conversation_line(&line)
+            .expect("parse must succeed")
+            .expect("assistant record must yield a ChatMessage");
+        match parsed {
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                tool_calls,
+            } => {
+                assert_eq!(content, "the actual answer");
+                assert_eq!(reasoning_content.as_deref(), None);
+                assert!(tool_calls.is_empty());
             }
             other => panic!("expected assistant, got {other:?}"),
         }
