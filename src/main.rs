@@ -1,3 +1,4 @@
+use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS, RateLimit};
@@ -16,6 +17,11 @@ const MODEL_ENV: &str = "ATTINI_MODEL_NAME";
 /// Environment variable that supplies a default completion-token cap when
 /// `--max-tokens` is omitted.
 const MAX_TOKENS_ENV: &str = "ATTINI_MAX_TOKENS";
+
+/// Cap on how many bytes `--stdin` may contribute to the prompt. Larger
+/// inputs should go through `--reference PATH` instead, to avoid bloating
+/// the user message with an unbounded paste.
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 // String forms of the tool-call cap defaults, exposed here because
 // noargs' `default()` needs a `&'static str`. Kept in sync with the
@@ -88,6 +94,58 @@ fn session_from_pos_or_env(value: Option<String>) -> Result<String, RunError> {
     Err(RunError::Runtime(format!(
         "session name required (positional <SESSION> or env {SESSION_ENV})"
     )))
+}
+
+/// Append standard-input auxiliary content to the prompt, wrapped in an
+/// unambiguous marker block so the model can tell where the pasted data
+/// begins.
+fn append_stdin_aux(prompt: String, stdin_text: &str) -> String {
+    format!("{prompt}\n\n--- stdin ---\n{stdin_text}\n--- end stdin ---")
+}
+
+/// Read the `--stdin` auxiliary prompt content. Errors when stdin is a
+/// terminal (it would block forever) or exceeds [`MAX_STDIN_BYTES`].
+/// Returns `None` (and warns) when input is empty.
+fn read_stdin_auxiliary() -> Result<Option<String>, RunError> {
+    if std::io::stdin().is_terminal() {
+        return Err(RunError::Runtime(
+            "--stdin was given but standard input is a terminal; pipe text into stdin \
+             (e.g. `... | attini agent \"...\" --stdin`)"
+                .to_string(),
+        ));
+    }
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .map_err(|e| RunError::Runtime(format!("failed to read standard input: {e}")))?;
+    if buf.len() > MAX_STDIN_BYTES {
+        return Err(RunError::Runtime(format!(
+            "standard input exceeded {MAX_STDIN_BYTES} bytes; use --reference PATH or paste \
+             a smaller fragment"
+        )));
+    }
+    let s = String::from_utf8(buf)
+        .map_err(|e| RunError::Runtime(format!("standard input is not UTF-8: {e}")))?;
+    if s.is_empty() {
+        eprintln!("warning: --stdin produced empty input; continuing without it");
+        Ok(None)
+    } else {
+        Ok(Some(s))
+    }
+}
+
+/// Report an error if any raw argument was left unconsumed after parsing.
+/// This is the non-consuming equivalent of noargs' `finish()` leftover check,
+/// callable from handlers that receive `&mut RawArgs` (where `finish()`, which
+/// takes ownership, cannot be called).
+fn check_unconsumed_args(args: &noargs::RawArgs) -> Result<(), RunError> {
+    if let Some((_, raw)) = args.remaining_args().next() {
+        return Err(RunError::Usage(noargs::Error::other(
+            args,
+            format!("unexpected argument '{raw}' found"),
+        )));
+    }
+    Ok(())
 }
 
 fn run() -> Result<RunOutcome, RunError> {
@@ -265,6 +323,15 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
 
+    let use_stdin = noargs::flag("stdin")
+        .short('I')
+        .doc(
+            "Read standard input and append it to the prompt as auxiliary content \
+             (not a file). Errors if stdin is a terminal; caps at 1 MiB.",
+        )
+        .take(args)
+        .is_present();
+
     let prompt: Option<String> = noargs::arg("[PROMPT]")
         .doc("User prompt (required unless --approve or --reject is given)")
         .example("List the files in src/")
@@ -274,6 +341,9 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
+    // Validate that no unexpected arguments remain before running the agent.
+    // Without this, `attini agent hello world` silently dropped `world`.
+    check_unconsumed_args(args)?;
 
     let tool_call_rate = parse_tool_call_rate(&tool_call_rate_raw)?;
     let session_tool_call_max = parse_session_tool_call_max(&session_tool_call_max_raw)?;
@@ -286,6 +356,11 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     if skill_name.is_some() && (approve || reject) {
         return Err(RunError::Runtime(
             "--skill cannot be combined with --approve or --reject".to_string(),
+        ));
+    }
+    if use_stdin && (approve || reject) {
+        return Err(RunError::Runtime(
+            "--stdin cannot be combined with --approve or --reject".to_string(),
         ));
     }
     let cont = if approve {
@@ -303,14 +378,23 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         }
         Continuation::Reject
     } else {
-        match prompt {
-            Some(p) => Continuation::Prompt(p),
+        let p = match prompt {
+            Some(p) => p,
             None => {
                 return Err(RunError::Runtime(
                     "PROMPT is required unless --approve or --reject is given".to_string(),
                 ));
             }
-        }
+        };
+        let p = if use_stdin {
+            match read_stdin_auxiliary()? {
+                Some(text) => append_stdin_aux(p, &text),
+                None => p,
+            }
+        } else {
+            p
+        };
+        Continuation::Prompt(p)
     };
 
     let mode = if local_only {
@@ -394,6 +478,8 @@ fn try_run_ask(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
+    // Validate that no unexpected arguments remain (e.g. a stray trailing token).
+    check_unconsumed_args(args)?;
     session_cmd::run_ask(
         &session_name,
         question.as_deref(),
@@ -936,5 +1022,37 @@ mod tests {
     #[test]
     fn session_tool_call_max_non_integer_errors() {
         assert!(parse_session_tool_call_max("abc").is_err());
+    }
+
+    #[test]
+    fn unconsumed_args_catch_extra_positions() {
+        // `attini agent hello world` used to silently drop `world`; the
+        // leftover check must now reject it as a usage error.
+        let mut args = noargs::RawArgs::new(
+            ["attini", "agent", "hello", "world"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        noargs::cmd("agent").take(&mut args);
+        noargs::arg("[PROMPT]").take(&mut args);
+        assert!(check_unconsumed_args(&args).is_err());
+    }
+
+    #[test]
+    fn unconsumed_args_ok_when_all_consumed() {
+        let mut args =
+            noargs::RawArgs::new(["attini", "agent", "hello"].iter().map(|s| s.to_string()));
+        noargs::cmd("agent").take(&mut args);
+        noargs::arg("[PROMPT]").take(&mut args);
+        assert!(check_unconsumed_args(&args).is_ok());
+    }
+
+    #[test]
+    fn append_stdin_aux_wraps_content() {
+        let out = append_stdin_aux("summarise".to_string(), "the quick brown fox");
+        assert_eq!(
+            out,
+            "summarise\n\n--- stdin ---\nthe quick brown fox\n--- end stdin ---"
+        );
     }
 }

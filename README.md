@@ -70,7 +70,7 @@ Streams the response to stdout. The tool loop is not run.
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill NAME] [--read-path PATH ...] [--max-tokens N] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill NAME] [--read-path PATH ...] [--max-tokens N] [--stdin] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -78,6 +78,17 @@ UTF-8 file into the system prompt before the first turn, so context is present
 without a `read` round-trip. Relative paths resolve against the workspace root.
 Files larger than 32 KiB are not inlined; instead they are granted as extra read
 roots and referenced by absolute path (readable with the `read` tool).
+
+`--stdin` reads standard input (until EOF) and appends it to the prompt as a
+clearly marked `--- stdin ---` block, so small pasted fragments need no temp
+file. It errors when stdin is a terminal (it would block), caps input at 1 MiB,
+and warns when stdin is empty. It is meant for *data*, not background context —
+use `--reference PATH` for that. `--stdin` cannot be combined with `--approve`
+or `--reject`.
+
+Extra positional tokens are now rejected as a usage error (`attini agent hello
+world` fails instead of silently dropping `world`), so multi-word prompts must
+be quoted or passed via `--stdin`.
 
 `--max-tokens N` caps the completion-token budget for every model call in the
 run. When omitted the model's own default is used.
