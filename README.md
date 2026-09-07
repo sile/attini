@@ -35,9 +35,7 @@ than letting the agent infer or guess:
 - **Context is requested, not discovered.** The agent does not go looking for
   context: files are loaded only when you name them (`--reference PATH`,
   `--skill PATH`), and no tool lets the model pull in skill or memory content
-  at runtime. The only context injected without being named is the
-  `# Workspace context` block, a fixed, always-on part of every session's base
-  prompt that is documented and predictable rather than discovered on demand.
+  at runtime. Nothing is added to the system prompt unless you named it.
 - **State changes are surfaced.** `patch` shows a preview (SHA-256 hashes + a
   diff summary) and waits for approval on any non-tracked write; the model's
   in-flight intent is observable via `attini ask` / `session show`; and a
@@ -115,11 +113,6 @@ implicit skill discovery** — attini never scans `~/.attini/skills` or
 `.attini/skills`, and the model has no `skill_load` tool. Context enters only
 because you asked for it, explicitly, at invocation start. `--skill` cannot be
 combined with `--approve` or `--reject`.
-
-The system prompt also includes a `# Workspace context` block that names the
-current directory (the workspace root), the enclosing git repository (when
-present), the current branch, and whether the root is a linked git worktree — so
-the model is aware of which repo/branch it is editing even before the first turn.
 
 When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
