@@ -1,7 +1,14 @@
 attini
 ======
 
-A DeepSeek-powered coding agent prototype.
+A CLI coding agent that aims to be as autonomous as it can be, without ever
+leaving your control.
+
+attini lives in your workspace and works on its own: it lists and reads files,
+searches the codebase, applies patches, and runs commands. Safe, reversible
+changes are applied without a prompt; anything consequential — a new file, a
+change outside git, a command that isn't explicitly allowed — is shown as a
+preview and waits for your approval.
 
 > This README is a work-in-progress draft. Keep it in sync with the implementation.
 
@@ -12,7 +19,9 @@ A DeepSeek-powered coding agent prototype.
   core without performing I/O, while async transport, TUI, and filesystem
   integration live in surrounding modules
 - The agent can use read-only tools (`list`, `read`, `search`) and a `patch` tool
-  (add / update) that requires a preview and approval before applying changes
+  (add / update); reversible changes to tracked files are applied directly, while
+  consequential writes (new files, non-tracked changes) require a preview and
+  approval
 - Enforced constraints include workspace-boundary checks, file-size limits, and
   search-result limits
 
