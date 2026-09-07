@@ -1,7 +1,8 @@
 # Conversation-log bloat: investigation report
 
-**Status:** Investigation record; part of the findings are being fixed now
-(option C, below). Other parts are deferred or rejected.
+**Status:** Investigation record. Option C is implemented and verified
+(commit `52a9ee6`). Options A and B are still open; the `read` re-read bloat
+is acknowledged but not part of this change.
 
 ## What this is
 
@@ -99,13 +100,36 @@ lives) plus failures, and on non-zero exit keeps the full output.
 
 ## Decision
 
-* **C first**: drop `reasoning_content` from the request body (keep it for
-  display). Removes 4.29 MB immediately. This is being implemented now.
+* **C done** (`52a9ee6`): restored assistant records no longer re-send
+  `reasoning_content` to the model unless the answer lives entirely in it.
+  See "Option C implementation" below.
 * **A next**: add `--summary`-style trimming to `command` output handling and
   wire in `COMMAND_MAX_STREAM_BYTES`. Removes the `cargo test` noise (1.4 MB).
 * **B**: not recommended unless A is insufficient.
 * **read re-read**: acknowledged, but a caching design is a larger separate
   effort; not part of this change.
+
+## Option C implementation
+
+`parse_conversation_line` (`src/session.rs`) still restores `reasoning` into
+the record (so `--show-reasoning` and log inspection keep working), but it no
+longer puts it back into the rebuilt `ChatMessage` unless the assistant turn
+has *empty* `content` **and** *empty* `tool_calls` — the rare DeepSeek-reasoning
+case where the answer itself lives in `reasoning`. Those turns promote
+`reasoning` into `content` so the answer is not lost. All other turns set
+`reasoning_content` to `None`.
+
+Rationale for conditional (not unconditional) removal: unconditionally dropping
+`reasoning` would delete the actual answer for the empty-content/empty-tool_calls
+case, so the conversation would lose the model's response.
+
+A/B verification:
+
+* `ask` (already-stripped path) summarised the same history correctly.
+* A disposable two-turn session (`ab_strip`) was started with `FIRST_OK`, one
+  `reasoning` record saved, then resumed; it answered `SECOND_OK` with
+  `ctx=1338` and no re-sent reasoning, confirming continuation does not depend
+  on re-sent `reasoning`.
 
 ## How to revive / verify
 
