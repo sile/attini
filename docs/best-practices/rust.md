@@ -55,6 +55,20 @@ cargo refuses user-defined aliases that shadow a built-in command
   stream, `quiet` will not help — see `docs/bug/command-max-stream-bytes.md` for
   the unrelated, still-unimplemented output cap.
 
+### Runtime override
+
+`[term] quiet = true` is a config-file **default**, not a hard setting. You can
+opt back in to full output for a single command without editing the file:
+
+```sh
+cargo test -v                 # verbose, per-invocation
+CARGO_TERM_QUIET=false cargo test   # env var overrides the config
+```
+
+The environment variable takes precedence over `.cargo/config.toml`, so
+`CARGO_TERM_QUIET=false` reliably restores normal output. Use `-v` for that
+one command, or the env var when you want a deterministic, explicit override.
+
 ### Why this exists
 
 This repository was set up after measuring a 12.6 MB / 8.4k-line conversation
