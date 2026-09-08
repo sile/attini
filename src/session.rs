@@ -35,6 +35,10 @@ pub struct Session {
     conversation_path: PathBuf,
     pending_path: PathBuf,
     writer: File,
+    /// Whether plan mode is on for this session: when `true`, every
+    /// patch (including git-tracked edits) requires explicit human
+    /// approval. Persisted in `.attini/{NAME}/plan_mode`.
+    pub plan_mode: bool,
 }
 
 impl Session {
@@ -56,6 +60,7 @@ impl Session {
             .create(true)
             .append(true)
             .open(&paths.conversation)?;
+        let plan_mode = load_plan_mode(&paths.dir)?;
         Ok(Self {
             dir: paths.dir,
             lock_path: paths.lock,
@@ -63,6 +68,7 @@ impl Session {
             conversation_path: paths.conversation,
             pending_path: paths.pending,
             writer,
+            plan_mode,
         })
     }
 
@@ -226,6 +232,15 @@ impl Session {
             Err(e) => Err(e),
         }
     }
+
+    /// Set the session's plan-mode flag and persist it. `on=true`
+    /// enables plan mode (every patch requires approval); `on=false`
+    /// restores normal mode. Called when `--plan=on|off` is supplied;
+    /// when the flag is omitted the persisted value is left unchanged.
+    pub fn set_plan_mode(&mut self, on: bool) -> io::Result<()> {
+        self.plan_mode = on;
+        save_plan_mode(&self.dir, on)
+    }
 }
 
 impl Drop for Session {
@@ -301,6 +316,9 @@ pub struct SessionPaths {
     /// Not part of the conversation; consumed only by the read-only
     /// `ask` command to give follow-up questions prior context.
     pub ask: PathBuf,
+    /// Persisted plan-mode flag (`.attini/{NAME}/plan_mode`). `1` means
+    /// plan mode is on (every patch requires approval); `0` means normal.
+    pub plan_mode: PathBuf,
 }
 
 /// Root directory (`.attini/`) that holds every session in the CWD.
@@ -330,8 +348,35 @@ pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
         lock: dir.join("LOCK"),
         scratchpad: dir.join("scratchpad"),
         ask: dir.join("ask.json"),
+        plan_mode: dir.join(PLAN_MODE_FILE),
         dir,
     })
+}
+
+/// Filename holding the persisted plan-mode flag (contents `1` or `0`).
+const PLAN_MODE_FILE: &str = "plan_mode";
+
+/// Read a session's persisted plan-mode flag. Missing file, or an
+/// unreadable / invalid value, defaults to `false` (normal mode).
+/// Used by [`Session::open`] and by the read-only `session show`
+/// command, which must not take the LOCK.
+pub fn load_plan_mode(dir: &Path) -> io::Result<bool> {
+    let text = match fs::read_to_string(dir.join(PLAN_MODE_FILE)) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(text.trim() == "1")
+}
+
+/// Persist a session's plan-mode flag. Writes `1` (on) or `0` (off)
+/// to `plan_mode` atomically (tmp + rename) so a crash cannot leave
+/// a partial file.
+pub fn save_plan_mode(dir: &Path, on: bool) -> io::Result<()> {
+    let path = dir.join(PLAN_MODE_FILE);
+    let tmp = dir.join(format!("{PLAN_MODE_FILE}.tmp"));
+    fs::write(&tmp, if on { "1" } else { "0" })?;
+    fs::rename(&tmp, &path)
 }
 
 // -------------------------------------------------------------------
@@ -1974,6 +2019,34 @@ mod tests {
             LineKind::Summary { cutoff_ts } => assert_eq!(cutoff_ts, 450),
             other => panic!("expected summary, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_mode_roundtrips_through_file() {
+        let dir = std::env::temp_dir().join(format!("attini-plan-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Missing file defaults to off.
+        assert!(!load_plan_mode(&dir).unwrap());
+
+        save_plan_mode(&dir, true).unwrap();
+        assert!(load_plan_mode(&dir).unwrap());
+
+        save_plan_mode(&dir, false).unwrap();
+        assert!(!load_plan_mode(&dir).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_mode_tolerates_bad_file_content() {
+        let dir = std::env::temp_dir().join(format!("attini-plan-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(PLAN_MODE_FILE), "not-1").unwrap();
+        assert!(!load_plan_mode(&dir).unwrap());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     impl std::fmt::Debug for LineKind {

@@ -83,7 +83,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--stdin] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--plan=on|off] [--stdin] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -114,6 +114,14 @@ implicit skill discovery** — attini never scans `~/.attini/skills` or
 because you asked for it, explicitly, at invocation start. `--skill` cannot be
 combined with `--approve` or `--reject`.
 
+`--plan=on` / `--plan=off` turns plan mode on or off **persistently** for the
+session. In plan mode every patch — including edits on git-tracked files, which
+would otherwise be auto-applied — requires explicit human approval before it
+touches the workspace. Commands are unchanged (deny rules still hard-reject),
+and `--approve` / `--reject` still work. The flag persists in
+`.attini/<SESSION>/plan_mode` and is reflected in `attini session show`; omitting
+it leaves the session's current plan-mode state unchanged.
+
 When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
@@ -121,11 +129,11 @@ stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 [agent] model=deepseek-v4-flash session=main ctx=20736
 ```
 
-`model=`/`session=` show which session/model is about to advance, and `ctx=` is
+`model=`/`session=` show which session/model is about to advance, `ctx=` is
 the **current** conversation size (the last recorded `prompt_tokens`, not the
-cumulative billed total) — so you can see how close the session is to compaction
-before it runs. `ATTINI_STATUS_LINE=0` disables the
-line.
+cumulative billed total), and `plan=on` appears when plan mode is active — so
+you can see how close the session is to compaction before it runs.
+`ATTINI_STATUS_LINE=0` disables the line.
 
 ### Model selection
 

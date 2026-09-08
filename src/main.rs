@@ -327,6 +327,25 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
 
+    let plan_override: Option<bool> = noargs::opt("plan")
+        .ty("on|off")
+        .doc(
+            "Enable/disable plan mode for this session. Plan mode makes every patch — \
+             including edits on git-tracked files — require explicit human approval; it \
+             persists across invocations. Omit to leave the session's current plan-mode \
+             state unchanged.",
+        )
+        .take(args)
+        .present_and_then(|o| o.value().parse::<String>())?
+        .map(|s| match s.as_str() {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            other => Err(RunError::Runtime(format!(
+                "--plan must be 'on' or 'off', got '{other}'"
+            ))),
+        })
+        .transpose()?;
+
     let use_stdin = noargs::flag("stdin")
         .short('I')
         .doc(
@@ -426,6 +445,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         session_tool_call_max,
         skill_path,
         authorization,
+        plan_override,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
         agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
