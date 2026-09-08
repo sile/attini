@@ -554,7 +554,7 @@ pub enum PatchError {
     OutsideWorkspace { path: String },
     /// Layer 1 hardcoded reject: the target is a runtime-critical file
     /// (`.git/**`, `.attini/*/{LOCK,conversation.jsonl,...}`,
-    /// `.attini/{permissions.json,memories.md}`) regardless of git
+    /// `.attini/permissions.json`) regardless of git
     /// tracking status. `reason` is a short human-readable classifier
     /// (`"git metadata"`, `"session runtime state"`, etc.) embedded in
     /// the message; it is not exposed as a separate JSON field.

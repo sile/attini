@@ -787,9 +787,6 @@ fn resolve_references(
 
 fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
-    if let Some(mem) = crate::memories::load(&cfg.session_name)? {
-        messages.push(ChatMessage::System(mem));
-    }
     let summaries = session.load_summaries()?;
     let total = summaries.len();
     for (i, summary) in summaries.into_iter().enumerate() {

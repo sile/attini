@@ -473,20 +473,18 @@ fn layer1_rejects_other_session_runtime_state() {
 }
 
 #[test]
-fn layer1_rejects_workspace_permissions_and_memories() {
+fn layer1_rejects_workspace_permissions() {
     let root = TempRoot::new("layer1-workspace-scoped");
     root.write(".attini/permissions.json", b"{\"command_prefixes\":[]}");
-    root.write(".attini/memories.md", b"# global\n");
     let executor = exec_with_git(&root, &[]);
-    for path in [".attini/permissions.json", ".attini/memories.md"] {
-        let err = executor
-            .preview_patch(&inv(vec![update(path, "# global\n", "hijack")]))
-            .expect_err(path);
-        assert!(
-            matches!(err, PatchError::ExcludedPath { .. }),
-            "path {path}: {err:?}"
-        );
-    }
+    let err = executor
+        .preview_patch(&inv(vec![update(
+            ".attini/permissions.json",
+            "{\"command_prefixes\":[]}",
+            "hijack",
+        )]))
+        .expect_err(".attini/permissions.json");
+    assert!(matches!(err, PatchError::ExcludedPath { .. }), "{err:?}");
 }
 
 #[test]

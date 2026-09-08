@@ -9,7 +9,6 @@
 pub mod agent_cli;
 pub mod child_output;
 pub mod curl;
-pub mod memories;
 pub mod metrics;
 pub mod permissions;
 pub mod sansio;

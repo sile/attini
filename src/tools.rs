@@ -675,7 +675,6 @@ fn layer1_reject_reason(rel: &Path) -> Option<&'static str> {
             if comps.len() == 2 {
                 match name1 {
                     "permissions.json" => Some("workspace permissions"),
-                    "memories.md" => Some("workspace memories"),
                     _ => None,
                 }
             } else if comps.len() == 3 {
@@ -684,7 +683,6 @@ fn layer1_reject_reason(rel: &Path) -> Option<&'static str> {
                     "conversation.jsonl" => Some("session runtime state"),
                     "pending.json" => Some("session runtime state"),
                     "permissions.json" => Some("session permissions"),
-                    "memories.md" => Some("session memories"),
                     _ => None,
                 }
             } else {

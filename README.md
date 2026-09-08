@@ -34,8 +34,8 @@ than letting the agent infer or guess:
 
 - **Context is requested, not discovered.** The agent does not go looking for
   context: files are loaded only when you name them (`--reference PATH`,
-  `--skill PATH`), and no tool lets the model pull in skill or memory content
-  at runtime. Nothing is added to the system prompt unless you named it.
+  `--skill PATH`), and no tool lets the model pull in skill content at runtime.
+  Nothing is added to the system prompt unless you named it.
 - **State changes are surfaced.** `patch` shows a preview (SHA-256 hashes + a
   diff summary) and waits for approval on any non-tracked write; the model's
   in-flight intent is observable via `attini ask` / `session show`; and a
@@ -45,10 +45,8 @@ than letting the agent infer or guess:
   and write, destructive operations require explicit confirmation, and a
   non-tracked file never silently overwrites a tracked one. Where a behaviour
   is too risky to do safely, attini refuses rather than guesses — for example
-  rejecting multiple edits to the same path in one `patch`, or refusing to
-  write `.attini/*/memories.md`.
-- **Human-edited state, model-extended space.** Persistent context such as
-  memories is written by humans only. The model can work freely in its own
+  rejecting multiple edits to the same path in one `patch`.
+- **The model's own space is gated too.** The model can work freely in its own
   scratchpad, but every write there still passes through approval.
 
 This is why, for instance, skills take an explicit `--skill PATH` instead of
@@ -183,29 +181,6 @@ reset: ...)` note is printed).
 attini ask -s main
 attini ask -s main "What is the model currently working on?"
 ```
-
-## Memories
-
-`attini agent` prepends persistent memory from up to three tiers to every
-invocation's system prompt:
-
-| Tier | Path | Scope |
-| --- | --- | --- |
-| Global | `~/.attini/memories.md` | All sessions, all workspaces |
-| Project | `.attini/memories.md` | All sessions in this workspace |
-| Session | `.attini/{NAME}/memories.md` | One session |
-
-Memories are **human-edited**. The model can read them (they are injected as
-context) but has no tool to write them, and `patch` refuses `.attini/*/memories.md`
-for safety. Create a file at any of the paths above by hand; the parent directory
-is created automatically. On every `attini agent` invocation, all existing tiers
-are read and concatenated into a single system message that is prepended before
-any `--system` prompt or skill body. Missing files are silently skipped and empty
-files are ignored.
-
-**Timing:** memories are loaded **once at invocation start**, before the first
-turn. Editing a memory file while a session is running has no effect on that
-session — it is picked up on the next `attini agent` call.
 
 ## Environment variables
 
