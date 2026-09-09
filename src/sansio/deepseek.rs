@@ -246,7 +246,7 @@ impl DisplayJson for RawJsonSlice<'_> {
 /// is the only mode the prototype uses. `tools` is omitted from the
 /// wire body when empty so requests without tool support look
 /// identical to a plain messages-only request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -260,6 +260,13 @@ pub struct ChatRequest {
     /// `None` omits both so the upstream model applies its own default
     /// (thinking enabled at high effort).
     pub thinking_effort: Option<ThinkingEffort>,
+    /// Sampling temperature. `Some(t)` sends `"temperature": t`;
+    /// `None` omits the field so the upstream model applies its own
+    /// default. The constructor defaults to `Some(0.0)` to make
+    /// code-editing responses deterministic; DeepSeek recommends 0
+    /// for coding/math. Note sampling parameters are ignored while
+    /// thinking mode is enabled.
+    pub temperature: Option<f64>,
 }
 
 impl ChatRequest {
@@ -270,6 +277,7 @@ impl ChatRequest {
             tools: Vec::new(),
             max_tokens: None,
             thinking_effort: None,
+            temperature: Some(0.0),
         }
     }
 
@@ -288,6 +296,13 @@ impl ChatRequest {
     /// level to request chain-of-thought at that depth.
     pub fn with_thinking_effort(mut self, effort: ThinkingEffort) -> Self {
         self.thinking_effort = Some(effort);
+        self
+    }
+
+    /// Set the sampling temperature for this request. `Some(t)`
+    /// sends `"temperature": t`; `None` omits the field entirely.
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
         self
     }
 
@@ -316,6 +331,9 @@ impl DisplayJson for ChatRequest {
                         f.member("reasoning_effort", effort.as_str())?;
                     }
                 }
+            }
+            if let Some(temperature) = self.temperature {
+                f.member("temperature", temperature)?;
             }
             if !self.tools.is_empty() {
                 f.member("tools", &self.tools)?;
@@ -536,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             request.to_json_string(),
-            r#"{"model":"deepseek-v4-flash","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true}}"#
+            r#"{"model":"deepseek-v4-flash","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true},"temperature":0}"#
         );
     }
 
@@ -548,6 +566,29 @@ mod tests {
         );
         let json = request.to_json_string();
         assert!(json.contains(r#""content":"line1\nline2\t\"quoted\"""#));
+    }
+
+    #[test]
+    fn chat_request_defaults_to_temperature_zero() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())]);
+        let json = request.to_json_string();
+        assert!(json.contains(r#""temperature":0"#), "unexpected: {json}");
+    }
+
+    #[test]
+    fn chat_request_serialises_temperature_when_overridden() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())])
+            .with_temperature(Some(1.0));
+        let json = request.to_json_string();
+        assert!(json.contains(r#""temperature":1"#), "unexpected: {json}");
+    }
+
+    #[test]
+    fn chat_request_omits_temperature_when_none() {
+        let request =
+            ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())]).with_temperature(None);
+        let json = request.to_json_string();
+        assert!(!json.contains("temperature"), "unexpected: {json}");
     }
 
     #[test]

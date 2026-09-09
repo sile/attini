@@ -1,8 +1,8 @@
 # DeepSeek API design/implementation considerations
 
-**Status:** Deferred. Record of the API review (2025) against the current
-implementation, with candidate improvements ordered by value. No code change
-yet.
+**Status:** Partially implemented. Option 1 (`--thinking-effort`, default
+`none`) and Option 3 (`temperature: 0`, CLI `--temperature/-t` /
+`ATTINI_TEMPERATURE`) are done. Options 2, 4, 5, 6 remain deferred.
 
 ## How this was produced
 
@@ -52,12 +52,13 @@ a request carries `tools`, `reasoning_content` must be passed back or the API
 returns 400. Commit `52a9ee6` strips it. No 400 has been observed in practice;
 kept as a watch item.
 
-### 3. `temperature` for determinism
+### 3. `temperature` for determinism — **DONE**
 
-DeepSeek recommends `temperature: 0` for coding/math. attini does not send it.
-**Only relevant when thinking is `disabled`** — docs state sampling parameters
-(`temperature`, `top_p`, etc.) are ignored in thinking mode. Candidate: add
-a `temperature` option (default 0) effective when thinking is off.
+DeepSeek recommends `temperature: 0` for coding/math. `ChatRequest` now defaults
+to `temperature: 0` and accepts `--temperature N` / `-t N` / `ATTINI_TEMPERATURE`.
+The value is sent only when thinking is `disabled` (sampling parameters are
+ignored in thinking mode). Note nojson renders float `0.0` as `0` on the wire;
+that is valid JSON and accepted by the API.
 
 ### 4. Retry / backoff
 

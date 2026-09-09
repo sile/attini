@@ -81,7 +81,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--plan=on|off] [--thinking-effort none|low|high|max] [--stdin] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--thinking-effort none|low|high|max] [--stdin] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -92,10 +92,10 @@ roots and referenced by absolute path (readable with the `read` tool).
 
 `--stdin` reads standard input (until EOF) and appends it to the prompt as a
 clearly marked `--- stdin ---` block, so small pasted fragments need no temp
-file. It errors when stdin is a terminal (it would block), caps input at 1 MiB,
-and warns when stdin is empty. It is meant for *data*, not background context —
-use `--reference PATH` for that. `--stdin` cannot be combined with `--approve`
-or `--reject`.
+file. When stdin is a terminal it prints a note and reads interactively until
+EOF (Ctrl+D); Ctrl+C cancels. It caps input at 1 MiB and warns when stdin is
+empty. It is meant for *data*, not background context — use `--reference PATH`
+for that. `--stdin` cannot be combined with `--approve` or `--reject`.
 
 Extra positional tokens are now rejected as a usage error (`attini agent hello
 world` fails instead of silently dropping `world`), so multi-word prompts must
@@ -103,6 +103,11 @@ be quoted or passed via `--stdin`.
 
 `--max-tokens N` caps the completion-token budget for every model call in the
 run. When omitted the model's own default is used.
+
+`--temperature N` / `-t N` sets the sampling temperature for model calls.
+Default is 0 (deterministic), which DeepSeek recommends for coding/math; the
+value is ignored while thinking mode is enabled. It can also be set via
+`ATTINI_TEMPERATURE`.
 
 `--skill PATH` / `-S PATH` loads a skill: either a directory containing `SKILL.md`,
 or a `SKILL.md` file directly. Its body is prepended to the system prompt before
@@ -201,4 +206,5 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_SESSION_NAME` | Default session name when `-s/--session` (or a positional `<SESSION>`) is omitted. Precedence: CLI flag, then this env var, then `main`. |
 | `ATTINI_MODEL_NAME` | Default model name when `--model` is omitted. Precedence: CLI flag, then this env var, then the built-in default. |
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
+| `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). Ignored while thinking mode is enabled. |
 | `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line end-of-invocation status that `attini agent` prints to stderr. Unset (or any other value) keeps it on. |

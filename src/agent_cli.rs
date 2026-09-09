@@ -212,6 +212,11 @@ pub struct AgentConfig {
     /// (and persist) for this session at the start of the invocation.
     /// `None` leaves the session's current persisted value unchanged.
     pub thinking_effort_override: Option<ThinkingEffort>,
+    /// Sampling temperature for model calls. `None` uses the request
+    /// default (`Some(0.0)`, deterministic code editing); `Some(t)`
+    /// overrides it. Note the API ignores `temperature` while thinking
+    /// mode is enabled.
+    pub temperature: Option<f64>,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -535,7 +540,8 @@ fn drive(
         let request = ChatRequest::new(cfg.model.clone(), messages.clone())
             .with_tools(tools.clone())
             .with_max_tokens(cfg.max_tokens)
-            .with_thinking_effort(session.thinking_effort);
+            .with_thinking_effort(session.thinking_effort)
+            .with_temperature(cfg.temperature);
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
         let call_result = {
@@ -2379,6 +2385,7 @@ mod tests {
             authorization: Authorization::PerTool,
             plan_override: None,
             thinking_effort_override: None,
+            temperature: None,
         }
     }
 

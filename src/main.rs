@@ -18,6 +18,9 @@ const MODEL_ENV: &str = "ATTINI_MODEL_NAME";
 /// Environment variable that supplies a default completion-token cap when
 /// `--max-tokens` is omitted.
 const MAX_TOKENS_ENV: &str = "ATTINI_MAX_TOKENS";
+/// Environment variable that supplies a default sampling temperature when
+/// `--temperature` is omitted.
+const TEMPERATURE_ENV: &str = "ATTINI_TEMPERATURE";
 
 /// Cap on how many bytes `--stdin` may contribute to the prompt. Larger
 /// inputs should go through `--reference PATH` instead, to avoid bloating
@@ -328,6 +331,14 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
 
+    let temperature: Option<f64> = noargs::opt("temperature")
+        .short('t')
+        .ty("N")
+        .doc("Sampling temperature for model calls; 0 is deterministic. Default 0 for code editing. Ignored while thinking mode is enabled.")
+        .env(TEMPERATURE_ENV)
+        .take(args)
+        .present_and_then(|o| o.value().parse::<f64>())?;
+
     let plan_override: Option<bool> = noargs::opt("plan")
         .ty("on|off")
         .doc(
@@ -468,6 +479,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         authorization,
         plan_override,
         thinking_effort_override,
+        temperature,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
         agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
