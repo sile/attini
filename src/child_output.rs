@@ -1,11 +1,15 @@
-//! Run a child process while streaming its stdout and stderr to the
-//! parent's stderr under a byte-rate limit, and accumulating the full
-//! output of both streams for the tool result.
-//!
-//! The display is a user-facing copy only: bytes skipped by the rate
-//! limiter are still accumulated, so callers can hand the full output
-//! to the model exactly as before. The parent's stdout is never used
-//! here because the CLI's final result is emitted there.
+//! Run a child process while accumulating up to
+//! [`COMMAND_MAX_STREAM_BYTES`] of each stream for the tool result,
+//! and streaming the child's output to the parent's stderr under a
+//! byte-rate limit **when stderr is a terminal**. The streaming is a
+//! human-watching copy only: when stderr is not a terminal (a pipe, a
+//! test harness, CI) no display bytes are written, which avoids
+//! back-pressure that could otherwise stall the child if the retained
+//! output is large. Accumulation is bounded by
+//! [`COMMAND_MAX_STREAM_BYTES`], and when a stream exceeds that the
+//! retained buffer is truncated with [`ChildOutput::truncated`] set.
+//! The parent's stdout is never used here because the CLI's final
+//! result is emitted there.
 //!
 //! The child's output is framed by `[child] started (pid ...)` /
 //! `[child] finished (...)` separator lines on stderr, and when stderr
@@ -21,6 +25,11 @@ use std::time::{Duration, Instant};
 /// Upper bound on bytes of a child stream displayed to the parent's
 /// stderr per one-second window. Excess bytes are still accumulated.
 pub const STREAM_DISPLAY_BYTES_PER_SECOND: usize = 64 * 1024;
+
+/// Maximum bytes retained from either the child's stdout or stderr
+/// for the tool result. When a stream exceeds this, the retained
+/// buffer is truncated and [`ChildOutput::truncated`] is set.
+pub const COMMAND_MAX_STREAM_BYTES: usize = 256 * 1024;
 
 /// Size of each read from a child pipe.
 const CHUNK_SIZE: usize = 4 * 1024;
@@ -43,6 +52,9 @@ pub struct ChildOutput {
     pub status: ExitStatus,
     /// Wall time from spawn to both streams drained.
     pub duration: Duration,
+    /// True when either stream was truncated at
+    /// [`COMMAND_MAX_STREAM_BYTES`]; the stdio text is incomplete.
+    pub truncated: bool,
 }
 
 /// Run `cmd` with piped stdout / stderr, streaming both to the parent
@@ -78,8 +90,8 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
     });
 
     let status = child.wait()?;
-    let stdout_bytes = join_pump(stdout_thread)?;
-    let stderr_bytes = join_pump(stderr_thread)?;
+    let (stdout_bytes, stdout_truncated) = join_pump(stdout_thread)?;
+    let (stderr_bytes, stderr_truncated) = join_pump(stderr_thread)?;
     let duration = started.elapsed();
     eprintln!("{}", finish_line(&status, duration));
 
@@ -88,6 +100,7 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         status,
         duration,
+        truncated: stdout_truncated || stderr_truncated,
     })
 }
 
@@ -109,12 +122,16 @@ pub fn finish_line(status: &ExitStatus, duration: Duration) -> String {
     )
 }
 
-fn join_pump(handle: Option<thread::JoinHandle<io::Result<Vec<u8>>>>) -> io::Result<Vec<u8>> {
+/// Result of draining one child stream: the retained (possibly
+/// truncated) bytes and whether truncation happened.
+type Pumped = (Vec<u8>, bool);
+
+fn join_pump(handle: Option<thread::JoinHandle<io::Result<Pumped>>>) -> io::Result<Pumped> {
     match handle {
         Some(h) => h
             .join()
             .map_err(|_| io::Error::other("child output reader thread panicked"))?,
-        None => Ok(Vec::new()),
+        None => Ok((Vec::new(), false)),
     }
 }
 
@@ -144,21 +161,33 @@ fn pump<R: Read, W: Write>(
     color: bool,
     mut limiter: DisplayRateLimiter,
     sink: &mut W,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<Pumped> {
     let mut accumulated = Vec::new();
+    let mut truncated = false;
     let mut chunk = [0u8; CHUNK_SIZE];
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
             break;
         }
-        accumulated.extend_from_slice(&chunk[..n]);
-        let allowed = limiter.allow(&chunk[..n]);
-        if allowed > 0 {
-            write_display(sink, kind, color, &chunk[..allowed])?;
+        let remaining = COMMAND_MAX_STREAM_BYTES.saturating_sub(accumulated.len());
+        if remaining > 0 {
+            let take = n.min(remaining);
+            accumulated.extend_from_slice(&chunk[..take]);
+            if take < n {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+        if color {
+            let allowed = limiter.allow(&chunk[..n]);
+            if allowed > 0 {
+                write_display(sink, kind, color, &chunk[..allowed])?;
+            }
         }
     }
-    Ok(accumulated)
+    Ok((accumulated, truncated))
 }
 
 /// Write `bytes` to `sink`, wrapping them in the stream colour when
@@ -275,8 +304,40 @@ mod tests {
         let reader = io::Cursor::new(b"x".repeat(10 * 1024));
         let limiter = DisplayRateLimiter::new(1, Duration::from_secs(1));
         let mut sink = io::sink();
-        let bytes = pump(reader, StreamKind::Stdout, false, limiter, &mut sink).expect("pump");
+        let (bytes, truncated) =
+            pump(reader, StreamKind::Stdout, false, limiter, &mut sink).expect("pump");
         assert_eq!(bytes.len(), 10 * 1024, "accumulation is never rate-capped");
+        assert!(!truncated, "10 KiB is below the stream cap");
+    }
+
+    #[test]
+    fn pump_truncates_accumulation_at_stream_cap() {
+        let payload = vec![b'x'; COMMAND_MAX_STREAM_BYTES + 1];
+        let reader = io::Cursor::new(payload);
+        let limiter = DisplayRateLimiter::new(COMMAND_MAX_STREAM_BYTES, Duration::from_secs(1));
+        let mut sink = io::sink();
+        let (bytes, truncated) =
+            pump(reader, StreamKind::Stdout, false, limiter, &mut sink).expect("pump");
+        assert_eq!(
+            bytes.len(),
+            COMMAND_MAX_STREAM_BYTES,
+            "retained output hits the cap"
+        );
+        assert!(truncated);
+    }
+
+    #[test]
+    fn run_streamed_truncates_large_output_at_stream_cap() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("yes x | head -c 300000");
+        let out = run_streamed(&mut cmd).expect("run");
+        assert!(out.status.success());
+        assert_eq!(
+            out.stdout.len(),
+            COMMAND_MAX_STREAM_BYTES,
+            "retained stdout hits the stream cap"
+        );
+        assert!(out.truncated);
     }
 
     #[test]

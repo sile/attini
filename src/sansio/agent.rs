@@ -55,16 +55,6 @@ pub const PATCH_MAX_EDITS: usize = 20;
 /// read.
 pub const PATCH_MAX_FILE_BYTES: usize = READ_MAX_BYTES;
 
-/// Maximum bytes retained from either stdout or stderr of a running
-/// command. Reaching this limit terminates the process group and
-/// marks the tool result as `truncated`.
-pub const COMMAND_MAX_STREAM_BYTES: usize = 256 * 1024;
-
-/// Chunk size for a single non-blocking read on the child's stdout /
-/// stderr pipe. Small enough to keep the TUI tail buffer responsive
-/// under high-throughput output.
-pub const COMMAND_STREAM_CHUNK_SIZE: usize = 4 * 1024;
-
 /// A read-only tool the model can invoke while the agent is running.
 ///
 /// Semantics and per-tool limits are defined in `src/tools.rs`; this
@@ -406,9 +396,10 @@ impl CommandInvocation {
             name: "command".to_string(),
             description: "Run a command in the workspace by executing argv[0] with argv[1..] \
                  directly (no shell). Every call requires user approval unless a matching \
-                 argv_prefix rule pre-approves it. Output byte totals are capped; non-zero \
-                 exit status is returned as a normal result (not an error). Runtime is not \
-                 capped by attini; the user can interrupt a long-running command with Ctrl+C."
+                 argv_prefix rule pre-approves it. Output is capped at 256 KiB per stream; if \
+                 a stream is truncated the result sets `truncated: true`. Non-zero exit status \
+                 is returned as a normal result (not an error). Runtime is not capped by \
+                 attini; the user can interrupt a long-running command with Ctrl+C."
                 .to_string(),
             parameters_json: COMMAND_PARAMS_SCHEMA.to_string(),
         }

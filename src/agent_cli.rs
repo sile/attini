@@ -1845,6 +1845,7 @@ fn run_command_sync(
         output.status.code(),
         termination_reason,
         elapsed,
+        output.truncated,
     ))
 }
 
@@ -2070,6 +2071,7 @@ fn command_result_json(
     exit_code: Option<i32>,
     termination_reason: &str,
     elapsed: Duration,
+    truncated: bool,
 ) -> String {
     struct Payload<'a> {
         stdout: &'a str,
@@ -2077,6 +2079,7 @@ fn command_result_json(
         exit_code: Option<i32>,
         termination_reason: &'a str,
         duration_ms: u64,
+        truncated: bool,
     }
     impl DisplayJson for Payload<'_> {
         fn fmt(&self, f: &mut nojson::JsonFormatter<'_, '_>) -> std::fmt::Result {
@@ -2087,6 +2090,7 @@ fn command_result_json(
                 }
                 f.member("termination_reason", self.termination_reason)?;
                 f.member("duration_ms", self.duration_ms)?;
+                f.member("truncated", self.truncated)?;
                 f.member("stdout", self.stdout)?;
                 f.member("stderr", self.stderr)
             })
@@ -2099,6 +2103,7 @@ fn command_result_json(
         exit_code,
         termination_reason,
         duration_ms,
+        truncated,
     })
     .to_string()
 }
@@ -2706,19 +2711,29 @@ mod tests {
             Some(1),
             "exited",
             Duration::from_millis(123),
+            false,
         );
         assert!(json.contains("\"stdout\":\"line 1\\nline 2\\n"));
         assert!(json.contains("\"stderr\":\"warning: something\\n"));
         assert!(json.contains("\"exit_code\":1"));
         assert!(json.contains("\"termination_reason\":\"exited\""));
         assert!(json.contains("\"duration_ms\":123"));
+        assert!(json.contains("\"truncated\":false"));
     }
 
     #[test]
     fn command_result_json_roundtrips_no_exit_code() {
-        let json = command_result_json("out", "", None, "signaled", Duration::ZERO);
+        let json = command_result_json("out", "", None, "signaled", Duration::ZERO, true);
         assert!(json.contains("\"exit_code\":null"));
         assert!(json.contains("\"termination_reason\":\"signaled\""));
+        assert!(json.contains("\"truncated\":true"));
+    }
+
+    #[test]
+    fn command_result_json_includes_truncated_flag() {
+        let json = command_result_json("out", "", Some(0), "exited", Duration::ZERO, true);
+        assert!(json.contains("\"truncated\":true"));
+        assert!(!json.contains("\"truncated\":false"));
     }
 
     // -------------------------------------------------------------

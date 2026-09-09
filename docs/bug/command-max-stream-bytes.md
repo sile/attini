@@ -1,8 +1,8 @@
 # COMMAND_MAX_STREAM_BYTES is dead and the "total capped" claim is false
 
-**Status:** Bug (open). The constant is declared, documented as enforcing a cap,
-and never referenced. The `command` tool advertises "Output byte totals are capped"
-but the runtime accumulator has no bound.
+**Status:** Fixed. The constant was dead and the runtime accumulator had no
+bound; `run_streamed` now truncates each stream at 256 KiB and sets a
+`truncated` flag on the tool result, and the tool description says so.
 
 ## Where the constant lives
 
@@ -86,6 +86,10 @@ the I/O layer (or a small shared module).
 
 ## Decision
 
-Tracked as a bug (not a plan). Fix when the command-tool hardening work lands;
-until then, treat `"Output byte totals are capped"` in the tool description as
-aspirational, not a guarantee.
+Fixed (minimal/truncation route, not the watchdog): `run_streamed` now bounds
+each retained stream at `COMMAND_MAX_STREAM_BYTES`, sets `ChildOutput::truncated`
+when a stream exceeds it, and `command_result_json` serializes a `truncated`
+member so the model sees that output was cut. The dead constants in
+`sansio/agent.rs` were removed; the cap lives in `child_output.rs`, next to the
+code that enforces it. The process-group watchdog from
+`docs/deferred/command-tool-timeout.md` was deliberately left out for now.
