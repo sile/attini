@@ -602,6 +602,7 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         try_run_session_prune,
         try_run_session_metrics,
         try_run_session_grant_read,
+        try_run_session_analyze,
     ] {
         match sub(args)? {
             CommandOutcome::NotHandled => {}
@@ -613,7 +614,7 @@ fn try_run_session(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         return Ok(CommandOutcome::Help);
     }
     Err(RunError::Runtime(
-        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, grant-read, compact, prune, metrics)"
+        "attini session requires a sub-command (list, show, tail, rm, unlock, grant, grant-read, compact, prune, metrics, analyze)"
             .to_string(),
     ))
 }
@@ -899,6 +900,37 @@ fn try_run_session_metrics(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
         session_cmd::MetricsScope::Single(&session_name)
     };
     session_cmd::run_metrics(scope, json).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(CommandOutcome::Done)
+}
+
+fn try_run_session_analyze(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("analyze")
+        .doc(
+            "Analyze one session's conversation log: record-kind histogram, \
+             assistant payload split, tool-result bytes by function, read \
+             targets, command programs/families, token-usage totals. \
+             Read-only; never acquires the session LOCK.",
+        )
+        .take(args)
+        .is_present()
+    {
+        return Ok(CommandOutcome::NotHandled);
+    }
+    let name = session_from_pos_or_env(
+        noargs::arg("<SESSION>")
+            .doc("Session name; directory is .attini/<SESSION>/")
+            .example("main")
+            .take(args)
+            .present_and_then(|a| a.value().parse())?,
+    )?;
+    let json = noargs::flag("json")
+        .doc("Emit the full analysis (not just top-10) as a JSON object")
+        .take(args)
+        .is_present();
+    if args.metadata().help_mode {
+        return Ok(CommandOutcome::Help);
+    }
+    session_cmd::run_analyze(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 

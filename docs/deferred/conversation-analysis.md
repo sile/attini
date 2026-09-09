@@ -1,7 +1,9 @@
-# Conversation analysis tooling (deferred)
+# Conversation analysis tooling
 
-**Status:** Deferred. Not implemented. This document records the design
-exploration, the decision, and how to revive it.
+**Status:** Partially implemented. The deterministic `attini session
+analyze` subcommand (measurement half) is implemented and committed; the
+interpretation skill is still deferred. This document records the design
+exploration, the decision, and how to revive the remaining half.
 
 ## Problem
 
@@ -140,17 +142,15 @@ not provide.
 
 ## Decision
 
-**Deferred.** The bloat investigation was a one-off; the real fixes (stop
-re-sending `reasoning`, cap `command` output) are already decided. The
-analysis tooling is ergonomic, not critical, and the next opportunity to use
-it is uncertain. If revived, implement **both halves in the order above**: the
-subcommand first (deterministic baseline), then the interpretation skill.
+**Partially implemented.** The `session analyze` subcommand was implemented
+and committed. It produces the record-kind histogram, assistant-payload
+split, tool-result consumers (read targets, command families), and
+aggregate totals, with `--json` for a machine-consumable baseline. The
+interpretation skill is still deferred; it is the remaining half.
 
-## How to revive
+## How to revive the remaining half
 
-When the next session grows large, first write the ad-hoc analysis once more;
-if it takes more than a few minutes, implement `session analyze` with
-`--json`. Once the subcommand exists, add the `analyze-conversation` skill so
-the model can interpret the output and launch targeted follow-up. The
-byte-sized record-kind histogram is the highest-value piece of the
-subcommand; the interpretation skill is what makes it actionable.
+Add the `analyze-conversation` skill (a `SKILL.md` loaded via the existing
+explicit `attini agent -S PATH`) so the model can interpret `session analyze`
+output and launch targeted follow-up. The measurement subcommand already
+exists, so the skill only needs to chain it with model judgment.
