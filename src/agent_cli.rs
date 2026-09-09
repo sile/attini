@@ -195,8 +195,8 @@ pub struct AgentConfig {
     /// Optional CLI-selected skill path. When set, the SKILL.md body
     /// (either the file itself or SKILL.md inside the directory) is
     /// prepended as a system message before the first turn. Applies
-    /// only to fresh invocations; combining with `--approve` /
-    /// `--reject` is rejected in `main.rs`.
+    /// only to fresh invocations; combining with `--approve` is
+    /// rejected in `main.rs`.
     pub skill_path: Option<PathBuf>,
     /// How side-effecting tool calls are authorized in this
     /// invocation. `plan run` supplies
@@ -236,8 +236,6 @@ pub enum Continuation {
     /// Resume by approving the pending tool call recorded in the
     /// session's `pending.json`.
     Approve,
-    /// Resume by rejecting the pending tool call.
-    Reject,
 }
 
 /// Terminal outcome of one `agent_cli::run` invocation.
@@ -454,7 +452,7 @@ fn drive(
     }
 
     let is_prompt = matches!(cont, Continuation::Prompt(_));
-    let is_approve_or_reject = matches!(cont, Continuation::Approve | Continuation::Reject);
+    let is_approve = matches!(cont, Continuation::Approve);
 
     let mut messages = build_initial_messages(session, cfg)?;
 
@@ -495,34 +493,14 @@ fn drive(
             }
             session.clear_pending()?;
         }
-        Continuation::Reject => {
-            let pendings = load_pending_or_err(session)?;
-            for pending in &pendings {
-                session.append(&SessionRecord::ToolApproval {
-                    ts: now_unix_millis(),
-                    call_id: pending.call_id.clone(),
-                    decision: ApprovalDecision::Reject,
-                    auto_decided_by: None,
-                })?;
-                let content = r#"{"error":"rejected","message":"user rejected this tool call"}"#;
-                append_tool(
-                    session,
-                    &mut messages,
-                    &pending.call_id,
-                    content.to_string(),
-                )?;
-                counters.tool_errors += 1;
-            }
-            session.clear_pending()?;
-        }
     }
 
-    // `Approve` / `Reject` consume the parked pending inside the match
-    // above (appending a Tool record for the answered call), so they
-    // run the orphan repair *after* the match; otherwise the pending
-    // is still parked and the freshly-appended Tool record could be
-    // re-surfaced as an orphan.
-    if is_approve_or_reject {
+    // `Approve` consumes the parked pending inside the match above
+    // (appending a Tool record for the answered call), so it runs the
+    // orphan repair *after* the match; otherwise the pending is still
+    // parked and the freshly-appended Tool record could be re-surfaced
+    // as an orphan.
+    if is_approve {
         let repaired = repair_orphaned_tool_calls(session, &mut messages)?;
         if repaired > 0 {
             eprintln!(
@@ -1948,7 +1926,7 @@ fn repair_messages(messages: &[ChatMessage]) -> (Vec<ChatMessage>, Vec<OrphanedT
 /// transcript is healed and the same orphan does not recur on a
 /// later invocation. If the cancelled call corresponds to a pending
 /// approval that the caller bypassed with a fresh prompt, the pending
-/// is cleared so a later `--approve` / `--reject` does not double-run
+/// is cleared so a later `--approve` does not double-run
 /// it.
 ///
 /// Even when no new synthetic result is required, the repaired message
@@ -1968,7 +1946,7 @@ fn repair_orphaned_tool_calls(
         for orphan in &orphans {
             // If the orphan is the very call that the previous invocation
             // parked in pending.json and the caller resumed with a fresh
-            // prompt (bypassing --approve / --reject), drop the pending so
+            // prompt (bypassing --approve), drop the pending so
             // a later resume does not execute the now-cancelled call.
             if let Some(pendings) = session.load_pending()?
                 && pendings.iter().any(|p| p.call_id == orphan.call_id)
@@ -2021,7 +1999,7 @@ fn append_tool(
 fn load_pending_or_err(session: &Session) -> io::Result<Vec<Pending>> {
     session
         .load_pending()?
-        .ok_or_else(|| io::Error::other("no pending.json — nothing to approve or reject"))
+        .ok_or_else(|| io::Error::other("no pending.json — nothing to approve"))
 }
 
 fn tool_error_json_from(err: &ToolExecutionError) -> String {

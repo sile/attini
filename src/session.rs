@@ -823,8 +823,8 @@ pub enum SessionRecord {
         call_id: String,
         decision: ApprovalDecision,
         /// `Some` when the decision was made automatically (rule
-        /// match or plan-mode reject); `None` for user `--approve`
-        /// / `--reject`. Serialised as an optional sidecar object.
+        /// match or plan-mode reject); `None` for user `--approve`.
+        /// Serialised as an optional sidecar object.
         auto_decided_by: Option<AutoDecidedBy>,
     },
     /// Snapshot of transport / agent metric counters. Emitted

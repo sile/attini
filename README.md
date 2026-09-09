@@ -95,7 +95,7 @@ clearly marked `--- stdin ---` block, so small pasted fragments need no temp
 file. When stdin is a terminal it prints a note and reads interactively until
 EOF (Ctrl+D); Ctrl+C cancels. It caps input at 1 MiB and warns when stdin is
 empty. It is meant for *data*, not background context — use `--reference PATH`
-for that. `--stdin` cannot be combined with `--approve` or `--reject`.
+for that. `--stdin` cannot be combined with `--approve`.
 
 Extra positional tokens are now rejected as a usage error (`attini agent hello
 world` fails instead of silently dropping `world`), so multi-word prompts must
@@ -115,13 +115,13 @@ the first turn. Relative paths resolve against the workspace root. There is **no
 implicit skill discovery** — attini never scans `~/.attini/skills` or
 `.attini/skills`, and the model has no `skill_load` tool. Context enters only
 because you asked for it, explicitly, at invocation start. `--skill` cannot be
-combined with `--approve` or `--reject`.
+combined with `--approve`.
 
 `--plan=on` / `--plan=off` turns plan mode on or off **persistently** for the
 session. In plan mode every patch — including edits on git-tracked files, which
 would otherwise be auto-applied — requires explicit human approval before it
 touches the workspace. Commands are unchanged (deny rules still hard-reject),
-and `--approve` / `--reject` still work. The flag persists in
+and `--approve` still works. The flag persists in
 `.attini/<SESSION>/plan_mode` and is reflected in `attini session show`; omitting
 it leaves the session's current plan-mode state unchanged.
 

@@ -26,7 +26,7 @@ attini agent -s main --plan=off "..."   # plan mode OFF (persisted)
   to off / normal mode).
 - State is persisted under `.attini/<session>/`, so it survives across
   `attini agent` invocations.
-- `--approve` / `--reject` remain usable inside plan mode; a human explicitly
+- `--approve` remains usable inside plan mode; a human explicitly
   approving a pending call is always allowed (it is not a machine authorization
   bypass, it is the human gate itself).
 

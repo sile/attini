@@ -1209,7 +1209,7 @@ pub fn run_compact(session_name: &str, model: &str, max_tokens: Option<u64>) -> 
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "session {session_name:?} has pending.json; resume it with --approve / --reject before compacting"
+                "session {session_name:?} has pending.json; resume it with --approve before compacting"
             ),
         ));
     }

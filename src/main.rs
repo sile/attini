@@ -232,10 +232,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .doc("Resume the session by approving its pending tool call")
         .take(args)
         .is_present();
-    let reject = noargs::flag("reject")
-        .doc("Resume the session by rejecting its pending tool call")
-        .take(args)
-        .is_present();
     let local_only = noargs::flag("local-only")
         .doc("Local-only mode: auto-run commands matched by a `network: false` rule; leave others for approval")
         .take(args)
@@ -319,7 +315,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
              and prepend its body as a system message before PROMPT. Relative \
              paths resolve against the workspace root. There is no implicit \
              skill discovery — the path must be given explicitly. \
-             Cannot be combined with --approve or --reject.",
+             Cannot be combined with --approve.",
         )
         .take(args)
         .present_and_then(|o| o.value().parse::<String>())?
@@ -388,7 +384,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .is_present();
 
     let prompt: Option<String> = noargs::arg("[PROMPT]")
-        .doc("User prompt (required unless --approve or --reject is given)")
+        .doc("User prompt (required unless --approve is given)")
         .example("List the files in src/")
         .take(args)
         .present_and_then(|a| a.value().parse())?;
@@ -403,19 +399,14 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     let tool_call_rate = parse_tool_call_rate(&tool_call_rate_raw)?;
     let session_tool_call_max = parse_session_tool_call_max(&session_tool_call_max_raw)?;
 
-    if approve && reject {
+    if skill_path.is_some() && approve {
         return Err(RunError::Runtime(
-            "--approve and --reject are mutually exclusive".to_string(),
+            "--skill cannot be combined with --approve".to_string(),
         ));
     }
-    if skill_path.is_some() && (approve || reject) {
+    if use_stdin && approve {
         return Err(RunError::Runtime(
-            "--skill cannot be combined with --approve or --reject".to_string(),
-        ));
-    }
-    if use_stdin && (approve || reject) {
-        return Err(RunError::Runtime(
-            "--stdin cannot be combined with --approve or --reject".to_string(),
+            "--stdin cannot be combined with --approve".to_string(),
         ));
     }
     let cont = if approve {
@@ -425,19 +416,12 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
             ));
         }
         Continuation::Approve
-    } else if reject {
-        if prompt.is_some() {
-            return Err(RunError::Runtime(
-                "PROMPT must be omitted when using --reject".to_string(),
-            ));
-        }
-        Continuation::Reject
     } else {
         let p = match prompt {
             Some(p) => p,
             None => {
                 return Err(RunError::Runtime(
-                    "PROMPT is required unless --approve or --reject is given".to_string(),
+                    "PROMPT is required unless --approve is given".to_string(),
                 ));
             }
         };
