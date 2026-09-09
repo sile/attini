@@ -1,7 +1,7 @@
-# `try_auto_compact` record-based trigger (deferred)
+# `try_auto_compact` record-based trigger
 
-**Status:** Deferred. Not implemented. This document records the remaining
-trigger hole in automatic compaction, why it is not urgent, and how to revive it.
+**Status:** Implemented. A second, record-size-based auto-compaction trigger
+was added alongside the token threshold, closing the stale-`token_usage` hole.
 
 ## Problem
 
@@ -45,21 +45,40 @@ compaction never fires because the trigger threshold is judged from stale data.
   * it needs a guard so it fires at most once per resume / on the first turn.
 * Not observed in practice after the prior fix; deferred until it is.
 
-## How to revive
+## Implementation
 
-* Add a size-based guard next to the token threshold, e.g. compute the total
-  byte length of `load_records_since_last_summary()` (or of the retained tail)
-  and if it exceeds a budget, force compaction even when
-  `latest_prompt_tokens() < COMPACTION_TRIGGER_TOKENS`.
-* Or record an actual history-size indicator alongside `token_usage` so
-  `latest_prompt_tokens` reflects the real history even when the turn did not
-  complete.
-* Guard against over-eager compaction: fire at most once per resume, and only
-  on the first turn of a resumed session.
+`try_auto_compact` (`src/agent_cli.rs`) now judges the need to compact from two
+independent signals via the pure helper `should_auto_compact(latest, total_chars)`:
+
+```rust
+fn should_auto_compact(latest: u64, total_chars: usize) -> bool {
+    latest >= COMPACTION_TRIGGER_TOKENS || total_chars > RECORDS_TOTAL_MAX_CHARS
+}
+```
+
+* `latest` is the last successful turn's `prompt_tokens` (unchanged).
+* `total_chars` is the raw character size of the real records since the last
+  summary, computed only when `latest < COMPACTION_TRIGGER_TOKENS` (so a
+  normal-size history does not pay the extra scan cost).
+* A new constant `RECORDS_TOTAL_MAX_CHARS = 250_000` mirrors
+  `RETAINED_TAIL_MAX_CHARS`; exceeding it forces compaction even when the token
+  count is stale/small.
+
+`compaction_cutoff` was also relaxed: it no longer early-returns `None` when
+`records.len() <= target_keep`. Instead it starts at `safe_tail_start` (which
+returns `0` for a short history) and walks forward while the whole history
+exceeds the budget, so a few records dominated by one huge tool result are
+folded into a summary rather than dropped.
+
+Guards:
+* `try_auto_compact` still returns early when `pending.json` exists, so it fires
+  only on a fresh `Continuation::Prompt` (never on `--approve`).
+* It fires on the first turn of a resumed session only; after compaction the
+  summary replaces the huge history so a second pass sees a small total.
 
 ## Decision
 
-**Deferred.** The trigger hole is real but requires a new heuristic with
-repeated-compaction risk. It was not the cause of the reported failure and has
-not been observed since. Revisit only if a session is found to stay locked in
-the overflow state with `latest_prompt_tokens` below the threshold.
+**Implemented** (see "Implementation" above). The record-size trigger closes
+the stale-`token_usage` hole and, combined with the pre-existing
+`compaction_cutoff` fold-all path, ensures a huge tool result appended just
+before a suspend is summarised instead of overflowing the next main call.

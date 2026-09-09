@@ -161,6 +161,15 @@ pub const SUMMARY_TOOL_RESULT_MAX_CHARS: usize = 200;
 /// context; normal recent tails are far smaller and unaffected.
 pub const RETAINED_TAIL_MAX_CHARS: usize = 250_000;
 
+/// Maximum raw character size of the real records between the last
+/// summary and now, used as a second auto-compaction trigger. When
+/// the previous turn suspended before recording its `token_usage`,
+/// `latest_prompt_tokens()` is stale/small even though the actual
+/// records (which include a huge tool result) are enormous; this
+/// bound catches that case so compaction still fires. Mirrors
+/// [`RETAINED_TAIL_MAX_CHARS`] for consistency.
+pub const RECORDS_TOTAL_MAX_CHARS: usize = 250_000;
+
 pub struct AgentConfig {
     pub session_name: String,
     pub model: String,
@@ -905,6 +914,23 @@ Aim for ~500 words of plain prose. Do not include markdown code fences \
 unless quoting a short critical excerpt. Do not comment on the \
 summarization itself; produce only the summary.";
 
+/// Decide whether to auto-compact before a `Prompt` invocation.
+///
+/// Returns `true` when at least one of two independent signals says
+/// the real history is too large:
+///   * the last successful turn recorded `>= COMPACTION_TRIGGER_TOKENS`
+///     prompt tokens (`latest`);
+///   * the raw character size of the real records since the last
+///     summary (`total_chars`) exceeds `RECORDS_TOTAL_MAX_CHARS`.
+///
+/// The second signal matters when the previous turn suspended before
+/// recording its `token_usage`: `latest` is then stale/small, but the
+/// actual records (e.g. a huge tool result) are still enormous and
+/// would overflow the next main call.
+fn should_auto_compact(latest: u64, total_chars: usize) -> bool {
+    latest >= COMPACTION_TRIGGER_TOKENS || total_chars > RECORDS_TOTAL_MAX_CHARS
+}
+
 fn try_auto_compact(
     session: &mut Session,
     model: &str,
@@ -914,15 +940,35 @@ fn try_auto_compact(
     if session.load_pending()?.is_some() {
         return Ok(());
     }
-    let Some(latest) = session.latest_prompt_tokens()? else {
-        return Ok(());
+    // Judge the need to compact from two independent signals:
+    //   * the token threshold, which reflects the *last successful* turn;
+    //   * the raw size of the real records since the last summary, which
+    //     stays accurate even when that turn suspended before recording
+    //     `token_usage` (leaving a huge tool result behind but a stale,
+    //     small `latest`).
+    let latest = session.latest_prompt_tokens()?.unwrap_or(0);
+    let total_chars = if latest < COMPACTION_TRIGGER_TOKENS {
+        let records = session.load_records_since_last_summary()?;
+        records
+            .iter()
+            .map(|r| message_raw_char_len(&r.message) + 1)
+            .sum::<usize>()
+    } else {
+        0
     };
-    if latest < COMPACTION_TRIGGER_TOKENS {
+    if !should_auto_compact(latest, total_chars) {
         return Ok(());
     }
-    eprintln!(
-        "[compaction] previous prompt was {latest} tokens (threshold {COMPACTION_TRIGGER_TOKENS}), summarising..."
-    );
+    if latest < COMPACTION_TRIGGER_TOKENS {
+        eprintln!(
+            "[compaction] previous prompt was {latest} tokens (below threshold) but records are \
+             {total_chars} chars, summarising..."
+        );
+    } else {
+        eprintln!(
+            "[compaction] previous prompt was {latest} tokens (threshold {COMPACTION_TRIGGER_TOKENS}), summarising..."
+        );
+    }
     counters.compaction_attempts += 1;
     if let Err(e) = compact_conversation(session, model, max_tokens) {
         counters.compaction_failures += 1;
@@ -1331,9 +1377,13 @@ fn compaction_cutoff(
     max_tail_chars: usize,
 ) -> Option<usize> {
     let n = records.len();
-    if n <= target_keep {
-        return None;
-    }
+    // `safe_tail_start` returns 0 when the history is short (<= target)
+    // or when no safe boundary exists in the initial tail. Starting at
+    // 0 here means: if the *whole* history already fits the budget, we
+    // skip (return None); if it is too large because of one huge record
+    // even though there are few records, the loop below walks forward
+    // to a safe boundary and folds it -- exactly the trigger hole this
+    // guard closes.
     let mut keep_start = safe_tail_start(records, target_keep);
     // If the retained tail cannot fit, fold its oldest part by moving
     // the cutoff toward the end, stopping at a safe boundary so an
@@ -2308,6 +2358,49 @@ mod tests {
         let keep = safe_tail_start(&records, 2);
         assert!(keep > 0);
         assert_eq!(compaction_cutoff(&records, 2, 100_000), Some(keep));
+    }
+
+    #[test]
+    fn compaction_cutoff_folds_few_but_huge_records() {
+        // The trigger hole: very few records but one enormous tool
+        // result dominates the history. `latest_prompt_tokens` would
+        // be stale/small, so the size-based guard must fire even when
+        // `n <= target_keep`. The cutoff should walk past the huge
+        // record and fold it (returning `Some(n)` when no safe
+        // boundary is reachable, or a boundary that fits the budget).
+        let records = vec![user(1), assistant_with_tool_call(2), big_tool(3, 300_000)];
+        assert_eq!(compaction_cutoff(&records, 10, 1000), Some(records.len()));
+    }
+
+    #[test]
+    fn compaction_cutoff_skips_when_few_and_small() {
+        // Few records that all fit the budget: nothing to fold.
+        let records = vec![user(1), assistant_plain(2)];
+        assert_eq!(compaction_cutoff(&records, 10, 1000), None);
+    }
+
+    #[test]
+    fn should_auto_compact_fires_on_token_threshold() {
+        // Last successful turn was large enough: compact on the token
+        // threshold alone, even if the recorded size is tiny.
+        assert!(should_auto_compact(COMPACTION_TRIGGER_TOKENS, 0));
+        assert!(should_auto_compact(COMPACTION_TRIGGER_TOKENS + 1, 100));
+    }
+
+    #[test]
+    fn should_auto_compact_fires_on_record_size_when_tokens_stale() {
+        // The trigger hole: the token count is stale/small because the
+        // previous turn suspended, but the real records are huge. The
+        // size guard must fire even below the token threshold.
+        assert!(should_auto_compact(0, RECORDS_TOTAL_MAX_CHARS + 1));
+        assert!(should_auto_compact(1000, RECORDS_TOTAL_MAX_CHARS + 1));
+    }
+
+    #[test]
+    fn should_auto_compact_stays_quiet_when_everything_is_small() {
+        // Both signals below their thresholds: no compaction.
+        assert!(!should_auto_compact(0, RECORDS_TOTAL_MAX_CHARS));
+        assert!(!should_auto_compact(COMPACTION_TRIGGER_TOKENS - 1, 10));
     }
 
     #[test]
