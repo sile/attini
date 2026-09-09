@@ -76,17 +76,11 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
 
     let stdout_thread = stdout.map(|reader| {
         let limiter = DisplayRateLimiter::new_per_second();
-        thread::spawn(move || {
-            let mut sink = io::stderr().lock();
-            pump(reader, StreamKind::Stdout, color, limiter, &mut sink)
-        })
+        thread::spawn(move || pump(reader, StreamKind::Stdout, color, limiter))
     });
     let stderr_thread = stderr.map(|reader| {
         let limiter = DisplayRateLimiter::new_per_second();
-        thread::spawn(move || {
-            let mut sink = io::stderr().lock();
-            pump(reader, StreamKind::Stderr, color, limiter, &mut sink)
-        })
+        thread::spawn(move || pump(reader, StreamKind::Stderr, color, limiter))
     });
 
     let status = child.wait()?;
@@ -155,12 +149,11 @@ impl StreamKind {
 /// Read a child pipe to EOF, accumulating every byte and displaying
 /// the stream to the parent stderr under `limiter`'s rate cap, wrapped
 /// in the stream's ANSI colour when `color` is true.
-fn pump<R: Read, W: Write>(
+fn pump<R: Read>(
     mut reader: R,
     kind: StreamKind,
     color: bool,
     mut limiter: DisplayRateLimiter,
-    sink: &mut W,
 ) -> io::Result<Pumped> {
     let mut accumulated = Vec::new();
     let mut truncated = false;
@@ -183,7 +176,8 @@ fn pump<R: Read, W: Write>(
         if color {
             let allowed = limiter.allow(&chunk[..n]);
             if allowed > 0 {
-                write_display(sink, kind, color, &chunk[..allowed])?;
+                let mut sink = io::stderr().lock();
+                write_display(&mut sink, kind, color, &chunk[..allowed])?;
             }
         }
     }
@@ -303,9 +297,8 @@ mod tests {
         // A tiny budget must not truncate the accumulated bytes.
         let reader = io::Cursor::new(b"x".repeat(10 * 1024));
         let limiter = DisplayRateLimiter::new(1, Duration::from_secs(1));
-        let mut sink = io::sink();
         let (bytes, truncated) =
-            pump(reader, StreamKind::Stdout, false, limiter, &mut sink).expect("pump");
+            pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
         assert_eq!(bytes.len(), 10 * 1024, "accumulation is never rate-capped");
         assert!(!truncated, "10 KiB is below the stream cap");
     }
@@ -315,9 +308,8 @@ mod tests {
         let payload = vec![b'x'; COMMAND_MAX_STREAM_BYTES + 1];
         let reader = io::Cursor::new(payload);
         let limiter = DisplayRateLimiter::new(COMMAND_MAX_STREAM_BYTES, Duration::from_secs(1));
-        let mut sink = io::sink();
         let (bytes, truncated) =
-            pump(reader, StreamKind::Stdout, false, limiter, &mut sink).expect("pump");
+            pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
         assert_eq!(
             bytes.len(),
             COMMAND_MAX_STREAM_BYTES,
@@ -357,6 +349,20 @@ mod tests {
         cmd.arg("-c").arg("exit 3");
         let out = run_streamed(&mut cmd).expect("run");
         assert_eq!(out.status.code(), Some(3));
+    }
+
+    #[test]
+    fn run_streamed_does_not_deadlock_when_both_streams_overflow() {
+        // Both stdout and stderr write enough to overflow their pipe
+        // buffers. If the pump threads contend on a shared display lock
+        // (or otherwise stop draining one pipe), the child blocks and
+        // run_streamed never returns.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("i=0; while [ $i -lt 100000 ]; do echo out; echo err >&2; i=$((i+1)); done");
+        let out = run_streamed(&mut cmd).expect("run");
+        assert!(out.status.success());
+        assert!(out.truncated);
     }
 
     // -----------------------------------------------------------------
