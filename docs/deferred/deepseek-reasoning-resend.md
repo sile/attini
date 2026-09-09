@@ -68,6 +68,33 @@ stripping works. Reverting the strip to blindly conform to the doc risks
 reintroducing the very context bloat that `52a9ee6` fixed, without evidence
 that the strict path is needed.
 
+## Why not "recent-only" resend
+
+A natural middle ground is to resend only the *most recent* `reasoning_content`
+(e.g., the last N turns) instead of the full 4.29 MB history, to keep the
+context bounded while still giving the model a hint of its recent thinking.
+This is **intentionally not pursued**:
+
+- **The spec is all-or-nothing.** The documented requirement is that
+  `reasoning_content` of *all* previous turns be passed back, not a sliding
+  window. A partial resend is exactly the kind of request the strict path is
+  described to reject (400), so "recent-only" is *more* likely to trip the
+  error than full strip, not less.
+- **No evidence a prefix helps.** A/B stripping *everything* still produced a
+  working agent (`SECOND_OK` / `ctx=1338`). If the model continues without any
+  prior CoT, there is no demonstrated benefit to feeding it a partial slice.
+- **Adds complexity without a use case.** "Recent-only" needs a per-turn
+  cutoff policy, risks inconsistent context, and has no measured payoff.
+
+## Decision snapshot
+
+- Commit `52a9ee6` (conditional strip) remains.
+- No code change planned until a real 400 is observed.
+- "Recent-only" resend is rejected.
+- Keep the strip; observe in practice. If a `400` referencing
+  `reasoning_content` ever appears, revisit the conditional-resend fix.
+- Track this as a watch item on the next DeepSeek API behavior change.
+
 ## How to revive
 
 If an `attini agent` invocation ever returns `API request failed: ...` with a
