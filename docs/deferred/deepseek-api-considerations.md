@@ -2,7 +2,9 @@
 
 **Status:** Partially implemented. Option 1 (`--thinking-effort`, default
 `high`) and Option 3 (`temperature: 0`, CLI `--temperature/-t` /
-`ATTINI_TEMPERATURE`) are done. Options 2, 4, 5, 6 remain deferred.
+`ATTINI_TEMPERATURE`) are done. Option 4 (retry) is explicitly **not
+planned** — a transient failure is best handled by a manual re-run, since
+attini values controllability over autonomy. Options 2, 5, 6 remain deferred.
 
 ## How this was produced
 
@@ -60,12 +62,17 @@ The value is sent only when thinking is `disabled` (sampling parameters are
 ignored in thinking mode). Note nojson renders float `0.0` as `0` on the wire;
 that is valid JSON and accepted by the API.
 
-### 4. Retry / backoff
+### 4. Retry / backoff — **NOT PLANNED**
 
 `curl.rs` has no retry for 429 / 5xx / connection errors. A single transient
 failure kills the whole invocation. Candidate: bounded exponential backoff
 with jitter for transport errors and 429, retrying only idempotent request
 shapes (a fresh chat completion is safe to retry).
+
+**Decision:** do not implement. attini does not prioritise autonomy so
+highly — a transient failure is handled acceptably by the human simply
+re-running the command. The added backoff/jitter/idempotency complexity is
+not worth it while manual intervention stays cheap.
 
 ### 5. Model split (agent vs. summariser vs. ask)
 
@@ -93,7 +100,8 @@ landscape so the next API-related change can be made deliberately.
 
 Implement Option 1 first (explicit `thinking` / `reasoning_effort`), verify
 with a live run that tool-calling still works with `thinking: disabled`, then
-wire `temperature: 0`. Add retry (Option 4) only if transient failures are
-observed in practice. Re-check all model names / parameter names against the
-official docs at implementation time; this note's values came from the docs
-review session and could drift.
+wire `temperature: 0`. Retry (Option 4) is currently rejected — revisit
+only if transient failures become frequent enough that a manual re-run
+becomes genuinely painful. Re-check all model names / parameter names
+against the official docs at implementation time; this note's values came
+from the docs review session and could drift.
