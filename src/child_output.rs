@@ -297,8 +297,7 @@ mod tests {
         // A tiny budget must not truncate the accumulated bytes.
         let reader = io::Cursor::new(b"x".repeat(10 * 1024));
         let limiter = DisplayRateLimiter::new(1, Duration::from_secs(1));
-        let (bytes, truncated) =
-            pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
+        let (bytes, truncated) = pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
         assert_eq!(bytes.len(), 10 * 1024, "accumulation is never rate-capped");
         assert!(!truncated, "10 KiB is below the stream cap");
     }
@@ -308,8 +307,7 @@ mod tests {
         let payload = vec![b'x'; COMMAND_MAX_STREAM_BYTES + 1];
         let reader = io::Cursor::new(payload);
         let limiter = DisplayRateLimiter::new(COMMAND_MAX_STREAM_BYTES, Duration::from_secs(1));
-        let (bytes, truncated) =
-            pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
+        let (bytes, truncated) = pump(reader, StreamKind::Stdout, false, limiter).expect("pump");
         assert_eq!(
             bytes.len(),
             COMMAND_MAX_STREAM_BYTES,
