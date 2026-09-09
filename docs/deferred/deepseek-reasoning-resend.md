@@ -48,6 +48,34 @@ session resumed and produced `SECOND_OK`. So the API appears to tolerate the
 omission in practice, or the test's message shape (low history, no tool_calls
 in the resumed turn) avoided the strict path.
 
+## "Final answer makes prior thinking irrelevant"?
+
+One might argue: per the Thinking Mode guide, the model performs "multiple
+turns of reasoning Before outputting the final answer". Once the final answer
+is emitted, the preceding CoT has served its purpose, so it should be safe to
+drop it. This intuition is correct *conceptually*.
+
+But DeepSeek's API is **stateless**: the server holds no conversation. The
+client resends the full history each call, and the server rebuilds context by
+means of concatenation. So the reasoning_content of earlier turns is not
+"consumed" once the final answer appears — it must be resent in subsequent
+requests for the server to reconstruct context. The spec makes this mandatory
+for tools-bearing requests (see above), even after the final answer.
+
+Therefore:
+
+- With `--thinking-effort=none` (the default), no reasoning content is
+generated, so this resend requirement does not apply at all.
+- With thinking enabled (`low|high|max`), the requirement technically binds for
+tools-bearing requests. If the model has already produced its final answer,
+that answer is kept as part of the next request, and the CoT that preceded it
+must still be resent to satisfy the spec at the API level.
+
+In practice the strict path has not been triggered (no 400 observed), but the
+conceptual argument "prior thinking is no longer needed after a final answer"
+should not be used to justify dropping it: the server has no memory of the
+prior turn, and relies on the client to resend the trace.
+
 ## Two directions
 
 1. **Restore resend for tools-bearing requests.** This matches the documented
