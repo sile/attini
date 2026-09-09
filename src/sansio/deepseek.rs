@@ -15,6 +15,53 @@
 
 use nojson::{DisplayJson, Json, JsonFormatter, JsonParseError, RawJsonValue};
 
+/// DeepSeek thinking-mode effort control.
+///
+/// `None` disables thinking mode entirely (the API receives
+/// `{"thinking":{"type":"disabled"}}`). `Low`/`High`/`Max` enable
+/// it at the corresponding depth (the API receives
+/// `{"thinking":{"type":"enabled"}}` plus `reasoning_effort`).
+/// This is a per-session setting so attini defaults to `None` (off)
+/// and avoids the chain-of-thought bloat that accumulates when
+/// thinking is silently on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingEffort {
+    /// Thinking mode disabled: `{"thinking":{"type":"disabled"}}`.
+    None,
+    /// Thinking enabled at low depth.
+    Low,
+    /// Thinking enabled at high depth (the API's default effort).
+    High,
+    /// Thinking enabled at maximum effort.
+    Max,
+}
+
+impl ThinkingEffort {
+    /// Canonical string used both for the `reasoning_effort` wire
+    /// value and for the persisted session file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingEffort::None => "none",
+            ThinkingEffort::Low => "low",
+            ThinkingEffort::High => "high",
+            ThinkingEffort::Max => "max",
+        }
+    }
+
+    /// Parse a `thinking_effort` value from its canonical string.
+    /// Returns `None` for unrecognised input so callers can treat it
+    /// as the default (thinking off).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(ThinkingEffort::None),
+            "low" => Some(ThinkingEffort::Low),
+            "high" => Some(ThinkingEffort::High),
+            "max" => Some(ThinkingEffort::Max),
+            _ => None,
+        }
+    }
+}
+
 /// A single message in a chat conversation.
 ///
 /// Modelled as an enum per role because OpenAI-compatible messages
@@ -208,6 +255,11 @@ pub struct ChatRequest {
     /// `None` omits the field so the upstream model applies its own
     /// default; `Some(n)` caps the response size (and cost).
     pub max_tokens: Option<u64>,
+    /// DeepSeek thinking-mode effort. `Some(effort)` sends the
+    /// `thinking` toggle (and, for enabled levels, `reasoning_effort`);
+    /// `None` omits both so the upstream model applies its own default
+    /// (thinking enabled at high effort).
+    pub thinking_effort: Option<ThinkingEffort>,
 }
 
 impl ChatRequest {
@@ -217,6 +269,7 @@ impl ChatRequest {
             messages,
             tools: Vec::new(),
             max_tokens: None,
+            thinking_effort: None,
         }
     }
 
@@ -227,6 +280,14 @@ impl ChatRequest {
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set the DeepSeek thinking-mode effort for this request. Pass
+    /// [`ThinkingEffort::None`] to disable thinking mode, or an enabled
+    /// level to request chain-of-thought at that depth.
+    pub fn with_thinking_effort(mut self, effort: ThinkingEffort) -> Self {
+        self.thinking_effort = Some(effort);
         self
     }
 
@@ -247,6 +308,15 @@ impl DisplayJson for ChatRequest {
             if let Some(max_tokens) = self.max_tokens {
                 f.member("max_tokens", max_tokens)?;
             }
+            if let Some(effort) = self.thinking_effort {
+                match effort {
+                    ThinkingEffort::None => f.member("thinking", &ThinkingToggleDisabled)?,
+                    _ => {
+                        f.member("thinking", &ThinkingToggleEnabled)?;
+                        f.member("reasoning_effort", effort.as_str())?;
+                    }
+                }
+            }
             if !self.tools.is_empty() {
                 f.member("tools", &self.tools)?;
             }
@@ -260,6 +330,22 @@ struct StreamOptions;
 impl DisplayJson for StreamOptions {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| f.member("include_usage", true))
+    }
+}
+
+struct ThinkingToggleEnabled;
+
+impl DisplayJson for ThinkingToggleEnabled {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| f.member("type", "enabled"))
+    }
+}
+
+struct ThinkingToggleDisabled;
+
+impl DisplayJson for ThinkingToggleDisabled {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| f.member("type", "disabled"))
     }
 }
 
@@ -477,6 +563,47 @@ mod tests {
         let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())]);
         let json = request.to_json_string();
         assert!(!json.contains("max_tokens"), "unexpected: {json}");
+    }
+
+    #[test]
+    fn chat_request_omits_thinking_when_unset() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())]);
+        let json = request.to_json_string();
+        assert!(!json.contains("thinking"), "unexpected thinking: {json}");
+        assert!(
+            !json.contains("reasoning_effort"),
+            "unexpected effort: {json}"
+        );
+    }
+
+    #[test]
+    fn chat_request_serialises_thinking_disabled() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())])
+            .with_thinking_effort(ThinkingEffort::None);
+        let json = request.to_json_string();
+        assert!(
+            json.contains(r#""thinking":{"type":"disabled"}"#),
+            "unexpected: {json}"
+        );
+        assert!(
+            !json.contains("reasoning_effort"),
+            "unexpected effort: {json}"
+        );
+    }
+
+    #[test]
+    fn chat_request_serialises_thinking_enabled_high() {
+        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())])
+            .with_thinking_effort(ThinkingEffort::High);
+        let json = request.to_json_string();
+        assert!(
+            json.contains(r#""thinking":{"type":"enabled"}"#),
+            "unexpected: {json}"
+        );
+        assert!(
+            json.contains(r#""reasoning_effort":"high""#),
+            "unexpected: {json}"
+        );
     }
 
     #[test]

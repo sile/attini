@@ -129,10 +129,12 @@ pub fn run_show(name: &str) -> io::Result<()> {
     let summary = scan_conversation(&paths.conversation)?;
     let pending = read_pending_summary(&paths.pending)?;
     let plan_mode = crate::session::load_plan_mode(&paths.dir)?;
+    let thinking_effort = crate::session::load_thinking_effort(&paths.dir)?;
 
     println!("session: {name}");
     println!("  dir: {}", paths.dir.display());
     println!("  plan: {}", if plan_mode { "on" } else { "off" });
+    println!("  thinking: {}", thinking_effort.as_str());
     println!("  lock: {}", format_lock_status(lock));
     print_summary(&summary);
     match pending {

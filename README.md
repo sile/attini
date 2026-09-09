@@ -81,7 +81,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--plan=on|off] [--stdin] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--plan=on|off] [--thinking-effort none|low|high|max] [--stdin] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -120,6 +120,15 @@ and `--approve` / `--reject` still work. The flag persists in
 `.attini/<SESSION>/plan_mode` and is reflected in `attini session show`; omitting
 it leaves the session's current plan-mode state unchanged.
 
+`--thinking-effort none|low|high|max` sets the session's DeepSeek thinking-mode
+effort **persistently** (default `none`, i.e. chain-of-thought off). `none`
+disables thinking so no `reasoning_content` is produced and no reasoning is
+re-sent on tool-bearing requests; `low`/`high`/`max` enable chain-of-thought at
+that depth. It persists in `.attini/<SESSION>/thinking_effort`, is reflected in
+`attini session show` as `thinking: ...`, and is shown in the status line as
+`thinking=...` when enabled. Omit the flag to leave the session's current value
+unchanged.
+
 When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
@@ -129,8 +138,9 @@ stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
 `model=`/`session=` show which session/model is about to advance, `ctx=` is
 the **current** conversation size (the last recorded `prompt_tokens`, not the
-cumulative billed total), and `plan=on` appears when plan mode is active — so
-you can see how close the session is to compaction before it runs.
+cumulative billed total), `plan=on` appears when plan mode is active, and
+`thinking=low|high|max` appears when thinking mode is enabled — so you can see
+how close the session is to compaction before it runs.
 `ATTINI_STATUS_LINE=0` disables the line.
 
 ### Model selection

@@ -14,7 +14,7 @@ use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
-use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
+use crate::sansio::deepseek::{ChatMessage, ChatRequest, ThinkingEffort, ToolCall, ToolDef};
 use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
@@ -208,6 +208,10 @@ pub struct AgentConfig {
     /// for `--plan=on`, `Some(false)` for `--plan=off`. `None` leaves
     /// the session's current persisted plan-mode state unchanged.
     pub plan_override: Option<bool>,
+    /// When `Some`, the requested DeepSeek thinking-mode effort to set
+    /// (and persist) for this session at the start of the invocation.
+    /// `None` leaves the session's current persisted value unchanged.
+    pub thinking_effort_override: Option<ThinkingEffort>,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -246,6 +250,9 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     // current persisted state is left untouched.
     if let Some(on) = cfg.plan_override {
         session.set_plan_mode(on)?;
+    }
+    if let Some(effort) = cfg.thinking_effort_override {
+        session.set_thinking_effort(effort)?;
     }
     // Combine persistent extra_read_paths (from permissions.json) with
     // CLI --read-path overrides for this invocation, canonicalise
@@ -287,7 +294,13 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
         let ctx_tokens = session.latest_prompt_tokens().ok().flatten().unwrap_or(0);
         eprintln!(
             "{}",
-            render_agent_status_line(&cfg.model, &cfg.session_name, ctx_tokens, session.plan_mode)
+            render_agent_status_line(
+                &cfg.model,
+                &cfg.session_name,
+                ctx_tokens,
+                session.plan_mode,
+                session.thinking_effort,
+            )
         );
     }
 
@@ -335,11 +348,16 @@ fn render_agent_status_line(
     session_name: &str,
     ctx_tokens: u64,
     plan_mode: bool,
+    thinking_effort: ThinkingEffort,
 ) -> String {
     let plan = if plan_mode { " plan=on" } else { "" };
+    let think = match thinking_effort {
+        ThinkingEffort::None => String::new(),
+        other => format!(" thinking={}", other.as_str()),
+    };
     format!(
-        "[agent] model={} session={} ctx={}{}",
-        model, session_name, ctx_tokens, plan,
+        "[agent] model={} session={} ctx={}{}{}",
+        model, session_name, ctx_tokens, plan, think,
     )
 }
 
@@ -516,7 +534,8 @@ fn drive(
         gate.begin_turn();
         let request = ChatRequest::new(cfg.model.clone(), messages.clone())
             .with_tools(tools.clone())
-            .with_max_tokens(cfg.max_tokens);
+            .with_max_tokens(cfg.max_tokens)
+            .with_thinking_effort(session.thinking_effort);
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
         let call_result = {
@@ -2359,6 +2378,7 @@ mod tests {
             skill_path: None,
             authorization: Authorization::PerTool,
             plan_override: None,
+            thinking_effort_override: None,
         }
     }
 
@@ -2858,7 +2878,13 @@ mod tests {
 
     #[test]
     fn status_line_render_includes_session_and_ctx() {
-        let line = render_agent_status_line("deepseek-v4-flash", "main", 20736, false);
+        let line = render_agent_status_line(
+            "deepseek-v4-flash",
+            "main",
+            20736,
+            false,
+            ThinkingEffort::None,
+        );
         assert_eq!(
             line,
             "[agent] model=deepseek-v4-flash session=main ctx=20736"
@@ -2867,7 +2893,7 @@ mod tests {
 
     #[test]
     fn status_line_uses_passed_ctx_as_current_size() {
-        let line = render_agent_status_line("m", "s", 1000, false);
+        let line = render_agent_status_line("m", "s", 1000, false, ThinkingEffort::None);
         assert!(line.contains("ctx=1000"));
         assert!(line.contains("model=m"));
         assert!(line.contains("session=s"));
@@ -2875,9 +2901,22 @@ mod tests {
 
     #[test]
     fn status_line_appends_plan_marker_when_on() {
-        let line = render_agent_status_line("m", "s", 1000, true);
+        let line = render_agent_status_line("m", "s", 1000, true, ThinkingEffort::None);
         assert!(line.contains("plan=on"));
         assert!(line.ends_with("plan=on"));
+    }
+
+    #[test]
+    fn status_line_appends_thinking_marker_when_enabled() {
+        let line = render_agent_status_line("m", "s", 1000, false, ThinkingEffort::Low);
+        assert!(line.contains("thinking=low"));
+        assert!(line.ends_with("thinking=low"));
+    }
+
+    #[test]
+    fn status_line_omits_thinking_marker_when_off() {
+        let line = render_agent_status_line("m", "s", 1000, false, ThinkingEffort::None);
+        assert!(!line.contains("thinking"));
     }
 
     // -------------------------------------------------------------

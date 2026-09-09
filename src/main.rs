@@ -2,6 +2,7 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS, RateLimit};
+use attini::sansio::deepseek::ThinkingEffort;
 use attini::session_cmd;
 
 const EXIT_USAGE: u8 = 2;
@@ -346,6 +347,26 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         })
         .transpose()?;
 
+    let thinking_effort_override: Option<ThinkingEffort> = noargs::opt("thinking-effort")
+        .short('E')
+        .ty("none|low|high|max")
+        .doc(
+            "DeepSeek thinking-mode effort for this session: `none` disables chain-of-thought \
+             (the default), `low|high|max` enable it at that depth. Persists across \
+             invocations. Omit to leave the session's current value unchanged. \
+             When thinking is enabled, `reasoning_content` is produced and must be resent \
+             on subsequent tool-bearing requests; `none` avoids that bloat.",
+        )
+        .take(args)
+        .present_and_then(|o| o.value().parse::<String>())?
+        .map(|s| match ThinkingEffort::parse(&s) {
+            Some(effort) => Ok(effort),
+            None => Err(RunError::Runtime(format!(
+                "--thinking-effort must be 'none', 'low', 'high' or 'max', got '{s}'"
+            ))),
+        })
+        .transpose()?;
+
     let use_stdin = noargs::flag("stdin")
         .short('I')
         .doc(
@@ -446,6 +467,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         skill_path,
         authorization,
         plan_override,
+        thinking_effort_override,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
         agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
