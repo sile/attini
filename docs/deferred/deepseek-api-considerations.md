@@ -1,7 +1,7 @@
 # DeepSeek API design/implementation considerations
 
 **Status:** Partially implemented. Option 1 (`--thinking-effort`, default
-`none`) and Option 3 (`temperature: 0`, CLI `--temperature/-t` /
+`high`) and Option 3 (`temperature: 0`, CLI `--temperature/-t` /
 `ATTINI_TEMPERATURE`) are done. Options 2, 4, 5, 6 remain deferred.
 
 ## How this was produced
