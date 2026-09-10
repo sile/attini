@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
-use nojson::DisplayJson;
+use nojson::{DisplayJson, RawJson};
 
 use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
@@ -136,6 +136,14 @@ pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
 /// patch from flooding the terminal while still showing what changed
 /// for the common case.
 pub const PATCH_PREVIEW_MAX_LINES: usize = 200;
+
+/// Upper bound on the number of content lines printed for a `read`
+/// tool result on stderr. Beyond this the rest is collapsed into a
+/// `... (N more lines omitted)` marker, so a large read cannot flood
+/// the terminal while still showing the head of what was read. The
+/// JSON payload sent to the model is unaffected; this is display
+/// only.
+pub const READ_PREVIEW_MAX_LINES: usize = 20;
 
 /// Target number of real records to retain past the summary cutoff
 /// when compacting. Actual retention may be a little higher: the
@@ -1680,7 +1688,18 @@ fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> (String, String, boo
         Ok(inv) => {
             let args_summary = summarize_read_only(&inv);
             match executor.execute(inv) {
-                ToolOutcome::Ok(payload) => (format!("[{args_summary}] ok"), payload, false),
+                ToolOutcome::Ok(payload) => {
+                    let mut summary = format!("[{args_summary}] ok");
+                    // Echo the head of a `read` result to stderr so a
+                    // human can see what was read without opening the
+                    // file. Display only: the payload sent to the model
+                    // is unchanged.
+                    if let Some(preview) = read_content_preview(&payload) {
+                        summary.push('\n');
+                        summary.push_str(&preview);
+                    }
+                    (summary, payload, false)
+                }
                 ToolOutcome::Err(err) => (
                     format!("[{args_summary}] err: {}", short_err(&err)),
                     tool_error_json_from(&err),
@@ -1720,6 +1739,43 @@ fn summarize_read_only(inv: &ReadOnlyTool) -> String {
             None => format!(r#"search "{pattern}""#),
         },
     }
+}
+
+/// Render the head of a `read` result's `content` for stderr,
+/// capped at [`READ_PREVIEW_MAX_LINES`] lines with a
+/// `... (N more lines omitted)` marker. Returns `None` when the
+/// payload is not a readable object with a string `content` member
+/// (e.g. a `list` or `search` result), so callers can append it
+/// unconditionally. Never fails: display is best-effort.
+fn read_content_preview(payload: &str) -> Option<String> {
+    let json = RawJson::parse(payload).ok()?;
+    let content = json
+        .value()
+        .to_member("content")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .ok()?;
+    let mut out = String::new();
+    let mut shown: usize = 0;
+    let mut omitted: usize = 0;
+    for line in content.lines() {
+        if shown < READ_PREVIEW_MAX_LINES {
+            out.push_str("  | ");
+            out.push_str(line);
+            out.push('\n');
+            shown += 1;
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("  | ... ({omitted} more lines omitted)\n"));
+    }
+    // Trim the trailing newline so the caller controls spacing.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn short_err(err: &ToolExecutionError) -> String {
@@ -3196,5 +3252,38 @@ mod tests {
         assert!(out.contains("patch preview: 1 edit(s)"), "{out}");
         assert!(out.contains("    - old"), "{out}");
         assert!(out.contains("    + new"), "{out}");
+    }
+
+    // -------------------------------------------------------------
+    // read_content_preview
+    // -------------------------------------------------------------
+
+    #[test]
+    fn read_preview_renders_content_lines() {
+        let payload =
+            r#"{"content":"line one\nline two","start_line":1,"end_line":2,"truncated":false}"#;
+        let out = read_content_preview(payload).expect("preview");
+        assert!(out.contains("  | line one"), "{out}");
+        assert!(out.contains("  | line two"), "{out}");
+    }
+
+    #[test]
+    fn read_preview_caps_and_notes_omissions() {
+        let many: String = (0..(READ_PREVIEW_MAX_LINES + 7))
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let payload =
+            format!(r#"{{"content":"{many}","start_line":1,"end_line":1,"truncated":false}}"#);
+        let out = read_content_preview(&payload).expect("preview");
+        assert!(out.contains("7 more lines omitted"), "{out}");
+        assert!(out.lines().count() <= READ_PREVIEW_MAX_LINES + 1, "{out}");
+    }
+
+    #[test]
+    fn read_preview_is_none_for_non_read_payloads() {
+        // A list/search result has no `content` member.
+        assert!(read_content_preview(r#"{"entries":[],"truncated":false}"#).is_none());
+        assert!(read_content_preview("not json").is_none());
     }
 }
