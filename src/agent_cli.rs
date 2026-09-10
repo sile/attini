@@ -1860,19 +1860,35 @@ fn dispatch_patch_unapproved(
         Ok(PatchDispatch::Continue)
     } else {
         let mut preview_text = render_patch_preview_text(&preview, &inv);
+        let plan_marker = if session.plan_mode { " (plan)" } else { "" };
         if session.plan_mode {
             preview_text = format!("(plan) {preview_text}");
-            eprintln!("[patch] approval required (plan)");
-        } else {
-            eprintln!("[patch] approval required");
         }
+        eprintln!("[patch] approval required{plan_marker}");
         eprintln!("{preview_text}");
+        // Re-state the approval request after the (possibly long) diff so the
+        // decision prompt lands at the bottom of the terminal, next to the
+        // summary the human needs, instead of being pushed off-screen by the
+        // diff body.
+        eprintln!("{}", render_patch_approval_footer(&preview, plan_marker));
         Ok(PatchDispatch::Awaiting(build_pending(
             tc,
             PendingToolKind::Patch,
             preview_text,
         )))
     }
+}
+
+/// One-line approval restatement shown after the diff body, so the human can
+/// decide without scrolling back up past the diff.
+fn render_patch_approval_footer(p: &PatchPreview, plan_marker: &str) -> String {
+    format!(
+        "[patch] approval required{plan_marker}: {} edit(s) across {} file(s), +{} / -{} lines",
+        p.edit_count,
+        p.target_paths.len(),
+        p.added_lines,
+        p.removed_lines
+    )
 }
 
 fn render_patch_preview_text(p: &PatchPreview, inv: &PatchInvocation) -> String {
@@ -3252,6 +3268,27 @@ mod tests {
         assert!(out.contains("patch preview: 1 edit(s)"), "{out}");
         assert!(out.contains("    - old"), "{out}");
         assert!(out.contains("    + new"), "{out}");
+    }
+
+    #[test]
+    fn patch_approval_footer_restates_summary() {
+        let preview = PatchPreview {
+            target_paths: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            added_lines: 3,
+            removed_lines: 1,
+            edit_count: 2,
+            auto_approve: false,
+        };
+        let plain = render_patch_approval_footer(&preview, "");
+        assert_eq!(
+            plain,
+            "[patch] approval required: 2 edit(s) across 2 file(s), +3 / -1 lines"
+        );
+        let plan = render_patch_approval_footer(&preview, " (plan)");
+        assert!(
+            plan.starts_with("[patch] approval required (plan): "),
+            "{plan}"
+        );
     }
 
     // -------------------------------------------------------------
