@@ -164,6 +164,14 @@ how close the session is to compaction before it runs.
 `patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
 after approval.
 
+**Tool call batching:** the model may emit several tool calls in one turn. When a
+turn contains an approval-gated call (a `command`, or a `patch` on a non-tracked
+path), any tool call ordered *after* it in the same turn is left unanswered and
+cancelled on the next resume by the orphan-repair pass, so the model has to
+reissue it. attini therefore instructs the model to place an approval-gated call
+last in the turn (or emit it alone); read-only calls may be freely batched and may
+precede an approval-gated call.
+
 For longer tasks the model may keep its own working notes under the session's
 scratchpad directory (`.attini/{NAME}/scratchpad/`) using `patch`; those files are
 not tracked by git and never appear in `git diff`. Because they are non-tracked,

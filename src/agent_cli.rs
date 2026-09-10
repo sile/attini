@@ -841,6 +841,7 @@ fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Ve
     messages.push(ChatMessage::System(render_scratchpad_note(
         &cfg.session_name,
     )));
+    messages.push(ChatMessage::System(render_tool_batching_note()));
     if session.plan_mode {
         messages.push(ChatMessage::System(render_plan_mode_note()));
     }
@@ -883,6 +884,27 @@ fn render_scratchpad_note(session_name: &str) -> String {
          not tracked, `patch` writes are permitted but are shown for approval, \
          like any other non-tracked write.\n"
     )
+}
+
+/// Tell the model how to batch tool calls within a single turn so a
+/// read-only call is not stranded behind an approval-gated one. When
+/// a turn emits a call that needs approval (a `command`, or a `patch`
+/// on a non-tracked path), any tool call ordered after it in the same
+/// turn is left unanswered and later cancelled by the orphan-repair
+/// pass — the model receives no result for it and must reissue it.
+/// Emitting approval-gated calls last (or alone) avoids the wasted
+/// round trip.
+fn render_tool_batching_note() -> String {
+    "# Tool call batching\n\n\
+     You may emit several tool calls in one turn. However, if any of them \
+     requires human approval — a `command`, or a `patch` on a non-tracked \
+     path — place it **last** in the turn, or emit it alone. Any tool call \
+     ordered after an approval-gated one (including a read-only `read`, \
+     `search`, or `list`) is left unanswered and cancelled on resume, so \
+     you would have to reissue it. Read-only calls may be freely batched \
+     together, and may precede an approval-gated call; just do not put \
+     them after one.\n"
+        .to_string()
 }
 
 /// Resolve and load a CLI-selected skill path. Called at the start of
@@ -3023,5 +3045,20 @@ mod tests {
         assert!(note.contains("git-tracked"));
         assert!(note.contains("explicit human approval"));
         assert!(note.contains("do not assume any edit is auto-approved"));
+    }
+
+    // -------------------------------------------------------------
+    // render_tool_batching_note
+    // -------------------------------------------------------------
+
+    #[test]
+    fn tool_batching_note_forbids_read_only_after_approval_gated_call() {
+        let note = render_tool_batching_note();
+        assert!(note.contains("Tool call batching"));
+        assert!(note.contains("approval"));
+        assert!(note.contains("last"));
+        assert!(note.contains("read"));
+        assert!(note.contains("search"));
+        assert!(note.contains("do not put"));
     }
 }
