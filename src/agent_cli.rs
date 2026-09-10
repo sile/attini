@@ -11,7 +11,7 @@ use nojson::DisplayJson;
 use crate::curl::{self, ProgressSinks};
 use crate::permissions::{self, LoadedRules};
 use crate::sansio::agent::{
-    CommandError, CommandInvocation, PatchInvocation, PatchPreview, ReadOnlyTool,
+    CommandError, CommandInvocation, PatchInvocation, PatchPreview, PatchTool, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ThinkingEffort, ToolCall, ToolDef};
@@ -129,6 +129,13 @@ impl Counters {
 /// leaves room for the next turn's growth plus the memory tier, tool
 /// definitions, and the summarizer's own input.
 pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
+
+/// Upper bound on the number of diff lines printed for a patch
+/// preview / auto-approved patch. Beyond this the rest is collapsed
+/// into a `... (N more lines omitted)` marker. Keeps a pathological
+/// patch from flooding the terminal while still showing what changed
+/// for the common case.
+pub const PATCH_PREVIEW_MAX_LINES: usize = 200;
 
 /// Target number of real records to retain past the summary cutoff
 /// when compacting. Actual retention may be a little higher: the
@@ -1783,6 +1790,7 @@ fn dispatch_patch_unapproved(
                         "[patch] auto-approved: {} file(s) (git-tracked)",
                         paths.len()
                     );
+                    eprintln!("{}", render_patch_diff(&inv));
                     append_tool(session, messages, &tc.id, patch_result_json(&paths))?;
                 }
                 Err(e) => {
@@ -1795,7 +1803,7 @@ fn dispatch_patch_unapproved(
         }
         Ok(PatchDispatch::Continue)
     } else {
-        let mut preview_text = render_patch_preview_text(&preview);
+        let mut preview_text = render_patch_preview_text(&preview, &inv);
         if session.plan_mode {
             preview_text = format!("(plan) {preview_text}");
             eprintln!("[patch] approval required (plan)");
@@ -1811,7 +1819,7 @@ fn dispatch_patch_unapproved(
     }
 }
 
-fn render_patch_preview_text(p: &PatchPreview) -> String {
+fn render_patch_preview_text(p: &PatchPreview, inv: &PatchInvocation) -> String {
     let mut out = format!(
         "patch preview: {} edit(s) across {} file(s), +{} / -{} lines",
         p.edit_count,
@@ -1822,6 +1830,63 @@ fn render_patch_preview_text(p: &PatchPreview) -> String {
     for path in &p.target_paths {
         out.push_str("\n  ");
         out.push_str(path);
+    }
+    out.push('\n');
+    out.push_str(&render_patch_diff(inv));
+    out
+}
+
+/// Render a readable per-edit diff body (no hunk headers): each
+/// `before` line as `- ...` and each `after` line as `+ ...`, with
+/// `Add` content all `+`. Output is capped at
+/// [`PATCH_PREVIEW_MAX_LINES`] lines so a pathological patch cannot
+/// flood the terminal; the overflow is summarised as
+/// `... (N more lines omitted)`.
+fn render_patch_diff(inv: &PatchInvocation) -> String {
+    let mut out = String::new();
+    let mut shown: usize = 0;
+    let mut omitted: usize = 0;
+    // A line counts toward the cap if it carries a `-`/`+`/header;
+    // this keeps the accounting honest even across many edits.
+    let push = |out: &mut String, shown: &mut usize, omitted: &mut usize, line: String| {
+        if *shown < PATCH_PREVIEW_MAX_LINES {
+            out.push_str(&line);
+            out.push('\n');
+            *shown += 1;
+        } else {
+            *omitted += 1;
+        }
+    };
+    for edit in &inv.edits {
+        match edit {
+            PatchTool::Add { path, content } => {
+                push(&mut out, &mut shown, &mut omitted, format!("  add {path}"));
+                for line in content.lines() {
+                    push(&mut out, &mut shown, &mut omitted, format!("    + {line}"));
+                }
+            }
+            PatchTool::Update {
+                path,
+                before,
+                after,
+            } => {
+                push(
+                    &mut out,
+                    &mut shown,
+                    &mut omitted,
+                    format!("  update {path}"),
+                );
+                for line in before.lines() {
+                    push(&mut out, &mut shown, &mut omitted, format!("    - {line}"));
+                }
+                for line in after.lines() {
+                    push(&mut out, &mut shown, &mut omitted, format!("    + {line}"));
+                }
+            }
+        }
+    }
+    if omitted > 0 {
+        out.push_str(&format!("    ... ({omitted} more lines omitted)\n"));
     }
     out
 }
@@ -3060,5 +3125,76 @@ mod tests {
         assert!(note.contains("read"));
         assert!(note.contains("search"));
         assert!(note.contains("do not put"));
+    }
+
+    // -------------------------------------------------------------
+    // render_patch_diff / render_patch_preview_text
+    // -------------------------------------------------------------
+
+    fn patch_inv(edits: Vec<PatchTool>) -> PatchInvocation {
+        PatchInvocation { edits }
+    }
+
+    #[test]
+    fn patch_diff_shows_before_and_after_lines() {
+        let inv = patch_inv(vec![PatchTool::Update {
+            path: "src/a.rs".to_string(),
+            before: "let x = 1;\nlet y = 2;".to_string(),
+            after: "let x = 1;\nlet y = 3;".to_string(),
+        }]);
+        let out = render_patch_diff(&inv);
+        assert!(out.contains("  update src/a.rs"), "{out}");
+        assert!(out.contains("    - let y = 2;"), "{out}");
+        assert!(out.contains("    + let y = 3;"), "{out}");
+    }
+
+    #[test]
+    fn patch_diff_shows_add_content() {
+        let inv = patch_inv(vec![PatchTool::Add {
+            path: "src/new.rs".to_string(),
+            content: "fn main() {}".to_string(),
+        }]);
+        let out = render_patch_diff(&inv);
+        assert!(out.contains("  add src/new.rs"), "{out}");
+        assert!(out.contains("    + fn main() {}"), "{out}");
+    }
+
+    #[test]
+    fn patch_diff_caps_output_and_notes_omissions() {
+        let many: String = (0..(PATCH_PREVIEW_MAX_LINES + 50))
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let inv = patch_inv(vec![PatchTool::Add {
+            path: "big.txt".to_string(),
+            content: many,
+        }]);
+        let out = render_patch_diff(&inv);
+        assert!(out.contains("more lines omitted"), "{out}");
+        // The cap applies to body lines; total printed lines are bounded.
+        assert!(
+            out.lines().count() <= PATCH_PREVIEW_MAX_LINES + 1,
+            "printed {} lines",
+            out.lines().count()
+        );
+    }
+
+    #[test]
+    fn patch_preview_text_includes_diff() {
+        let inv = patch_inv(vec![PatchTool::Update {
+            path: "src/a.rs".to_string(),
+            before: "old".to_string(),
+            after: "new".to_string(),
+        }]);
+        let preview = PatchPreview {
+            target_paths: vec!["src/a.rs".to_string()],
+            added_lines: 1,
+            removed_lines: 1,
+            edit_count: 1,
+            auto_approve: true,
+        };
+        let out = render_patch_preview_text(&preview, &inv);
+        assert!(out.contains("patch preview: 1 edit(s)"), "{out}");
+        assert!(out.contains("    - old"), "{out}");
+        assert!(out.contains("    + new"), "{out}");
     }
 }
