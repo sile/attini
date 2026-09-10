@@ -1076,7 +1076,9 @@ decisions, files/symbols in play, and any tool call awaiting approval. If a ques
 is appended, answer that question specifically. Otherwise produce a short status \
 summary (~300 words) of the current state, in third person. Never begin with an \
 action verb such as 'I will / I am going to / let's'. Do not comment on the \
-instruction itself; produce only the answer. A prior observer answer may be included \
+instruction itself; produce only the answer. Answer in the same language the session \
+transcript is written in (if the transcript mixes languages, use its dominant \
+language), even when no question is appended. A prior observer answer may be included \
     below as context: treat it as a hint only and always let the transcript below \
     override it.";
 
