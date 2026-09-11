@@ -108,14 +108,14 @@ fn inv(edits: Vec<PatchTool>) -> PatchInvocation {
 // -----------------------------------------------------------------
 
 #[test]
-fn preview_add_produces_hash_none_and_line_stats() {
+fn preview_add_produces_content_none_and_line_stats() {
     let root = TempRoot::new("preview-add");
-    let (hashes, preview) = exec(&root)
+    let (snapshots, preview) = exec(&root)
         .preview_patch(&inv(vec![add("new.txt", "one\ntwo\n")]))
         .expect("preview ok");
-    assert_eq!(hashes.len(), 1);
-    assert_eq!(hashes[0].path, "new.txt");
-    assert_eq!(hashes[0].sha256, None);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].path, "new.txt");
+    assert_eq!(snapshots[0].content, None);
     assert_eq!(preview.added_lines, 2);
     assert_eq!(preview.removed_lines, 0);
     assert_eq!(preview.edit_count, 1);
@@ -123,13 +123,16 @@ fn preview_add_produces_hash_none_and_line_stats() {
 }
 
 #[test]
-fn preview_update_returns_sha256_of_existing_file() {
+fn preview_update_returns_content_of_existing_file() {
     let root = TempRoot::new("preview-update");
     root.write("a.txt", b"hello\nworld\n");
-    let (hashes, preview) = exec(&root)
+    let (snapshots, preview) = exec(&root)
         .preview_patch(&inv(vec![update("a.txt", "world", "rust")]))
         .expect("preview ok");
-    assert!(hashes[0].sha256.is_some());
+    assert_eq!(
+        snapshots[0].content.as_deref(),
+        Some(b"hello\nworld\n".as_slice())
+    );
     assert_eq!(preview.removed_lines, 1);
     assert_eq!(preview.added_lines, 1);
 }

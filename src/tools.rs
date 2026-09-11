@@ -15,11 +15,10 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use nojson::{DisplayJson, Json, JsonFormatter};
-use sha2::{Digest, Sha256};
 
 use crate::sansio::agent::{
     DEFAULT_LIST_MAX_ENTRIES, DEFAULT_SEARCH_MAX_RESULTS, PATCH_MAX_FILE_BYTES, PatchError,
-    PatchInvocation, PatchPreview, PatchTool, PreviewHash, READ_MAX_BYTES, ReadOnlyTool,
+    PatchInvocation, PatchPreview, PatchTool, PreviewContent, READ_MAX_BYTES, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
 
@@ -117,15 +116,15 @@ impl ToolExecutor {
     }
 
     /// Read every target file (Update) and check every target does
-    /// not exist (Add), then produce the SHA-256 hashes and diff
+    /// not exist (Add), then produce the byte snapshots and diff
     /// summary that the [`AgentCore`](crate::sansio::agent::AgentCore)
     /// needs to enter approval mode. Does NOT write anything to the
     /// filesystem.
     pub fn preview_patch(
         &self,
         invocation: &PatchInvocation,
-    ) -> Result<(Vec<PreviewHash>, PatchPreview), PatchError> {
-        let mut hashes = Vec::with_capacity(invocation.edits.len());
+    ) -> Result<(Vec<PreviewContent>, PatchPreview), PatchError> {
+        let mut snapshots = Vec::with_capacity(invocation.edits.len());
         let mut added_lines: u64 = 0;
         let mut removed_lines: u64 = 0;
         let mut target_paths: Vec<String> = Vec::with_capacity(invocation.edits.len());
@@ -141,9 +140,9 @@ impl ToolExecutor {
                     if full.exists() {
                         return Err(PatchError::AddOnExistingFile { path: path.clone() });
                     }
-                    hashes.push(PreviewHash {
+                    snapshots.push(PreviewContent {
                         path: path.clone(),
-                        sha256: None,
+                        content: None,
                     });
                     added_lines += line_count(content);
                 }
@@ -160,10 +159,9 @@ impl ToolExecutor {
                         auto_approve = false;
                     }
                     let bytes = read_file_capped(&full, path)?;
-                    let hash: [u8; 32] = Sha256::digest(&bytes).into();
-                    hashes.push(PreviewHash {
+                    snapshots.push(PreviewContent {
                         path: path.clone(),
-                        sha256: Some(hash),
+                        content: Some(bytes.clone()),
                     });
                     let matches = count_occurrences(&bytes, before.as_bytes());
                     match matches {
@@ -191,7 +189,7 @@ impl ToolExecutor {
             edit_count: invocation.edits.len() as u64,
             auto_approve,
         };
-        Ok((hashes, preview))
+        Ok((snapshots, preview))
     }
 
     /// Whether an already-canonical absolute `canon` path is tracked
@@ -210,10 +208,10 @@ impl ToolExecutor {
     /// Apply all edits atomically in two phases (see `0007` design):
     ///
     /// - **Phase 1**: verify each target is in the same state as it
-    ///   was at preview time (SHA-256 for Update, non-existence for
-    ///   Add), then write every new content to a per-target `.tmp`
-    ///   file. Any failure here aborts and deletes every `.tmp` file
-    ///   already written.
+    ///   was at preview time (exact byte equality for Update,
+    ///   non-existence for Add), then write every new content to a
+    ///   per-target `.tmp` file. Any failure here aborts and deletes
+    ///   every `.tmp` file already written.
     /// - **Phase 2**: rename each `.tmp` into its target in order.
     ///   Failure in phase 2 is treated as a rare filesystem
     ///   inconsistency: the remaining `.tmp` files are cleaned up but
@@ -222,14 +220,14 @@ impl ToolExecutor {
     pub fn apply_patch(
         &self,
         invocation: &PatchInvocation,
-        preview_hashes: &[PreviewHash],
+        preview_content: &[PreviewContent],
     ) -> Result<Vec<PathBuf>, PatchError> {
         struct Prepared {
             target: PathBuf,
             tmp: PathBuf,
         }
         let mut prepared: Vec<Prepared> = Vec::with_capacity(invocation.edits.len());
-        for (edit, expected_hash) in invocation.edits.iter().zip(preview_hashes.iter()) {
+        for (edit, snapshot) in invocation.edits.iter().zip(preview_content.iter()) {
             let step = || -> Result<Prepared, PatchError> {
                 match edit {
                     PatchTool::Add { path, content } => {
@@ -248,11 +246,11 @@ impl ToolExecutor {
                     } => {
                         let full = self.resolve_update_target(path)?;
                         let bytes = read_file_capped(&full, path)?;
-                        let hash: [u8; 32] = Sha256::digest(&bytes).into();
-                        let expected = expected_hash
-                            .sha256
+                        let expected = snapshot
+                            .content
+                            .as_deref()
                             .ok_or_else(|| PatchError::Conflict { path: path.clone() })?;
-                        if expected != hash {
+                        if expected != bytes.as_slice() {
                             return Err(PatchError::Conflict { path: path.clone() });
                         }
                         let matches = count_occurrences(&bytes, before.as_bytes());

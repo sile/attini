@@ -5,7 +5,7 @@
 //! contract holds after every step.
 
 use attini::sansio::agent::{
-    Action, AgentCore, CommandOutputStream, Event, PatchPreview, PreviewHash, RequestId, Status,
+    Action, AgentCore, CommandOutputStream, Event, PatchPreview, PreviewContent, RequestId, Status,
     ToolExecutionError, ToolOutcome,
 };
 use attini::sansio::deepseek::ChatMessage;
@@ -174,9 +174,9 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
         "patch_preview_ready" => Event::PatchPreviewReady {
             request: sample_request_id(ctx, core),
             call_id: sample_call_id(ctx, core),
-            preview_hashes: vec![PreviewHash {
+            preview_content: vec![PreviewContent {
                 path: "pbt.txt".to_string(),
-                sha256: None,
+                content: None,
             }],
             preview: PatchPreview {
                 target_paths: vec!["pbt.txt".to_string()],

@@ -732,13 +732,18 @@ impl CommandError {
     }
 }
 
-/// SHA-256 digest of a file captured at [`PatchTool::Update`] preview
-/// time. `sha256` is `None` for [`PatchTool::Add`] paths (whose apply-
-/// time check is "the file must NOT exist" rather than a hash match).
+/// Snapshot of a file's bytes captured at [`PatchTool::Update`]
+/// preview time. `content` is `None` for [`PatchTool::Add`] paths
+/// (whose apply-time check is "the file must NOT exist" rather than
+/// a content match).
+///
+/// The apply-time check compares these bytes for exact equality, so
+/// there is no hash-collision surface; `content` is a plain byte
+/// snapshot, not a digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreviewHash {
+pub struct PreviewContent {
     pub path: String,
-    pub sha256: Option<[u8; 32]>,
+    pub content: Option<Vec<u8>>,
 }
 
 /// TUI-facing summary of an incoming patch, computed on the shell
@@ -966,13 +971,13 @@ pub enum Event {
         call_id: String,
         outcome: ToolOutcome,
     },
-    /// Shell has computed the target file hashes and diff summary for
-    /// a patch call and is waiting for user approval. Transitions the
-    /// core to [`Status::AwaitingApproval`].
+    /// Shell has computed the target file snapshots and diff summary
+    /// for a patch call and is waiting for user approval. Transitions
+    /// the core to [`Status::AwaitingApproval`].
     PatchPreviewReady {
         request: RequestId,
         call_id: String,
-        preview_hashes: Vec<PreviewHash>,
+        preview_content: Vec<PreviewContent>,
         preview: PatchPreview,
     },
     /// User approved the approval-mode preview for `call_id`. The
@@ -1024,7 +1029,7 @@ pub enum Action {
         call_id: String,
         invocation: ReadOnlyTool,
     },
-    /// Compute the target file SHA-256 hashes and diff summary for
+    /// Compute the target file snapshots and diff summary for
     /// `invocation` and deliver them back as
     /// [`Event::PatchPreviewReady`] so the core can enter approval
     /// mode. The shell must not touch the filesystem yet.
@@ -1034,7 +1039,7 @@ pub enum Action {
         invocation: PatchInvocation,
     },
     /// User approved the patch preview; apply the 2-phase writeback
-    /// using `preview_hashes` to detect concurrent modifications
+    /// using `preview_content` to detect concurrent modifications
     /// between preview and apply. `invocation` is re-parsed from the
     /// tool call arguments so the shell does not need to cache it
     /// between preview and approval.
@@ -1042,7 +1047,7 @@ pub enum Action {
         request: RequestId,
         call_id: String,
         invocation: PatchInvocation,
-        preview_hashes: Vec<PreviewHash>,
+        preview_content: Vec<PreviewContent>,
     },
     /// User approved the command preview; run the shell command,
     /// stream stdout/stderr back via [`Event::CommandOutputChunk`],
@@ -1140,9 +1145,9 @@ struct PendingToolResult {
     /// for patch tools before the shell has produced a preview.
     patch_preview: Option<PatchPreview>,
     /// Populated together with `patch_preview`. Retained here so
-    /// [`Event::ApproveToolCall`] can hand the same hashes back to
+    /// [`Event::ApproveToolCall`] can hand the same snapshots back to
     /// the shell as [`Action::ApplyPatch`] without a round trip.
-    preview_hashes: Vec<PreviewHash>,
+    preview_content: Vec<PreviewContent>,
     /// Populated at `on_finish` for command tool calls. Drives the
     /// approval-mode label content in the TUI.
     command_preview: Option<CommandPreview>,
@@ -1174,10 +1179,11 @@ pub struct ActiveToolCall {
     /// non-patch tools or patch tools whose preview has not yet
     /// arrived.
     pub patch_preview: Option<PatchPreview>,
-    /// SHA-256 hashes captured at preview time. Empty for non-patch
-    /// tools; the TUI does not display them (they exist only so the
-    /// core can hand them to [`Action::ApplyPatch`] on approval).
-    pub preview_hashes: Vec<PreviewHash>,
+    /// File-content snapshots captured at preview time. Empty for
+    /// non-patch tools; the TUI does not display them (they exist only
+    /// so the core can hand them to [`Action::ApplyPatch`] on
+    /// approval).
+    pub preview_content: Vec<PreviewContent>,
     /// Approval-mode label content for command tool calls. `None`
     /// for other tool kinds.
     pub command_preview: Option<CommandPreview>,
@@ -1285,7 +1291,7 @@ pub struct AgentMetrics {
     /// (parsed successfully, within the shared turn/arguments limits).
     pub patch_calls_previewed: Counter,
     /// [`Event::PatchPreviewReady`] whose `call_id` matched an
-    /// outstanding patch call; the diff summary and hashes were
+    /// outstanding patch call; the diff summary and snapshots were
     /// stored on the pending tool result approval bumped to `Pending`,
     /// and the phase transitioned to `AwaitingApproval`.
     pub patch_previews_committed: Counter,
@@ -1392,7 +1398,7 @@ impl AgentCore {
                     is_streaming: true,
                     approval: ApprovalState::NotRequired,
                     patch_preview: None,
-                    preview_hashes: Vec::new(),
+                    preview_content: Vec::new(),
                     command_preview: None,
                     command_output_tail: None,
                 })
@@ -1408,7 +1414,7 @@ impl AgentCore {
                     is_streaming: false,
                     approval: r.approval,
                     patch_preview: r.patch_preview.clone(),
-                    preview_hashes: r.preview_hashes.clone(),
+                    preview_content: r.preview_content.clone(),
                     command_preview: r.command_preview.clone(),
                     command_output_tail: r.command_output_tail.clone(),
                 })
@@ -1445,9 +1451,9 @@ impl AgentCore {
             Event::PatchPreviewReady {
                 request,
                 call_id,
-                preview_hashes,
+                preview_content,
                 preview,
-            } => self.on_patch_preview_ready(request, call_id, preview_hashes, preview),
+            } => self.on_patch_preview_ready(request, call_id, preview_content, preview),
             Event::ApproveToolCall { call_id } => self.on_approve_tool_call(call_id),
             Event::RejectToolCall { call_id } => self.on_reject_tool_call(call_id),
             Event::CommandOutputChunk {
@@ -1767,7 +1773,7 @@ impl AgentCore {
         &mut self,
         request: RequestId,
         call_id: String,
-        preview_hashes: Vec<PreviewHash>,
+        preview_content: Vec<PreviewContent>,
         preview: PatchPreview,
     ) -> Vec<Action> {
         let Some(pending) = self.pending.as_mut() else {
@@ -1788,7 +1794,7 @@ impl AgentCore {
             return Vec::new();
         };
         entry.patch_preview = Some(preview);
-        entry.preview_hashes = preview_hashes;
+        entry.preview_content = preview_content;
         entry.approval = ApprovalState::Pending;
         self.metrics.patch_previews_committed.inc();
         self.recompute_phase_and_status();
@@ -1816,13 +1822,13 @@ impl AgentCore {
         // moving.
         let action = match entry.function_name.as_str() {
             "patch" => {
-                let preview_hashes = entry.preview_hashes.clone();
+                let preview_content = entry.preview_content.clone();
                 match PatchInvocation::parse(&entry.arguments_json) {
                     Ok(invocation) => Action::ApplyPatch {
                         request: request_id,
                         call_id: call_id.clone(),
                         invocation,
-                        preview_hashes,
+                        preview_content,
                     },
                     Err(err) => {
                         entry.outcome = Some(ToolOutcome::Err(err));
@@ -2066,7 +2072,7 @@ fn synthetic_err_result(call: ToolCall, err: ToolExecutionError) -> PendingToolR
         arguments_json: call.arguments_json,
         approval: ApprovalState::NotRequired,
         patch_preview: None,
-        preview_hashes: Vec::new(),
+        preview_content: Vec::new(),
         command_preview: None,
         command_output_tail: None,
         outcome: Some(ToolOutcome::Err(err)),
@@ -2080,7 +2086,7 @@ fn read_only_pending_result(call: ToolCall) -> PendingToolResult {
         arguments_json: call.arguments_json,
         approval: ApprovalState::NotRequired,
         patch_preview: None,
-        preview_hashes: Vec::new(),
+        preview_content: Vec::new(),
         command_preview: None,
         command_output_tail: None,
         outcome: None,
@@ -2094,7 +2100,7 @@ fn patch_pending_result(call: ToolCall) -> PendingToolResult {
         arguments_json: call.arguments_json,
         approval: ApprovalState::NotRequired,
         patch_preview: None,
-        preview_hashes: Vec::new(),
+        preview_content: Vec::new(),
         command_preview: None,
         command_output_tail: None,
         outcome: None,
@@ -2125,7 +2131,7 @@ fn command_pending_result(call: ToolCall, preview: CommandPreview) -> PendingToo
         arguments_json: call.arguments_json,
         approval: ApprovalState::Pending,
         patch_preview: None,
-        preview_hashes: Vec::new(),
+        preview_content: Vec::new(),
         command_preview: Some(preview),
         command_output_tail: None,
         outcome: None,
@@ -3192,9 +3198,9 @@ mod tests {
         let id = last_start_id(&user(&mut core, "hi"));
         let _ = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
 
-        let hash = PreviewHash {
+        let snapshot = PreviewContent {
             path: "new.txt".to_string(),
-            sha256: None,
+            content: None,
         };
         let preview = PatchPreview {
             target_paths: vec!["new.txt".to_string()],
@@ -3206,7 +3212,7 @@ mod tests {
         let actions = core.handle_event(Event::PatchPreviewReady {
             request: id,
             call_id: "p1".to_string(),
-            preview_hashes: vec![hash],
+            preview_content: vec![snapshot],
             preview,
         });
 
@@ -3222,18 +3228,18 @@ mod tests {
     }
 
     #[test]
-    fn patch_approve_emits_apply_patch_with_stored_hashes() {
+    fn patch_approve_emits_apply_patch_with_stored_snapshots() {
         let mut core = AgentCore::new();
         let id = last_start_id(&user(&mut core, "hi"));
         let _ = drive_single_patch_call(&mut core, id, "p1", valid_add_patch_json());
-        let hash = PreviewHash {
+        let snapshot = PreviewContent {
             path: "new.txt".to_string(),
-            sha256: Some([7u8; 32]),
+            content: Some(b"before".to_vec()),
         };
         let _ = core.handle_event(Event::PatchPreviewReady {
             request: id,
             call_id: "p1".to_string(),
-            preview_hashes: vec![hash.clone()],
+            preview_content: vec![snapshot.clone()],
             preview: PatchPreview::default(),
         });
 
@@ -3246,14 +3252,14 @@ mod tests {
             .find_map(|a| match a {
                 Action::ApplyPatch {
                     call_id,
-                    preview_hashes,
+                    preview_content,
                     ..
-                } => Some((call_id.clone(), preview_hashes.clone())),
+                } => Some((call_id.clone(), preview_content.clone())),
                 _ => None,
             })
             .expect("ApplyPatch emitted");
         assert_eq!(apply.0, "p1");
-        assert_eq!(apply.1, vec![hash]);
+        assert_eq!(apply.1, vec![snapshot]);
         assert_eq!(core.metrics().tool_call_approvals_committed.get(), 1);
         // Approved but not yet resolved — approval left, phase now ToolRunning.
         assert_eq!(core.status(), Status::ToolRunning);
@@ -3268,7 +3274,7 @@ mod tests {
         let _ = core.handle_event(Event::PatchPreviewReady {
             request: id,
             call_id: "p1".to_string(),
-            preview_hashes: Vec::new(),
+            preview_content: Vec::new(),
             preview: PatchPreview::default(),
         });
 
@@ -3312,7 +3318,7 @@ mod tests {
         let actions = core.handle_event(Event::PatchPreviewReady {
             request: id,
             call_id: "does_not_exist".to_string(),
-            preview_hashes: Vec::new(),
+            preview_content: Vec::new(),
             preview: PatchPreview::default(),
         });
         assert!(actions.is_empty());
@@ -3347,7 +3353,7 @@ mod tests {
         let _ = core.handle_event(Event::PatchPreviewReady {
             request: id,
             call_id: "p1".to_string(),
-            preview_hashes: Vec::new(),
+            preview_content: Vec::new(),
             preview: PatchPreview::default(),
         });
         assert_eq!(core.status(), Status::AwaitingApproval);

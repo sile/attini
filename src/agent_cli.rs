@@ -1828,7 +1828,7 @@ fn dispatch_patch_unapproved(
             return Ok(PatchDispatch::Continue);
         }
     };
-    let (hashes, preview) = match executor.preview_patch(&inv) {
+    let (preview_content, preview) = match executor.preview_patch(&inv) {
         Ok(x) => x,
         Err(e) => {
             if !dry_run {
@@ -1842,7 +1842,7 @@ fn dispatch_patch_unapproved(
     };
     if preview.auto_approve && !session.plan_mode {
         if !dry_run {
-            match executor.apply_patch(&inv, &hashes) {
+            match executor.apply_patch(&inv, &preview_content) {
                 Ok(paths) => {
                     eprintln!(
                         "[patch] auto-approved: {} file(s) (git-tracked)",
@@ -1987,11 +1987,11 @@ fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<Str
                 Ok(inv) => inv,
                 Err(e) => return Ok(tool_error_json("patch_args", &format!("{e:?}"))),
             };
-            let (hashes, _preview) = match executor.preview_patch(&inv) {
+            let (preview_content, _preview) = match executor.preview_patch(&inv) {
                 Ok(x) => x,
                 Err(e) => return Ok(tool_error_json("patch_preview", &format!("{e:?}"))),
             };
-            match executor.apply_patch(&inv, &hashes) {
+            match executor.apply_patch(&inv, &preview_content) {
                 Ok(paths) => Ok(patch_result_json(&paths)),
                 Err(e) => Ok(tool_error_json("patch_apply", &format!("{e:?}"))),
             }
