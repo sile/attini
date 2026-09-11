@@ -7,7 +7,7 @@ use attini::session_cmd;
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_RUNTIME: u8 = 1;
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+const DEFAULT_MODEL: &str = "deepseek-flash";
 
 /// Environment variable that supplies a default session name when
 /// `-s/--session` (or a positional `<SESSION>`) is omitted.

@@ -13,7 +13,7 @@ kept as a watch item.
 
 ## 5. Model split (agent vs. summariser vs. ask)
 
-`DEFAULT_MODEL = "deepseek-v4-flash"` is used uniformly for agent,
+`DEFAULT_MODEL = "deepseek-flash"` is used uniformly for agent,
 summariser, and `ask`. Some reasoning models do not support tool calling, so a
 future split (a cheaper model for summariser/ask, a tool-capable one for the
 agent loop) may be desirable if `deepseek-reasoner` becomes the primary

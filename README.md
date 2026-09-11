@@ -138,7 +138,7 @@ When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
 ```
-[agent] model=deepseek-v4-flash session=main ctx=20736
+[agent] model=deepseek-flash session=main ctx=20736
 ```
 
 `model=`/`session=` show which session/model is about to advance, `ctx=` is
@@ -150,7 +150,7 @@ how close the session is to compaction before it runs.
 
 ### Model selection
 
-- Default model: `deepseek-v4-flash` (override with `--model`)
+- Default model: `deepseek-flash` (override with `--model`)
 
 ## Agent tools
 

@@ -15,7 +15,7 @@ compared.
 
 ## What attini sends today
 
-- `model` (default `deepseek-v4-flash`, `src/main.rs:9`)
+- `model` (default `deepseek-flash`, `src/main.rs:10`)
 - `messages` (session history + system/tool records)
 - `stream: true`, `stream_options.include_usage: true`
 - `max_tokens` (optional, `--max-tokens` / `ATTINI_MAX_TOKENS`)
