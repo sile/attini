@@ -2,7 +2,6 @@ use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
 use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS, RateLimit};
-use attini::sansio::deepseek::ThinkingEffort;
 use attini::session_cmd;
 
 const EXIT_USAGE: u8 = 2;
@@ -224,10 +223,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .doc("Optional system prompt prepended to the conversation")
         .take(args)
         .present_and_then(|o| o.value().parse())?;
-    let show_reasoning = noargs::flag("show-reasoning")
-        .doc("Print reasoning_content deltas to stderr")
-        .take(args)
-        .is_present();
     let approve = noargs::flag("approve")
         .doc("Resume the session by approving its pending tool call")
         .take(args)
@@ -330,7 +325,9 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     let temperature: Option<f64> = noargs::opt("temperature")
         .short('t')
         .ty("N")
-        .doc("Sampling temperature for model calls; 0 is deterministic. Default 0 for code editing. Ignored while thinking mode is enabled.")
+        .doc(
+            "Sampling temperature for model calls; 0 is deterministic. Default 0 for code editing.",
+        )
         .env(TEMPERATURE_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<f64>())?;
@@ -350,26 +347,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
             "off" => Ok(false),
             other => Err(RunError::Runtime(format!(
                 "--plan must be 'on' or 'off', got '{other}'"
-            ))),
-        })
-        .transpose()?;
-
-    let thinking_effort_override: Option<ThinkingEffort> = noargs::opt("thinking-effort")
-        .short('E')
-        .ty("none|low|high|max")
-        .doc(
-            "DeepSeek thinking-mode effort for this session: `none` disables chain-of-thought \
-             (the default), `low|high|max` enable it at that depth. Persists across \
-             invocations. Omit to leave the session's current value unchanged. \
-             When thinking is enabled, `reasoning_content` is produced and must be resent \
-             on subsequent tool-bearing requests; `none` avoids that bloat.",
-        )
-        .take(args)
-        .present_and_then(|o| o.value().parse::<String>())?
-        .map(|s| match ThinkingEffort::parse(&s) {
-            Some(effort) => Ok(effort),
-            None => Err(RunError::Runtime(format!(
-                "--thinking-effort must be 'none', 'low', 'high' or 'max', got '{s}'"
             ))),
         })
         .transpose()?;
@@ -451,7 +428,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         max_tokens,
         workspace_root,
         system_prompt: system,
-        show_reasoning,
         max_turns: DEFAULT_MAX_TURNS,
         mode,
         extra_read_paths_cli: read_paths,
@@ -462,7 +438,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         skill_path,
         authorization,
         plan_override,
-        thinking_effort_override,
         temperature,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {

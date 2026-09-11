@@ -90,7 +90,6 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
             "user_msg",
             "cancel",
             "content_delta",
-            "reasoning_delta",
             "tool_call_delta",
             "patch_call_delta",
             "command_call_delta",
@@ -108,10 +107,6 @@ fn sample_event(ctx: &mut noprop::TestCaseContext, core: &AgentCore) -> Event {
         "user_msg" => Event::UserMessage(sample_string(ctx)),
         "cancel" => Event::Cancel,
         "content_delta" => Event::ContentDelta {
-            request: sample_request_id(ctx, core),
-            text: sample_string(ctx),
-        },
-        "reasoning_delta" => Event::ReasoningDelta {
             request: sample_request_id(ctx, core),
             text: sample_string(ctx),
         },
@@ -323,8 +318,6 @@ fn public_contract_holds_across_random_event_sequences() -> noprop::RunResult {
                 + m.cancels_ignored_when_idle.get()
                 + m.content_deltas_appended.get()
                 + m.content_deltas_dropped_as_stale.get()
-                + m.reasoning_deltas_appended.get()
-                + m.reasoning_deltas_dropped_as_stale.get()
                 + m.tool_call_deltas_appended.get()
                 + m.tool_call_deltas_dropped_as_stale.get()
                 + m.finishes_committed.get()

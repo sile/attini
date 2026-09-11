@@ -6,7 +6,6 @@
 //! - Serialising a streaming request with an optional `system` prompt,
 //!   one or more chat messages, and optional tool definitions
 //! - Decoding the streamed response chunks into content deltas,
-//!   reasoning-content deltas (DeepSeek's thinking mode extension),
 //!   tool-call deltas, and finish reasons
 //! - Recognising the `[DONE]` sentinel that terminates the stream
 //!
@@ -15,67 +14,18 @@
 
 use nojson::{DisplayJson, Json, JsonFormatter, JsonParseError, RawJsonValue};
 
-/// DeepSeek thinking-mode effort control.
-///
-/// `None` disables thinking mode entirely (the API receives
-/// `{"thinking":{"type":"disabled"}}`). `Low`/`High`/`Max` enable
-/// it at the corresponding depth (the API receives
-/// `{"thinking":{"type":"enabled"}}` plus `reasoning_effort`).
-/// This is a per-session setting so attini defaults to `None` (off)
-/// and avoids the chain-of-thought bloat that accumulates when
-/// thinking is silently on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThinkingEffort {
-    /// Thinking mode disabled: `{"thinking":{"type":"disabled"}}`.
-    None,
-    /// Thinking enabled at low depth.
-    Low,
-    /// Thinking enabled at high depth (the API's default effort).
-    High,
-    /// Thinking enabled at maximum effort.
-    Max,
-}
-
-impl ThinkingEffort {
-    /// Canonical string used both for the `reasoning_effort` wire
-    /// value and for the persisted session file.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ThinkingEffort::None => "none",
-            ThinkingEffort::Low => "low",
-            ThinkingEffort::High => "high",
-            ThinkingEffort::Max => "max",
-        }
-    }
-
-    /// Parse a `thinking_effort` value from its canonical string.
-    /// Returns `None` for unrecognised input so callers can treat it
-    /// as the default (thinking off).
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "none" => Some(ThinkingEffort::None),
-            "low" => Some(ThinkingEffort::Low),
-            "high" => Some(ThinkingEffort::High),
-            "max" => Some(ThinkingEffort::Max),
-            _ => None,
-        }
-    }
-}
-
 /// A single message in a chat conversation.
 ///
 /// Modelled as an enum per role because OpenAI-compatible messages
 /// have very different shapes: user / system carry plain text,
-/// assistant may carry text plus tool calls plus thinking-mode
-/// reasoning, and tool result messages carry the id of the call they
-/// answer.
+/// assistant may carry text plus tool calls, and tool result messages
+/// carry the id of the call they answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatMessage {
     System(String),
     User(String),
     Assistant {
         content: String,
-        reasoning_content: Option<String>,
         tool_calls: Vec<ToolCall>,
     },
     Tool {
@@ -89,7 +39,6 @@ impl ChatMessage {
     pub fn assistant_text(content: impl Into<String>) -> Self {
         Self::Assistant {
             content: content.into(),
-            reasoning_content: None,
             tool_calls: Vec::new(),
         }
     }
@@ -120,7 +69,6 @@ impl DisplayJson for ChatMessage {
             }),
             ChatMessage::Assistant {
                 content,
-                reasoning_content,
                 tool_calls,
             } => f.object(|f| {
                 f.member("role", "assistant")?;
@@ -135,9 +83,6 @@ impl DisplayJson for ChatMessage {
                         f.member("content", content)?;
                     }
                     f.member("tool_calls", tool_calls)?;
-                }
-                if let Some(reasoning) = reasoning_content {
-                    f.member("reasoning_content", reasoning)?;
                 }
                 Ok(())
             }),
@@ -255,11 +200,6 @@ pub struct ChatRequest {
     /// `None` omits the field so the upstream model applies its own
     /// default; `Some(n)` caps the response size (and cost).
     pub max_tokens: Option<u64>,
-    /// DeepSeek thinking-mode effort. `Some(effort)` sends the
-    /// `thinking` toggle (and, for enabled levels, `reasoning_effort`);
-    /// `None` omits both so the upstream model applies its own default
-    /// (thinking enabled at high effort).
-    pub thinking_effort: Option<ThinkingEffort>,
     /// Sampling temperature. `Some(t)` sends `"temperature": t`;
     /// `None` omits the field so the upstream model applies its own
     /// default. The constructor defaults to `Some(0.0)` to make
@@ -276,7 +216,6 @@ impl ChatRequest {
             messages,
             tools: Vec::new(),
             max_tokens: None,
-            thinking_effort: None,
             temperature: Some(0.0),
         }
     }
@@ -288,14 +227,6 @@ impl ChatRequest {
 
     pub fn with_max_tokens(mut self, max_tokens: Option<u64>) -> Self {
         self.max_tokens = max_tokens;
-        self
-    }
-
-    /// Set the DeepSeek thinking-mode effort for this request. Pass
-    /// [`ThinkingEffort::None`] to disable thinking mode, or an enabled
-    /// level to request chain-of-thought at that depth.
-    pub fn with_thinking_effort(mut self, effort: ThinkingEffort) -> Self {
-        self.thinking_effort = Some(effort);
         self
     }
 
@@ -323,15 +254,11 @@ impl DisplayJson for ChatRequest {
             if let Some(max_tokens) = self.max_tokens {
                 f.member("max_tokens", max_tokens)?;
             }
-            if let Some(effort) = self.thinking_effort {
-                match effort {
-                    ThinkingEffort::None => f.member("thinking", &ThinkingToggleDisabled)?,
-                    _ => {
-                        f.member("thinking", &ThinkingToggleEnabled)?;
-                        f.member("reasoning_effort", effort.as_str())?;
-                    }
-                }
-            }
+            // attini never enables chain-of-thought: the human is the
+            // final gate, so a private exploration is mostly wasted and
+            // was the largest source of context bloat. See
+            // `docs/design/thinking-mode.md`.
+            f.member("thinking", &ThinkingToggleDisabled)?;
             if let Some(temperature) = self.temperature {
                 f.member("temperature", temperature)?;
             }
@@ -348,14 +275,6 @@ struct StreamOptions;
 impl DisplayJson for StreamOptions {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| f.member("include_usage", true))
-    }
-}
-
-struct ThinkingToggleEnabled;
-
-impl DisplayJson for ThinkingToggleEnabled {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| f.member("type", "enabled"))
     }
 }
 
@@ -384,7 +303,6 @@ pub struct StreamToolCallDelta {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamChunk {
     pub content_delta: Option<String>,
-    pub reasoning_delta: Option<String>,
     pub tool_call_deltas: Vec<StreamToolCallDelta>,
     pub finish_reason: Option<String>,
     /// Token usage counters. OpenAI-compatible APIs return these only
@@ -453,18 +371,16 @@ impl<'text, 'raw> TryFrom<RawJsonValue<'text, 'raw>> for StreamChunk {
             });
         };
         let delta = choice.to_member("delta")?.optional();
-        let (content_delta, reasoning_delta, tool_call_deltas) = match delta {
+        let (content_delta, tool_call_deltas) = match delta {
             Some(delta) => (
                 optional_string(delta, "content")?,
-                optional_string(delta, "reasoning_content")?,
                 decode_tool_call_deltas(delta)?,
             ),
-            None => (None, None, Vec::new()),
+            None => (None, Vec::new()),
         };
         let finish_reason = optional_string(choice, "finish_reason")?;
         Ok(StreamChunk {
             content_delta,
-            reasoning_delta,
             tool_call_deltas,
             finish_reason,
             usage,
@@ -554,7 +470,7 @@ mod tests {
         );
         assert_eq!(
             request.to_json_string(),
-            r#"{"model":"deepseek-v4-flash","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true},"temperature":0}"#
+            r#"{"model":"deepseek-v4-flash","messages":[{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"Hello"}],"stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"disabled"},"temperature":0}"#
         );
     }
 
@@ -607,20 +523,8 @@ mod tests {
     }
 
     #[test]
-    fn chat_request_omits_thinking_when_unset() {
+    fn chat_request_always_disables_thinking() {
         let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())]);
-        let json = request.to_json_string();
-        assert!(!json.contains("thinking"), "unexpected thinking: {json}");
-        assert!(
-            !json.contains("reasoning_effort"),
-            "unexpected effort: {json}"
-        );
-    }
-
-    #[test]
-    fn chat_request_serialises_thinking_disabled() {
-        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())])
-            .with_thinking_effort(ThinkingEffort::None);
         let json = request.to_json_string();
         assert!(
             json.contains(r#""thinking":{"type":"disabled"}"#),
@@ -629,21 +533,6 @@ mod tests {
         assert!(
             !json.contains("reasoning_effort"),
             "unexpected effort: {json}"
-        );
-    }
-
-    #[test]
-    fn chat_request_serialises_thinking_enabled_high() {
-        let request = ChatRequest::new("m", vec![ChatMessage::User("hi".to_string())])
-            .with_thinking_effort(ThinkingEffort::High);
-        let json = request.to_json_string();
-        assert!(
-            json.contains(r#""thinking":{"type":"enabled"}"#),
-            "unexpected: {json}"
-        );
-        assert!(
-            json.contains(r#""reasoning_effort":"high""#),
-            "unexpected: {json}"
         );
     }
 
@@ -679,7 +568,6 @@ mod tests {
     fn assistant_message_with_tool_calls_uses_null_content_when_empty() {
         let msg = ChatMessage::Assistant {
             content: String::new(),
-            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 function_name: "list".to_string(),
@@ -690,20 +578,6 @@ mod tests {
         assert_eq!(
             json,
             r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"list","arguments":"{\"path\":\".\"}"}}]}"#
-        );
-    }
-
-    #[test]
-    fn assistant_message_with_reasoning_serialises_field() {
-        let msg = ChatMessage::Assistant {
-            content: "answer".to_string(),
-            reasoning_content: Some("thinking...".to_string()),
-            tool_calls: Vec::new(),
-        };
-        let json = Json(&msg).to_string();
-        assert_eq!(
-            json,
-            r#"{"role":"assistant","content":"answer","reasoning_content":"thinking..."}"#
         );
     }
 
@@ -728,19 +602,6 @@ mod tests {
             got,
             StreamPayload::Chunk(StreamChunk {
                 content_delta: Some("hi".to_string()),
-                ..Default::default()
-            })
-        );
-    }
-
-    #[test]
-    fn decodes_reasoning_delta_chunk() {
-        let payload = r#"{"choices":[{"index":0,"delta":{"reasoning_content":"thinking..."},"finish_reason":null}]}"#;
-        let got = decode_stream_payload(payload).expect("decode");
-        assert_eq!(
-            got,
-            StreamPayload::Chunk(StreamChunk {
-                reasoning_delta: Some("thinking...".to_string()),
                 ..Default::default()
             })
         );

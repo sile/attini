@@ -81,7 +81,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Agent CLI (`attini agent`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--thinking-effort none|low|high|max] [--stdin] "<PROMPT>"
+attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -105,9 +105,8 @@ be quoted or passed via `--stdin`.
 run. When omitted the model's own default is used.
 
 `--temperature N` / `-t N` sets the sampling temperature for model calls.
-Default is 0 (deterministic), which DeepSeek recommends for coding/math; the
-value is ignored while thinking mode is enabled. It can also be set via
-`ATTINI_TEMPERATURE`.
+Default is 0 (deterministic), which DeepSeek recommends for coding/math. It
+can also be set via `ATTINI_TEMPERATURE`.
 
 `--skill PATH` / `-S PATH` loads a skill: either a directory containing `SKILL.md`,
 or a `SKILL.md` file directly. Its body is prepended to the system prompt before
@@ -125,14 +124,12 @@ and `--approve` still works. The flag persists in
 `.attini/<SESSION>/plan_mode` and is reflected in `attini session show`; omitting
 it leaves the session's current plan-mode state unchanged.
 
-`--thinking-effort none|low|high|max` sets the session's DeepSeek thinking-mode
-effort **persistently** (default `none`, i.e. chain-of-thought off). `none`
-disables thinking so no `reasoning_content` is produced and no reasoning is
-re-sent on tool-bearing requests; `low`/`high`/`max` enable chain-of-thought at
-that depth. It persists in `.attini/<SESSION>/thinking_effort`, is reflected in
-`attini session show` as `thinking: ...`, and is shown in the status line as
-`thinking=...` when enabled. Omit the flag to leave the session's current value
-unchanged.
+DeepSeek thinking mode is always **disabled**: attini sends
+`{"thinking":{"type":"disabled"}}` on every request and offers no way to
+enable chain-of-thought. The human is the final gate, so a private exploration
+is mostly wasted, and it was the largest source of context bloat — see
+`docs/design/thinking-mode.md`. With thinking off no `reasoning_content` is
+produced or replayed, and `temperature` is always effective.
 
 When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
@@ -143,9 +140,8 @@ stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
 `model=`/`session=` show which session/model is about to advance, `ctx=` is
 the **current** conversation size (the last recorded `prompt_tokens`, not the
-cumulative billed total), `plan=on` appears when plan mode is active, and
-`thinking=low|high|max` appears when thinking mode is enabled — so you can see
-how close the session is to compaction before it runs.
+cumulative billed total), and `plan=on` appears when plan mode is active — so
+you can see how close the session is to compaction before it runs.
 `ATTINI_STATUS_LINE=0` disables the line.
 
 ### Model selection
@@ -214,5 +210,5 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_SESSION_NAME` | Default session name when `-s/--session` (or a positional `<SESSION>`) is omitted. Precedence: CLI flag, then this env var, then `main`. |
 | `ATTINI_MODEL_NAME` | Default model name when `--model` is omitted. Precedence: CLI flag, then this env var, then the built-in default. |
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
-| `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). Ignored while thinking mode is enabled. |
+| `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). |
 | `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line end-of-invocation status that `attini agent` prints to stderr. Unset (or any other value) keeps it on. |

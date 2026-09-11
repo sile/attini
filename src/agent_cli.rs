@@ -14,7 +14,7 @@ use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, PatchTool, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
-use crate::sansio::deepseek::{ChatMessage, ChatRequest, ThinkingEffort, ToolCall, ToolDef};
+use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
@@ -193,7 +193,6 @@ pub struct AgentConfig {
     pub max_tokens: Option<u64>,
     pub workspace_root: PathBuf,
     pub system_prompt: Option<String>,
-    pub show_reasoning: bool,
     pub max_turns: usize,
     pub mode: Mode,
     /// Extra workspace-external read-only path prefixes granted via
@@ -232,14 +231,9 @@ pub struct AgentConfig {
     /// for `--plan=on`, `Some(false)` for `--plan=off`. `None` leaves
     /// the session's current persisted plan-mode state unchanged.
     pub plan_override: Option<bool>,
-    /// When `Some`, the requested DeepSeek thinking-mode effort to set
-    /// (and persist) for this session at the start of the invocation.
-    /// `None` leaves the session's current persisted value unchanged.
-    pub thinking_effort_override: Option<ThinkingEffort>,
     /// Sampling temperature for model calls. `None` uses the request
     /// default (`Some(0.0)`, deterministic code editing); `Some(t)`
-    /// overrides it. Note the API ignores `temperature` while thinking
-    /// mode is enabled.
+    /// overrides it.
     pub temperature: Option<f64>,
 }
 
@@ -277,9 +271,6 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     // current persisted state is left untouched.
     if let Some(on) = cfg.plan_override {
         session.set_plan_mode(on)?;
-    }
-    if let Some(effort) = cfg.thinking_effort_override {
-        session.set_thinking_effort(effort)?;
     }
     // Combine persistent extra_read_paths (from permissions.json) with
     // CLI --read-path overrides for this invocation, canonicalise
@@ -321,13 +312,7 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
         let ctx_tokens = session.latest_prompt_tokens().ok().flatten().unwrap_or(0);
         eprintln!(
             "{}",
-            render_agent_status_line(
-                &cfg.model,
-                &cfg.session_name,
-                ctx_tokens,
-                session.plan_mode,
-                session.thinking_effort,
-            )
+            render_agent_status_line(&cfg.model, &cfg.session_name, ctx_tokens, session.plan_mode)
         );
     }
 
@@ -375,16 +360,11 @@ fn render_agent_status_line(
     session_name: &str,
     ctx_tokens: u64,
     plan_mode: bool,
-    thinking_effort: ThinkingEffort,
 ) -> String {
     let plan = if plan_mode { " plan=on" } else { "" };
-    let think = match thinking_effort {
-        ThinkingEffort::None => String::new(),
-        other => format!(" thinking={}", other.as_str()),
-    };
     format!(
-        "[agent] model={} session={} ctx={}{}{}",
-        model, session_name, ctx_tokens, plan, think,
+        "[agent] model={} session={} ctx={}{}",
+        model, session_name, ctx_tokens, plan,
     )
 }
 
@@ -542,18 +522,11 @@ fn drive(
         let request = ChatRequest::new(cfg.model.clone(), messages.clone())
             .with_tools(tools.clone())
             .with_max_tokens(cfg.max_tokens)
-            .with_thinking_effort(session.thinking_effort)
             .with_temperature(cfg.temperature);
         let mut stdout = io::stdout();
-        let mut stderr = io::stderr();
         let call_result = {
             let mut sinks = ProgressSinks {
                 content: &mut stdout,
-                reasoning: if cfg.show_reasoning {
-                    Some(&mut stderr)
-                } else {
-                    None
-                },
             };
             curl::call(&request, &mut sinks)
                 .map_err(|e| io::Error::other(format!("model call failed: {e}")))?
@@ -564,7 +537,6 @@ fn drive(
         session.append(&SessionRecord::Assistant {
             ts: now_unix_millis(),
             content: call_result.content.clone(),
-            reasoning: call_result.reasoning_content.clone(),
             tool_calls: call_result.tool_calls.clone(),
         })?;
         counters.turns += 1;
@@ -1255,18 +1227,10 @@ fn call_summariser_messages(
 ) -> io::Result<String> {
     let request = ChatRequest::new(model.to_string(), messages).with_max_tokens(max_tokens);
     let mut sink = io::sink();
-    let mut sinks = ProgressSinks {
-        content: &mut sink,
-        reasoning: None,
-    };
+    let mut sinks = ProgressSinks { content: &mut sink };
     let result = curl::call(&request, &mut sinks)
         .map_err(|e| io::Error::other(format!("summariser call failed: {e}")))?;
-    pick_summary_text(&result).ok_or_else(|| {
-        io::Error::other(
-            "summariser returned empty content \
-             (both content and reasoning_content were empty)",
-        )
-    })
+    pick_summary_text(&result).ok_or_else(|| io::Error::other("summariser returned empty content"))
 }
 
 fn run_summariser(
@@ -1319,23 +1283,16 @@ pub(crate) fn run_ask_summary(
     call_summariser_messages(model, vec![ChatMessage::System(system)], max_tokens)
 }
 
-/// Pick a usable summary from a [`CallResult`]: prefer `content` and
-/// fall back to `reasoning_content` when the primary field is empty.
-/// Some reasoning-capable DeepSeek models emit the actual answer via
-/// `reasoning_content` while leaving `content` blank; without this
-/// fallback auto-compaction fails on every such response and the
-/// invocation carries the full history for the remaining turns.
+/// Pick a usable summary from a [`CallResult`]: the assistant text.
+/// Returns `None` for an empty (or whitespace-only) response so the
+/// caller can surface a clear error rather than persisting a blank
+/// summary.
 fn pick_summary_text(result: &curl::CallResult) -> Option<String> {
     let content = result.content.trim();
-    if !content.is_empty() {
-        return Some(content.to_string());
+    if content.is_empty() {
+        return None;
     }
-    result
-        .reasoning_content
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    Some(content.to_string())
 }
 
 /// Given the real records that follow the last summary, return
@@ -1384,11 +1341,9 @@ fn message_raw_char_len(msg: &ChatMessage) -> usize {
         ChatMessage::User(s) => s.len(),
         ChatMessage::Assistant {
             content,
-            reasoning_content,
             tool_calls,
         } => {
             content.len()
-                + reasoning_content.as_deref().map_or(0, |r| r.len())
                 + tool_calls
                     .iter()
                     .map(|tc| tc.function_name.len() + tc.arguments_json.len())
@@ -2319,7 +2274,6 @@ mod tests {
         ChatMessageWithTs {
             message: ChatMessage::Assistant {
                 content: String::new(),
-                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id: format!("call_{ts}"),
                     function_name: "read".to_string(),
@@ -2406,7 +2360,6 @@ mod tests {
         assert!(is_safe_boundary(&ChatMessage::assistant_text("a")));
         assert!(!is_safe_boundary(&ChatMessage::Assistant {
             content: String::new(),
-            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: "x".to_string(),
                 function_name: "read".to_string(),
@@ -2610,7 +2563,6 @@ mod tests {
             max_tokens: None,
             workspace_root: PathBuf::new(),
             system_prompt: None,
-            show_reasoning: false,
             max_turns: 0,
             mode: Mode::Default,
             extra_read_paths_cli: Vec::new(),
@@ -2621,7 +2573,6 @@ mod tests {
             skill_path: None,
             authorization: Authorization::PerTool,
             plan_override: None,
-            thinking_effort_override: None,
             temperature: None,
         }
     }
@@ -2836,10 +2787,9 @@ mod tests {
     // pick_summary_text
     // -------------------------------------------------------------
 
-    fn call_result(content: &str, reasoning: Option<&str>) -> curl::CallResult {
+    fn call_result(content: &str) -> curl::CallResult {
         curl::CallResult {
             content: content.to_string(),
-            reasoning_content: reasoning.map(str::to_string),
             tool_calls: Vec::new(),
             finish_reason: None,
             usage: None,
@@ -2848,25 +2798,13 @@ mod tests {
 
     #[test]
     fn pick_summary_text_returns_content_when_present() {
-        let r = call_result("hello summary", Some("thinking..."));
+        let r = call_result("hello summary");
         assert_eq!(pick_summary_text(&r), Some("hello summary".to_string()));
     }
 
     #[test]
-    fn pick_summary_text_falls_back_to_reasoning_when_content_empty() {
-        let r = call_result("   ", Some("actual answer"));
-        assert_eq!(pick_summary_text(&r), Some("actual answer".to_string()));
-    }
-
-    #[test]
-    fn pick_summary_text_returns_none_when_reasoning_is_some_empty() {
-        let r = call_result("", Some("   "));
-        assert_eq!(pick_summary_text(&r), None);
-    }
-
-    #[test]
-    fn pick_summary_text_returns_none_when_reasoning_is_none() {
-        let r = call_result("", None);
+    fn pick_summary_text_returns_none_when_content_is_blank() {
+        let r = call_result("   ");
         assert_eq!(pick_summary_text(&r), None);
     }
 
@@ -2896,7 +2834,6 @@ mod tests {
             ChatMessageWithTs {
                 message: ChatMessage::Assistant {
                     content: "looking at the file".to_string(),
-                    reasoning_content: None,
                     tool_calls: vec![ToolCall {
                         id: "call_1".to_string(),
                         function_name: "search".to_string(),
@@ -2975,7 +2912,6 @@ mod tests {
     fn assistant_calls(ids: &[&str]) -> ChatMessage {
         ChatMessage::Assistant {
             content: String::new(),
-            reasoning_content: None,
             tool_calls: ids
                 .iter()
                 .map(|id| ToolCall {
@@ -3132,13 +3068,7 @@ mod tests {
 
     #[test]
     fn status_line_render_includes_session_and_ctx() {
-        let line = render_agent_status_line(
-            "deepseek-v4-flash",
-            "main",
-            20736,
-            false,
-            ThinkingEffort::None,
-        );
+        let line = render_agent_status_line("deepseek-v4-flash", "main", 20736, false);
         assert_eq!(
             line,
             "[agent] model=deepseek-v4-flash session=main ctx=20736"
@@ -3147,7 +3077,7 @@ mod tests {
 
     #[test]
     fn status_line_uses_passed_ctx_as_current_size() {
-        let line = render_agent_status_line("m", "s", 1000, false, ThinkingEffort::None);
+        let line = render_agent_status_line("m", "s", 1000, false);
         assert!(line.contains("ctx=1000"));
         assert!(line.contains("model=m"));
         assert!(line.contains("session=s"));
@@ -3155,22 +3085,9 @@ mod tests {
 
     #[test]
     fn status_line_appends_plan_marker_when_on() {
-        let line = render_agent_status_line("m", "s", 1000, true, ThinkingEffort::None);
+        let line = render_agent_status_line("m", "s", 1000, true);
         assert!(line.contains("plan=on"));
         assert!(line.ends_with("plan=on"));
-    }
-
-    #[test]
-    fn status_line_appends_thinking_marker_when_enabled() {
-        let line = render_agent_status_line("m", "s", 1000, false, ThinkingEffort::Low);
-        assert!(line.contains("thinking=low"));
-        assert!(line.ends_with("thinking=low"));
-    }
-
-    #[test]
-    fn status_line_omits_thinking_marker_when_off() {
-        let line = render_agent_status_line("m", "s", 1000, false, ThinkingEffort::None);
-        assert!(!line.contains("thinking"));
     }
 
     // -------------------------------------------------------------

@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nojson::{DisplayJson, Json, JsonFormatter, JsonParseError, RawJson};
 
-use crate::sansio::deepseek::{ChatMessage, ThinkingEffort, ToolCall};
+use crate::sansio::deepseek::{ChatMessage, ToolCall};
 
 /// Handle to an open session directory. Holds the LOCK file open
 /// for the lifetime of this value; drop it via [`Session::close`]
@@ -39,11 +39,6 @@ pub struct Session {
     /// patch (including git-tracked edits) requires explicit human
     /// approval. Persisted in `.attini/{NAME}/plan_mode`.
     pub plan_mode: bool,
-    /// DeepSeek thinking-mode effort for this session. `None` (= off)
-    /// disables chain-of-thought so no `reasoning_content` is
-    /// generated; the default. Persisted in
-    /// `.attini/{NAME}/thinking_effort` as `none|low|high|max`.
-    pub thinking_effort: ThinkingEffort,
 }
 
 impl Session {
@@ -66,7 +61,6 @@ impl Session {
             .append(true)
             .open(&paths.conversation)?;
         let plan_mode = load_plan_mode(&paths.dir)?;
-        let thinking_effort = load_thinking_effort(&paths.dir)?;
         Ok(Self {
             dir: paths.dir,
             lock_path: paths.lock,
@@ -75,7 +69,6 @@ impl Session {
             pending_path: paths.pending,
             writer,
             plan_mode,
-            thinking_effort,
         })
     }
 
@@ -248,14 +241,6 @@ impl Session {
         self.plan_mode = on;
         save_plan_mode(&self.dir, on)
     }
-
-    /// Set the session's thinking-mode effort and persist it. Called
-    /// when `--thinking-effort=...` is supplied; when the flag is
-    /// omitted the persisted value is left unchanged.
-    pub fn set_thinking_effort(&mut self, effort: ThinkingEffort) -> io::Result<()> {
-        self.thinking_effort = effort;
-        save_thinking_effort(&self.dir, effort)
-    }
 }
 
 impl Drop for Session {
@@ -334,10 +319,6 @@ pub struct SessionPaths {
     /// Persisted plan-mode flag (`.attini/{NAME}/plan_mode`). `1` means
     /// plan mode is on (every patch requires approval); `0` means normal.
     pub plan_mode: PathBuf,
-    /// Persisted thinking-mode effort (`.attini/{NAME}/thinking_effort`)
-    /// holding `none|low|high|max`. `none` disables thinking mode;
-    /// `low|high|max` enable it at that depth.
-    pub thinking_effort: PathBuf,
 }
 
 /// Root directory (`.attini/`) that holds every session in the CWD.
@@ -368,17 +349,12 @@ pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
         scratchpad: dir.join("scratchpad"),
         ask: dir.join("ask.json"),
         plan_mode: dir.join(PLAN_MODE_FILE),
-        thinking_effort: dir.join(THINKING_EFFORT_FILE),
         dir,
     })
 }
 
 /// Filename holding the persisted plan-mode flag (contents `1` or `0`).
 const PLAN_MODE_FILE: &str = "plan_mode";
-
-/// Filename holding the persisted thinking-mode effort (contents
-/// `none|low|high|max`).
-const THINKING_EFFORT_FILE: &str = "thinking_effort";
 
 /// Read a session's persisted plan-mode flag. Missing file, or an
 /// unreadable / invalid value, defaults to `false` (normal mode).
@@ -400,29 +376,6 @@ pub fn save_plan_mode(dir: &Path, on: bool) -> io::Result<()> {
     let path = dir.join(PLAN_MODE_FILE);
     let tmp = dir.join(format!("{PLAN_MODE_FILE}.tmp"));
     fs::write(&tmp, if on { "1" } else { "0" })?;
-    fs::rename(&tmp, &path)
-}
-
-/// Read a session's persisted thinking-mode effort. Missing file, or
-/// an unreadable / invalid value, defaults to [`ThinkingEffort::None`]
-/// (thinking off). Used by [`Session::open`] and by the read-only
-/// `session show` command, which must not take the LOCK.
-pub fn load_thinking_effort(dir: &Path) -> io::Result<ThinkingEffort> {
-    let text = match fs::read_to_string(dir.join(THINKING_EFFORT_FILE)) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ThinkingEffort::None),
-        Err(e) => return Err(e),
-    };
-    Ok(ThinkingEffort::parse(text.trim()).unwrap_or(ThinkingEffort::None))
-}
-
-/// Persist a session's thinking-mode effort. Writes `none|low|high|max`
-/// to `thinking_effort` atomically (tmp + rename) so a crash cannot
-/// leave a partial file.
-pub fn save_thinking_effort(dir: &Path, effort: ThinkingEffort) -> io::Result<()> {
-    let path = dir.join(THINKING_EFFORT_FILE);
-    let tmp = dir.join(format!("{THINKING_EFFORT_FILE}.tmp"));
-    fs::write(&tmp, effort.as_str())?;
     fs::rename(&tmp, &path)
 }
 
@@ -810,7 +763,6 @@ pub enum SessionRecord {
     Assistant {
         ts: u64,
         content: String,
-        reasoning: Option<String>,
         tool_calls: Vec<ToolCall>,
     },
     Tool {
@@ -998,13 +950,11 @@ impl DisplayJson for SessionRecord {
             Self::Assistant {
                 ts,
                 content,
-                reasoning,
                 tool_calls,
             } => f.object(|f| {
                 f.member("kind", "assistant")?;
                 f.member("ts", ts)?;
                 f.member("content", content)?;
-                f.member("reasoning", reasoning)?;
                 f.member("tool_calls", tool_calls)
             }),
             Self::Tool {
@@ -1255,9 +1205,6 @@ pub struct ConversationAnalysis {
     pub total_bytes: u64,
     pub kind_bytes: Vec<(String, RecordKindBytes)>,
     pub assistant_content_bytes: u64,
-    pub assistant_reasoning_bytes: u64,
-    pub assistant_reasoning_records: u64,
-    pub assistant_reasoning_max_bytes: u64,
     pub tool_calls_count: u64,
     pub tool_results: Vec<(String, ToolResultStats)>,
     pub read_targets: Vec<(String, ReadTargetStats)>,
@@ -1285,9 +1232,6 @@ pub fn analyze_conversation(path: &Path) -> io::Result<ConversationAnalysis> {
 
     let mut kind_bytes: BTreeMap<String, RecordKindBytes> = BTreeMap::new();
     let mut assistant_content_bytes = 0u64;
-    let mut assistant_reasoning_bytes = 0u64;
-    let mut assistant_reasoning_records = 0u64;
-    let mut assistant_reasoning_max_bytes = 0u64;
     let mut tool_calls_count = 0u64;
     let mut tool_results: BTreeMap<String, ToolResultStats> = BTreeMap::new();
     let mut read_targets: BTreeMap<String, ReadTargetStats> = BTreeMap::new();
@@ -1345,19 +1289,12 @@ pub fn analyze_conversation(path: &Path) -> io::Result<ConversationAnalysis> {
             }
             SessionRecord::Assistant {
                 content,
-                reasoning,
                 tool_calls,
                 ..
             } => {
                 kind_bytes.entry("assistant".to_string()).or_default().count += 1;
                 kind_bytes.get_mut("assistant").unwrap().bytes += this_bytes;
                 assistant_content_bytes += content.len() as u64;
-                if let Some(r) = reasoning {
-                    assistant_reasoning_bytes += r.len() as u64;
-                    assistant_reasoning_records += 1;
-                    assistant_reasoning_max_bytes =
-                        assistant_reasoning_max_bytes.max(r.len() as u64);
-                }
                 // Collect every tool_call from this turn so the `tool`
                 // results that follow can be attributed by call_id, even
                 // when the model emitted several calls in one turn.
@@ -1466,9 +1403,6 @@ pub fn analyze_conversation(path: &Path) -> io::Result<ConversationAnalysis> {
         total_bytes,
         kind_bytes: kind_bytes.into_iter().collect(),
         assistant_content_bytes,
-        assistant_reasoning_bytes,
-        assistant_reasoning_records,
-        assistant_reasoning_max_bytes,
         tool_calls_count,
         tool_results: tool_results.into_iter().collect(),
         read_targets: read_targets.into_iter().collect(),
@@ -1587,12 +1521,10 @@ fn parse_session_record_line(line: &str) -> Result<Option<SessionRecord>, String
         "assistant" => {
             let ts = read_u64(value, "ts")?;
             let content = read_string(value, "content")?;
-            let reasoning = read_optional_string(value, "reasoning")?;
             let tool_calls = read_tool_calls(value)?;
             Ok(Some(SessionRecord::Assistant {
                 ts,
                 content,
-                reasoning,
                 tool_calls,
             }))
         }
@@ -1758,21 +1690,9 @@ fn parse_conversation_line(line: &str) -> Result<Option<ChatMessage>, String> {
         }
         "assistant" => {
             let content = read_string(value, "content")?;
-            let reasoning = read_optional_string(value, "reasoning")?;
             let tool_calls = read_tool_calls(value)?;
-            // Reasoning is the model's private CoT trace. It is persisted
-            // for observability but is not replayed into later invocations:
-            // re-sending it bloats every request and can anchor the model
-            // to stale thinking. The lone exception is a turn that carried
-            // its answer entirely in `reasoning` (blank content, no tool
-            // calls); promote that to content so the answer is not lost.
-            let (content, reasoning_content) = match (content, reasoning) {
-                (c, Some(r)) if c.is_empty() && tool_calls.is_empty() => (r, None),
-                (c, _) => (c, None),
-            };
             Ok(Some(ChatMessage::Assistant {
                 content,
-                reasoning_content,
                 tool_calls,
             }))
         }
@@ -2126,7 +2046,6 @@ mod tests {
             Json(&SessionRecord::Assistant {
                 ts: 3,
                 content: "".to_string(),
-                reasoning: Some("lots of reasoning".to_string()),
                 tool_calls: vec![ToolCall {
                     id: "c1".to_string(),
                     function_name: "read".to_string(),
@@ -2151,7 +2070,6 @@ mod tests {
             Json(&SessionRecord::Assistant {
                 ts: 5,
                 content: "done".to_string(),
-                reasoning: None,
                 tool_calls: vec![ToolCall {
                     id: "c2".to_string(),
                     function_name: "command".to_string(),
@@ -2189,17 +2107,7 @@ mod tests {
 
         let a = analyze_conversation(&path).unwrap();
         assert_eq!(a.records, 7);
-        // split assistant content vs reasoning
         assert_eq!(a.assistant_content_bytes, "done".len() as u64);
-        assert_eq!(
-            a.assistant_reasoning_bytes,
-            "lots of reasoning".len() as u64
-        );
-        assert_eq!(a.assistant_reasoning_records, 1);
-        assert_eq!(
-            a.assistant_reasoning_max_bytes,
-            "lots of reasoning".len() as u64
-        );
         assert_eq!(a.tool_calls_count, 2);
         // tool results attributed by function name
         assert_eq!(a.tool_results.len(), 2);
@@ -2251,7 +2159,6 @@ mod tests {
             Json(&SessionRecord::Assistant {
                 ts: 1,
                 content: "".to_string(),
-                reasoning: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "a".to_string(),
@@ -2415,7 +2322,6 @@ mod tests {
         let record = SessionRecord::Assistant {
             ts: 42,
             content: "hi".to_string(),
-            reasoning: Some("because".to_string()),
             tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
                 function_name: "read".to_string(),
@@ -2429,45 +2335,13 @@ mod tests {
         match parsed {
             ChatMessage::Assistant {
                 content,
-                reasoning_content,
                 tool_calls,
             } => {
                 assert_eq!(content, "hi");
-                // Reasoning is stripped on replay when content or tool_calls
-                // already carry the turn; it is not re-sent to the model.
-                assert_eq!(reasoning_content.as_deref(), None);
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].id, "call_1");
                 assert_eq!(tool_calls[0].function_name, "read");
                 assert_eq!(tool_calls[0].arguments_json, r#"{"path":"src/foo.rs"}"#);
-            }
-            other => panic!("expected assistant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn assistant_reasoning_promoted_when_it_carries_the_answer() {
-        let record = SessionRecord::Assistant {
-            ts: 1,
-            // Some reasoning-capable models answer in `reasoning` while
-            // leaving `content` blank; the answer must not be lost.
-            content: String::new(),
-            reasoning: Some("the actual answer".to_string()),
-            tool_calls: vec![],
-        };
-        let line = nojson::Json(&record).to_string();
-        let parsed = parse_conversation_line(&line)
-            .expect("parse must succeed")
-            .expect("assistant record must yield a ChatMessage");
-        match parsed {
-            ChatMessage::Assistant {
-                content,
-                reasoning_content,
-                tool_calls,
-            } => {
-                assert_eq!(content, "the actual answer");
-                assert_eq!(reasoning_content.as_deref(), None);
-                assert!(tool_calls.is_empty());
             }
             other => panic!("expected assistant, got {other:?}"),
         }
@@ -2633,40 +2507,6 @@ mod tests {
         save_plan_mode(&dir, false).unwrap();
         assert!(!load_plan_mode(&dir).unwrap());
 
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn thinking_effort_roundtrips_through_file() {
-        let dir = std::env::temp_dir().join(format!("attini-te-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-
-        // Missing file defaults to none (thinking off).
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::None);
-
-        save_thinking_effort(&dir, ThinkingEffort::Low).unwrap();
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::Low);
-
-        save_thinking_effort(&dir, ThinkingEffort::High).unwrap();
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::High);
-
-        save_thinking_effort(&dir, ThinkingEffort::Max).unwrap();
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::Max);
-
-        save_thinking_effort(&dir, ThinkingEffort::None).unwrap();
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::None);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn thinking_effort_tolerates_bad_file_content() {
-        let dir = std::env::temp_dir().join(format!("attini-te-bad-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(THINKING_EFFORT_FILE), "not-an-effort").unwrap();
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::None);
         let _ = fs::remove_dir_all(&dir);
     }
 

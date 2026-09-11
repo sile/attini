@@ -56,7 +56,6 @@ fn resolve_chat_completions_url() -> io::Result<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResult {
     pub content: String,
-    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
     /// Token counters from the response's terminating usage chunk.
@@ -69,7 +68,6 @@ impl CallResult {
     pub fn into_assistant(self) -> ChatMessage {
         ChatMessage::Assistant {
             content: self.content,
-            reasoning_content: self.reasoning_content,
             tool_calls: self.tool_calls,
         }
     }
@@ -77,7 +75,6 @@ impl CallResult {
 
 pub struct ProgressSinks<'a> {
     pub content: &'a mut dyn Write,
-    pub reasoning: Option<&'a mut dyn Write>,
 }
 
 pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<CallResult> {
@@ -226,7 +223,6 @@ fn decode_sse_stream<R: Read>(
 #[derive(Default)]
 struct Assembly {
     content: String,
-    reasoning: String,
     tool_slots: Vec<ToolSlot>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -246,13 +242,6 @@ impl Assembly {
             let _ = sinks.content.write_all(delta.as_bytes());
             let _ = sinks.content.flush();
             self.content.push_str(&delta);
-        }
-        if let Some(delta) = chunk.reasoning_delta {
-            if let Some(sink) = sinks.reasoning.as_deref_mut() {
-                let _ = sink.write_all(delta.as_bytes());
-                let _ = sink.flush();
-            }
-            self.reasoning.push_str(&delta);
         }
         for tc in chunk.tool_call_deltas {
             self.absorb_tool_call(tc);
@@ -303,14 +292,8 @@ impl Assembly {
                 arguments_json: s.arguments_json,
             })
             .collect();
-        let reasoning = if self.reasoning.is_empty() {
-            None
-        } else {
-            Some(self.reasoning)
-        };
         CallResult {
             content: self.content,
-            reasoning_content: reasoning,
             tool_calls,
             finish_reason: self.finish_reason,
             usage: self.usage,

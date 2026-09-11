@@ -20,26 +20,39 @@ compared.
 - `stream: true`, `stream_options.include_usage: true`
 - `max_tokens` (optional, `--max-tokens` / `ATTINI_MAX_TOKENS`)
 - `temperature` (default `0`, `--temperature/-t` / `ATTINI_TEMPERATURE`)
-- `thinking`: `{type: enabled|disabled}` + `reasoning_effort`
-  (`--thinking-effort/-E`, session-persistent)
+- `thinking`: `{type: disabled}` (always — see decision 1)
 
 ## Implemented decisions
 
-### 1. `thinking` mode control
+### 1. Thinking mode is always disabled
 
-`--thinking-effort/-E` sets `thinking` + `reasoning_effort` per session.
-Values: `none|low|high|max`. Default for new sessions is `none` (chain-of-
-thought off). `none` maps to `{type: disabled}`; `low|high|max` map to
-`{type: enabled}` + `reasoning_effort`. Persisted under
-`.attini/<NAME>/thinking_effort`.
+attini sends `thinking: {type: disabled}` on every request. No
+chain-of-thought is requested, so no `reasoning_content` is produced, stored,
+or replayed.
+
+Rationale: attini is a half-autonomous tool whose human operator is the final
+gate. The human issues directions and corrections, so a private exploration
+by the model is mostly wasted, and it was by far the largest source of
+context bloat (see `docs/design/thinking-mode.md` and
+`docs/bug/conversation-log-bloat.md`).
+
+Consequences:
+
+- `ChatMessage::Assistant` has no `reasoning_content` field; the wire shape
+  is `{role, content, tool_calls?}`.
+- `temperature` is always effective (sampling parameters are only ignored
+  while thinking is enabled).
+- The "must resend `reasoning_content` on tool-bearing requests" rule from
+  the DeepSeek Thinking Mode guide never applies, so attini is not exposed to
+  that 400-error risk.
+- `--thinking-effort` / `-E` and `--show-reasoning` were removed.
 
 ### 2. `temperature` for determinism
 
 DeepSeek recommends `temperature: 0` for coding/math. `ChatRequest` defaults
 to `temperature: 0` and accepts `--temperature N` / `-t N` /
-`ATTINI_TEMPERATURE`. The value is sent only when thinking is `disabled`
-(sampling parameters are ignored in thinking mode). Note nojson renders float
-`0.0` as `0` on the wire; that is valid JSON and accepted by the API.
+`ATTINI_TEMPERATURE`. Note nojson renders float `0.0` as `0` on the wire;
+that is valid JSON and accepted by the API.
 
 ## Explicitly not planned
 

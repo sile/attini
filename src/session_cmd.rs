@@ -131,12 +131,10 @@ pub fn run_show(name: &str) -> io::Result<()> {
     let summary = scan_conversation(&paths.conversation)?;
     let pending = read_pending_summary(&paths.pending)?;
     let plan_mode = crate::session::load_plan_mode(&paths.dir)?;
-    let thinking_effort = crate::session::load_thinking_effort(&paths.dir)?;
 
     println!("session: {name}");
     println!("  dir: {}", paths.dir.display());
     println!("  plan: {}", if plan_mode { "on" } else { "off" });
-    println!("  thinking: {}", thinking_effort.as_str());
     println!("  lock: {}", format_lock_status(lock));
     print_summary(&summary);
     match pending {
@@ -818,16 +816,6 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
 
     println!("\nassistant payload");
     println!("  content: {}", format_bytes(a.assistant_content_bytes));
-    if a.assistant_reasoning_records > 0 {
-        println!(
-            "  reasoning: {} ({} records, max {})",
-            format_bytes(a.assistant_reasoning_bytes),
-            a.assistant_reasoning_records,
-            format_bytes(a.assistant_reasoning_max_bytes)
-        );
-    } else {
-        println!("  reasoning: none");
-    }
     println!("  tool_calls: {}", a.tool_calls_count);
 
     println!("\ntool results by function");
@@ -1026,9 +1014,6 @@ impl DisplayJson for AnalyzeJson<'_> {
                 "assistant",
                 AssistantJson {
                     content_bytes: a.assistant_content_bytes,
-                    reasoning_bytes: a.assistant_reasoning_bytes,
-                    reasoning_records: a.assistant_reasoning_records,
-                    reasoning_max_bytes: a.assistant_reasoning_max_bytes,
                     tool_calls: a.tool_calls_count,
                 },
             )?;
@@ -1084,9 +1069,6 @@ impl DisplayJson for KindsJson<'_> {
 
 struct AssistantJson {
     content_bytes: u64,
-    reasoning_bytes: u64,
-    reasoning_records: u64,
-    reasoning_max_bytes: u64,
     tool_calls: u64,
 }
 
@@ -1094,9 +1076,6 @@ impl DisplayJson for AssistantJson {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
             f.member("content_bytes", self.content_bytes)?;
-            f.member("reasoning_bytes", self.reasoning_bytes)?;
-            f.member("reasoning_records", self.reasoning_records)?;
-            f.member("reasoning_max_bytes", self.reasoning_max_bytes)?;
             f.member("tool_calls", self.tool_calls)?;
             Ok(())
         })
@@ -1903,7 +1882,7 @@ mod tests {
             &path,
             &[
                 r#"{"kind":"user","ts":1,"text":"a"}"#,
-                r#"{"kind":"assistant","ts":2,"content":"b","reasoning":null,"tool_calls":[]}"#,
+                r#"{"kind":"assistant","ts":2,"content":"b","tool_calls":[]}"#,
             ],
         );
         assert!(locate_last_summary_offset(&path).expect("ok").is_none());
@@ -2019,7 +1998,7 @@ mod tests {
             &path,
             &[
                 r#"{"kind":"user","ts":1,"text":"hi"}"#,
-                r#"{"kind":"assistant","ts":2,"content":"a","reasoning":null,"tool_calls":[]}"#,
+                r#"{"kind":"assistant","ts":2,"content":"a","tool_calls":[]}"#,
                 r#"{"kind":"summary","ts":3,"since_ts":0,"cutoff_ts":0,"text":"…"}"#,
                 r#"{"kind":"tool_approval","ts":4,"call_id":"c","decision":"approve"}"#,
             ],

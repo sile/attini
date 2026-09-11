@@ -13,8 +13,8 @@
 //! Read-only tool calls are supported through an explicit tool loop
 //! (see [`ReadOnlyTool`], `ToolRunning` phase,
 //! [`Event::ToolCallDelta`], [`Event::ToolResult`]). File-editing and
-//! command-execution tools, automatic retry, side-effect approvals,
-//! and cross-turn reasoning carry-over remain out of scope.
+//! command-execution tools, automatic retry, and side-effect approvals
+//! remain out of scope.
 
 use std::collections::BTreeMap;
 
@@ -907,7 +907,7 @@ pub enum Status {
     Idle,
     /// A request has been issued but no delta has been received yet.
     AwaitingModel,
-    /// The current request has begun streaming content or reasoning.
+    /// The current request has begun streaming content.
     Streaming,
     /// The model finished with `finish_reason == "tool_calls"` and the
     /// shell is executing the requested tools; the core is awaiting
@@ -924,14 +924,11 @@ pub enum Status {
 /// Buffered pieces of the assistant response for the in-flight request.
 ///
 /// `content` is the user-visible answer accumulated so far;
-/// `reasoning` is the DeepSeek thinking-mode extension surfaced for
-/// display only (not carried over between turns at this stage).
 /// `finish_reason` becomes `Some` after the final chunk has been
 /// observed but before the response is committed to the conversation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingResponse {
     pub content: String,
-    pub reasoning: String,
     pub finish_reason: Option<String>,
 }
 
@@ -945,8 +942,6 @@ pub enum Event {
     Cancel,
     /// A content delta arrived from the transport.
     ContentDelta { request: RequestId, text: String },
-    /// A reasoning-content delta arrived from the transport.
-    ReasoningDelta { request: RequestId, text: String },
     /// A tool-call streaming fragment arrived. The core assembles
     /// fragments across chunks by matching on `index`; the first
     /// non-null `id` / `function_name` win, and `arguments_fragment`
@@ -1225,13 +1220,6 @@ pub struct AgentMetrics {
     /// [`Event::ContentDelta`] dropped because no request was active
     /// or the `request` id did not match the active one.
     pub content_deltas_dropped_as_stale: Counter,
-    /// [`Event::ReasoningDelta`] whose `request` matched the active
-    /// [`RequestId`]; the text was appended to the pending reasoning
-    /// buffer.
-    pub reasoning_deltas_appended: Counter,
-    /// [`Event::ReasoningDelta`] dropped because no request was
-    /// active or the `request` id did not match the active one.
-    pub reasoning_deltas_dropped_as_stale: Counter,
     /// [`Event::Finish`] whose `request` matched the active
     /// [`RequestId`]; the assistant message was committed to the
     /// conversation.
@@ -1434,7 +1422,6 @@ impl AgentCore {
             Event::UserMessage(text) => self.on_user_message(text),
             Event::Cancel => self.on_cancel(),
             Event::ContentDelta { request, text } => self.on_content_delta(request, text),
-            Event::ReasoningDelta { request, text } => self.on_reasoning_delta(request, text),
             Event::ToolCallDelta {
                 request,
                 index,
@@ -1527,21 +1514,6 @@ impl AgentCore {
         vec![Action::Redraw]
     }
 
-    fn on_reasoning_delta(&mut self, request: RequestId, text: String) -> Vec<Action> {
-        let Some(pending) = self.pending.as_mut() else {
-            self.metrics.reasoning_deltas_dropped_as_stale.inc();
-            return Vec::new();
-        };
-        if pending.id != request || pending.phase != PendingPhase::Streaming {
-            self.metrics.reasoning_deltas_dropped_as_stale.inc();
-            return Vec::new();
-        }
-        pending.response.reasoning.push_str(&text);
-        self.status = Status::Streaming;
-        self.metrics.reasoning_deltas_appended.inc();
-        vec![Action::Redraw]
-    }
-
     fn on_tool_call_delta(
         &mut self,
         request: RequestId,
@@ -1607,11 +1579,6 @@ impl AgentCore {
         }
         let mut pending = self.pending.take().expect("checked above");
         pending.response.finish_reason = reason.clone();
-        let reasoning_content = if pending.response.reasoning.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut pending.response.reasoning))
-        };
         let content = std::mem::take(&mut pending.response.content);
         let is_tool_calls_reason = reason.as_deref() == Some("tool_calls");
         let has_slots = !pending.tool_call_slots.is_empty();
@@ -1619,7 +1586,6 @@ impl AgentCore {
         if !is_tool_calls_reason || !has_slots {
             self.conversation.push(ChatMessage::Assistant {
                 content,
-                reasoning_content,
                 tool_calls: Vec::new(),
             });
             self.status = Status::Idle;
@@ -1636,7 +1602,6 @@ impl AgentCore {
 
         self.conversation.push(ChatMessage::Assistant {
             content,
-            reasoning_content,
             tool_calls: tool_calls.clone(),
         });
         self.metrics.finishes_committed.inc();
@@ -2219,19 +2184,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_delta_accumulates_separately_from_content() {
-        let mut core = AgentCore::new();
-        let id = last_start_id(&user(&mut core, "hi"));
-        let _ = core.handle_event(Event::ReasoningDelta {
-            request: id,
-            text: "let me think".to_string(),
-        });
-        let pending = core.pending_response().expect("pending");
-        assert_eq!(pending.reasoning, "let me think");
-        assert!(pending.content.is_empty());
-    }
-
-    #[test]
     fn finish_commits_assistant_turn_and_returns_to_idle() {
         let mut core = AgentCore::new();
         let id = last_start_id(&user(&mut core, "hi"));
@@ -2441,24 +2393,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_delta_appended_and_dropped_counters() {
-        let mut core = AgentCore::new();
-        let id = last_start_id(&user(&mut core, "hi"));
-        let _ = core.handle_event(Event::ReasoningDelta {
-            request: id,
-            text: "think".to_string(),
-        });
-        // No pending: dropped
-        let _ = core.handle_event(Event::Cancel);
-        let _ = core.handle_event(Event::ReasoningDelta {
-            request: id,
-            text: "late".to_string(),
-        });
-        assert_eq!(core.metrics().reasoning_deltas_appended.get(), 1);
-        assert_eq!(core.metrics().reasoning_deltas_dropped_as_stale.get(), 1);
-    }
-
-    #[test]
     fn finish_committed_and_dropped_counters() {
         let mut core = AgentCore::new();
         let id = last_start_id(&user(&mut core, "hi"));
@@ -2515,8 +2449,6 @@ mod tests {
         assert_eq!(m.cancels_ignored_when_idle.get(), 0);
         assert_eq!(m.content_deltas_appended.get(), 0);
         assert_eq!(m.content_deltas_dropped_as_stale.get(), 0);
-        assert_eq!(m.reasoning_deltas_appended.get(), 0);
-        assert_eq!(m.reasoning_deltas_dropped_as_stale.get(), 0);
         assert_eq!(m.finishes_committed.get(), 0);
         assert_eq!(m.finishes_dropped_as_stale.get(), 0);
         assert_eq!(m.transport_errors_recorded.get(), 0);
