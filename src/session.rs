@@ -404,16 +404,16 @@ pub fn save_plan_mode(dir: &Path, on: bool) -> io::Result<()> {
 }
 
 /// Read a session's persisted thinking-mode effort. Missing file, or
-/// an unreadable / invalid value, defaults to [`ThinkingEffort::High`]
-/// (thinking on, high depth). Used by [`Session::open`] and by the read-only
+/// an unreadable / invalid value, defaults to [`ThinkingEffort::None`]
+/// (thinking off). Used by [`Session::open`] and by the read-only
 /// `session show` command, which must not take the LOCK.
 pub fn load_thinking_effort(dir: &Path) -> io::Result<ThinkingEffort> {
     let text = match fs::read_to_string(dir.join(THINKING_EFFORT_FILE)) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ThinkingEffort::High),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ThinkingEffort::None),
         Err(e) => return Err(e),
     };
-    Ok(ThinkingEffort::parse(text.trim()).unwrap_or(ThinkingEffort::High))
+    Ok(ThinkingEffort::parse(text.trim()).unwrap_or(ThinkingEffort::None))
 }
 
 /// Persist a session's thinking-mode effort. Writes `none|low|high|max`
@@ -2642,8 +2642,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        // Missing file defaults to high (thinking on).
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::High);
+        // Missing file defaults to none (thinking off).
+        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::None);
 
         save_thinking_effort(&dir, ThinkingEffort::Low).unwrap();
         assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::Low);
@@ -2666,7 +2666,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(THINKING_EFFORT_FILE), "not-an-effort").unwrap();
-        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::High);
+        assert_eq!(load_thinking_effort(&dir).unwrap(), ThinkingEffort::None);
         let _ = fs::remove_dir_all(&dir);
     }
 

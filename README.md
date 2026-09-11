@@ -126,7 +126,7 @@ and `--approve` still works. The flag persists in
 it leaves the session's current plan-mode state unchanged.
 
 `--thinking-effort none|low|high|max` sets the session's DeepSeek thinking-mode
-effort **persistently** (default `high`, i.e. chain-of-thought on). `none`
+effort **persistently** (default `none`, i.e. chain-of-thought off). `none`
 disables thinking so no `reasoning_content` is produced and no reasoning is
 re-sent on tool-bearing requests; `low`/`high`/`max` enable chain-of-thought at
 that depth. It persists in `.attini/<SESSION>/thinking_effort`, is reflected in

@@ -65,8 +65,8 @@ for tools-bearing requests (see above), even after the final answer.
 Therefore:
 
 - With `--thinking-effort=none`, no reasoning content is generated, so this
-resend requirement does not apply at all (the session default is `high`, so the
-requirement does bind unless a session is explicitly set to `none`).
+resend requirement does not apply at all (the session default is `none`, so the
+requirement binds only when a session explicitly enables thinking via `low|high|max`).
 - With thinking enabled (`low|high|max`), the requirement technically binds for
 tools-bearing requests. If the model has already produced its final answer,
 that answer is kept as part of the next request, and the CoT that preceded it

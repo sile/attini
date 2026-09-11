@@ -28,8 +28,8 @@ compared.
 ### 1. `thinking` mode control
 
 `--thinking-effort/-E` sets `thinking` + `reasoning_effort` per session.
-Values: `none|low|high|max`. Default for new sessions is `high` (chain-of-
-thought on). `none` maps to `{type: disabled}`; `low|high|max` map to
+Values: `none|low|high|max`. Default for new sessions is `none` (chain-of-
+thought off). `none` maps to `{type: disabled}`; `low|high|max` map to
 `{type: enabled}` + `reasoning_effort`. Persisted under
 `.attini/<NAME>/thinking_effort`.
 
