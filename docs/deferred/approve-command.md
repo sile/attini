@@ -60,16 +60,16 @@ attini approve [-s NAME]        # approve the session's pending tool call(s)
 
 - **`attini agent --approve` is removed, not deprecated.** Keeping it would leave the
   fall-through in (1) reachable through the flag the change is meant to retire, so the
-  two would contradict each other. The `Continuation::Approve` path in `src/agent_cli.rs`
-  stays — the new subcommand just constructs it, exactly as `--approve` does today (see
-  `try_run_agent` in `src/main.rs`).
+  two would contradict each other. The `Continuation::Approve` path in `src/tell_cli.rs`
+  stays — the new subcommand just constructs it (see `try_run_approve` in `src/main.rs`).
 - `agent` keeps its optional `<PROMPT>` (it is the normal "advance with a new prompt"
   path), so `attini agent --approv` still becomes a weird prompt. That is fine: once
   `--approve` is gone, no one expecting to approve reaches it, so the leftover token is
   just a mistyped prompt, not a mistaken approval.
-- `--approve` currently forbids combining with `--skill` and forbids a prompt.
-  A dedicated command makes those rules structural instead of validated: `approve` has
-  no `--skill` and no positional, so there is nothing to reject.
+- `--approve` forbids combining with a prompt. A dedicated command makes that rule
+  structural instead of validated: `approve` has no positional, so there is nothing to
+  reject. (The old `--skill` combination rule is moot: `--skill` itself has since been
+  removed — context now enters only through the prompt or `--stdin`.)
 - Consider a matching `attini reject` for symmetry even though `--reject` was removed
   (a fresh prompt already covers "reject + redirect"; see `docs/deferred/reject-flag.md`
   for why `--reject` is redundant). Reject-by-flag is gone, but a read-only
@@ -79,7 +79,7 @@ attini approve [-s NAME]        # approve the session's pending tool call(s)
 
 Today, avoiding a future approval means finding the argv-prefix and running a *separate*
 `attini session grant ...` invocation. The agent even prints a suggestion for it
-(`emit_suggested_rule` in `src/agent_cli.rs`):
+(`emit_suggested_rule` in `src/tell_cli.rs`):
 
 ```
 [command] approval required: cargo test
@@ -153,10 +153,10 @@ Settled semantics:
 
 1. `src/main.rs`: add `try_run_approve` (parse `-s/--session`, `--grant <SCOPE>`, reject
    unknown scopes), dispatch it before/alongside `agent`. Build `Continuation::Approve`
-   and call `agent_cli::run` exactly as `try_run_agent` does today.
-2. `src/main.rs`: remove the `--approve` flag from `try_run_agent` (and its prompt /
-   `--skill` validation, which becomes unnecessary).
-3. `src/agent_cli.rs`: after the `Continuation::Approve` branch completes, if a grant was
+   and call `tell_cli::run` exactly as `try_run_tell` does today.
+2. `src/main.rs`: remove the `--approve` flag from `try_run_tell` (and its prompt
+   validation, which becomes unnecessary).
+3. `src/tell_cli.rs`: after the `Continuation::Approve` branch completes, if a grant was
    requested, read the approved command's argv from the pending record, run it through
    the same truncation `emit_suggested_rule` uses, and call `permissions::grant`. Report
    a grant failure as a warning and keep the approval.

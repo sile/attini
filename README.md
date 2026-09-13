@@ -33,9 +33,9 @@ conservative: it prefers that the human tells it exactly what to do, rather
 than letting the agent infer or guess:
 
 - **Context is requested, not discovered.** The agent does not go looking for
-  context: files are loaded only when you name them (`--reference PATH`,
-  `--skill PATH`), and no tool lets the model pull in skill content at runtime.
-  Nothing is added to the system prompt unless you named it.
+  context: nothing is added to the system prompt unless you put it there — the
+  prompt itself, or `--stdin` for pasted data. No tool lets the model pull in
+  extra context at runtime.
 - **State changes are surfaced.** `patch` shows a preview (SHA-256 hashes + a
   diff summary) and waits for approval on any non-tracked write; the model's
   in-flight intent is observable via `attini ask` / `session show`; and a
@@ -49,9 +49,10 @@ than letting the agent infer or guess:
 - **The model's own space is gated too.** The model can work freely in its own
   scratchpad, but every write there still passes through approval.
 
-This is why, for instance, skills take an explicit `--skill PATH` instead of
-being auto-discovered from `~/.attini/skills` or `.attini/skills` — context
-should enter a session only because the human asked for it.
+This is why, for instance, there is no automatic skill or instruction-file
+discovery (no `~/.attini/skills`, no `.attini/skills`, no `AGENTS.md` scan) —
+context should enter a session only because the human asked for it, in the
+prompt.
 
 ## Requirements
 
@@ -81,23 +82,16 @@ export DEEPSEEK_API_KEY=sk-...
 ### Tell CLI (`attini tell`)
 
 ```sh
-attini tell [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
+attini tell [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
-
-`--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
-UTF-8 file into the system prompt before the first turn, so context is present
-without a `read` round-trip. Relative paths resolve against the workspace root.
-Files larger than 32 KiB are not inlined; instead they are granted as extra read
-roots and referenced by absolute path (readable with the `read` tool).
 
 `--stdin` reads standard input (until EOF) and appends it to the prompt as a
 clearly marked `--- stdin ---` block, so small pasted fragments need no temp
 file. When stdin is a terminal it prints a note and reads interactively until
 EOF (Ctrl+D); Ctrl+C cancels. It caps input at 1 MiB and warns when stdin is
-empty. It is meant for *data*, not background context — use `--reference PATH`
-for that.
+empty.
 
 Extra positional tokens are now rejected as a usage error (`attini tell hello
 world` fails instead of silently dropping `world`), so multi-word prompts must
@@ -109,13 +103,6 @@ run. When omitted the model's own default is used.
 `--temperature N` / `-t N` sets the sampling temperature for model calls.
 Default is 0 (deterministic), which DeepSeek recommends for coding/math. It
 can also be set via `ATTINI_TEMPERATURE`.
-
-`--skill PATH` / `-S PATH` loads a skill: either a directory containing `SKILL.md`,
-or a `SKILL.md` file directly. Its body is prepended to the system prompt before
-the first turn. Relative paths resolve against the workspace root. There is **no
-implicit skill discovery** — attini never scans `~/.attini/skills` or
-`.attini/skills`, and the model has no `skill_load` tool. Context enters only
-because you asked for it, explicitly, at invocation start.
 
 `--plan=on` / `--plan=off` turns plan mode on or off **persistently** for the
 session. In plan mode every patch — including edits on git-tracked files, which

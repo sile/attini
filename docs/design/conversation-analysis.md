@@ -69,7 +69,8 @@ only, never appended to `conversation.jsonl`.
   multiple subcommands under one program are all preserved.
 - Human output uses top-10 per section; `--json` emits the full list.
 
-## Deferred remaining half: interpretation skill
+## Deferred remaining half: interpretation guidance
 
-See `docs/deferred/` — the `-S analyze-conversation` skill that interprets
-`session analyze` output is still deferred.
+See `docs/deferred/` — guidance for interpreting `session analyze` output is
+still deferred. (Originally framed as a `-S` skill, but `--skill` has since
+been removed, so it can only live in the prompt now.)

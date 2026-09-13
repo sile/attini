@@ -20,9 +20,9 @@ can distinguish "not implemented yet" from "intentionally not there".
   every system prompt at startup.
 - **Status:** removed (`ea845e8`).
 - **Why not:** `memory` was the last implicit auto-injection. It violated the
-  design philosophy "Context is requested, not discovered". If global
-  persistent context is ever needed, the intended path is explicit
-  `--reference PATH` or a skill.
+  design philosophy "Context is requested, not discovered". If persistent
+  context is ever needed, put it in the prompt explicitly (or paste via
+  `--stdin`).
 
 ### 2. Subagent / delegation
 
@@ -40,27 +40,45 @@ can distinguish "not implemented yet" from "intentionally not there".
   instruction files (AGENTS.md or similar) into the system prompt.
 - **Status:** not implemented, and intentionally not planned.
 - **Why not:** it is implicit context discovery by convention, which attini
-  explicitly avoids. Repo-specific instructions can already be supplied
-  explicitly with `--reference PATH` (a file) or `--skill PATH` (a SKILL.md).
-  There is no need for a magic file-name convention.
+  explicitly avoids. Repo-specific instructions are just text — put them in
+  the prompt when you start a session. There is no need for a magic
+  file-name convention.
 
 ### 4. Auto skill load / implicit skill discovery
 
 - **What:** scanning `~/.attini/skills/` and `.attini/skills/` for skills and
   automatically listing / loading them.
 - **Status:** removed (`a159db0`).
-- **Why not:** skills must now be named explicitly with `--skill PATH`. The
-  model has no `skill_load` tool. Context enters only because you asked for
-  it at invocation start.
+- **Why not:** the model has no `skill_load` tool; context enters only
+  because you asked for it at invocation start. (The explicit `--skill PATH`
+  flag that replaced discovery has itself since been removed — see item 5.)
+
+### 5. `--skill` and `--reference` flags
+
+- **What:** `--skill PATH` / `-S` (prepend a `SKILL.md` body to the system
+  prompt) and `--reference PATH` / `-r` (inline a file, or grant it as a read
+  root when oversized).
+- **Status:** both removed.
+- **Why not:** the only thing they provided over the prompt was "this text
+  goes into the system prompt instead of the user message" — not a guarantee
+  the model will obey (there is none, by LLM nature). If you want context in
+  a session, type it in the prompt; for larger blobs paste via `--stdin`.
+  The remaining real capability — granting read permission outside the
+  workspace — is a separate concern handled by `--read-path` / `attini
+  session grant-read` (and later, an approval flow), not by a "context"
+  flag. Removing them also keeps "context is requested, not discovered"
+  honest: there is no longer a special flag that silently lands text in the
+  system prompt.
 
 ## The common thread
 
-All four are the same shape: **implicit, convention-based context or
-delegation that attini cannot see or control.** attini's answer to each is
-"be explicit" — name the file, the skill, or run the other session yourself.
+All are the same shape: **implicit, convention-based context or delegation
+that attini cannot see or control.** attini's answer to each is "be
+explicit" — put it in the prompt, or run the other session yourself.
 "Unsupported" here means "you ask for it explicitly, and then it works
 exactly the way you asked", not "the feature is missing and should be
-added".
+added". (Item 5 is the degenerate case: even an *explicit* flag was
+unnecessary, because the prompt already does the same thing.)
 
 ## Why this is not just "the same as the design philosophy"
 

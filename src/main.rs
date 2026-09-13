@@ -21,9 +21,8 @@ const MAX_TOKENS_ENV: &str = "ATTINI_MAX_TOKENS";
 /// `--temperature` is omitted.
 const TEMPERATURE_ENV: &str = "ATTINI_TEMPERATURE";
 
-/// Cap on how many bytes `--stdin` may contribute to the prompt. Larger
-/// inputs should go through `--reference PATH` instead, to avoid bloating
-/// the user message with an unbounded paste.
+/// Cap on how many bytes `--stdin` may contribute to the prompt, to avoid
+/// bloating the user message with an unbounded paste.
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 // String forms of the tool-call cap defaults, exposed here because
@@ -123,8 +122,7 @@ fn read_stdin_auxiliary() -> Result<Option<String>, RunError> {
         .map_err(|e| RunError::Runtime(format!("failed to read standard input: {e}")))?;
     if buf.len() > MAX_STDIN_BYTES {
         return Err(RunError::Runtime(format!(
-            "standard input exceeded {MAX_STDIN_BYTES} bytes; use --reference PATH or paste \
-             a smaller fragment"
+            "standard input exceeded {MAX_STDIN_BYTES} bytes; paste a smaller fragment"
         )));
     }
     let s = String::from_utf8(buf)
@@ -263,25 +261,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         let s: String = taken.then(|o| o.value().parse())?;
         read_paths.push(std::path::PathBuf::from(s));
     }
-    // --reference is repeatable; same loop pattern as --read-path.
-    let mut reference_paths: Vec<std::path::PathBuf> = Vec::new();
-    loop {
-        let taken = noargs::opt("reference")
-            .short('r')
-            .ty("PATH")
-            .doc(
-                "File whose contents are inlined into the system prompt before the first turn. \
-                 Repeatable. Relative paths resolve against the workspace root. Files larger \
-                 than 32 KiB are not inlined; they are granted as read roots and referenced \
-                 by absolute path instead.",
-            )
-            .take(args);
-        if !taken.is_present() {
-            break;
-        }
-        let s: String = taken.then(|o| o.value().parse())?;
-        reference_paths.push(std::path::PathBuf::from(s));
-    }
     let turn_tool_call_limit: usize = noargs::opt("turn-tool-call-limit")
         .ty("N")
         .doc(
@@ -309,18 +288,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .default(DEFAULT_SESSION_TOOL_CALL_MAX_STR)
         .take(args)
         .then(|o| o.value().parse())?;
-    let skill_path: Option<std::path::PathBuf> = noargs::opt("skill")
-        .short('S')
-        .ty("PATH")
-        .doc(
-            "Load a skill (a directory containing SKILL.md, or a SKILL.md file) \
-             and prepend its body as a system message before PROMPT. Relative \
-             paths resolve against the workspace root. There is no implicit \
-             skill discovery — the path must be given explicitly.",
-        )
-        .take(args)
-        .present_and_then(|o| o.value().parse::<String>())?
-        .map(std::path::PathBuf::from);
     let max_tokens: Option<u64> = noargs::opt("max-tokens")
         .ty("N")
         .doc("Maximum completion tokens per model call; `none` uses the model default")
@@ -418,11 +385,9 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         max_turns: DEFAULT_MAX_TURNS,
         mode,
         extra_read_paths_cli: read_paths,
-        reference_paths,
         turn_tool_call_limit,
         tool_call_rate,
         session_tool_call_max,
-        skill_path,
         authorization,
         plan_override,
         temperature,
@@ -511,13 +476,11 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         max_turns: DEFAULT_MAX_TURNS,
         mode: attini::sansio::permissions::Mode::Default,
         extra_read_paths_cli: Vec::new(),
-        reference_paths: Vec::new(),
         turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
             .parse()
             .map_err(|e| RunError::Runtime(format!("bad default turn limit: {e}")))?,
         tool_call_rate: parse_tool_call_rate(DEFAULT_TOOL_CALL_RATE_STR)?,
         session_tool_call_max: parse_session_tool_call_max(DEFAULT_SESSION_TOOL_CALL_MAX_STR)?,
-        skill_path: None,
         authorization: attini::sansio::permissions::Authorization::PerTool,
         plan_override: None,
         temperature: None,

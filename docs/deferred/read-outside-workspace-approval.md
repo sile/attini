@@ -21,8 +21,7 @@ the path is known up front and awkward when it is discovered mid-task.
   There is no approval hook.
 - `extra_read_roots` is built **once** in `run()` (`src/tell_cli.rs:290`) from:
   1. persistent `extra_read_paths` in `permissions.json`,
-  2. CLI `--read-path` (`extra_read_paths_cli`),
-  3. oversized `--reference` files (those not inlined).
+  2. CLI `--read-path` (`extra_read_paths_cli`).
   `canonicalise_extra_read_roots` dedupes and canonicalises. The `ToolExecutor` is then
   constructed once (`src/tell_cli.rs:291`) and never mutated for the rest of the session.
 - Read-only dispatch (`ToolKind::ReadOnly`, `src/tell_cli.rs:644`) executes **inline**:

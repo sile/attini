@@ -1,13 +1,18 @@
-# Interpretation skill for conversation analysis
+# Interpretation guidance for conversation analysis
 
 **Status:** Deferred. The deterministic `attini session analyze` subcommand
-(measurement half) is implemented and committed; the interpretation skill
+(measurement half) is implemented and committed; interpretation guidance
 is the remaining, unbuilt half. See `docs/design/conversation-analysis.md`
 for the implemented measurement half.
 
-## Deferred half: `-S analyze-conversation` skill
+> Note: this was originally framed as a `-S analyze-conversation` skill, but
+> the `--skill` flag has since been removed. There is no skill-loading
+> mechanism now; interpretation guidance can only be supplied by typing it
+> into the prompt (or pasting it via `--stdin`).
 
-A `SKILL.md` (loaded via the existing explicit `attini tell -S PATH`)
+## Deferred half: interpretation instructions
+
+A short instruction block (typed into the prompt, since `--skill` is gone)
 instructing the model how to:
 
 - Run `attini session analyze <NAME>` (and pass `--json` if machine parsing
@@ -24,13 +29,13 @@ instructing the model how to:
 
 ## Why deferred
 
-The measurement subcommand already exists, so the skill would only need to
-chain it with model judgment. It is deferred because the deterministic part
-(raw numbers) is the harder half and is done; the interpretation skill is
-ergonomic, not a correctness gap.
+The measurement subcommand already exists, so the guidance would only need
+to chain it with model judgment. It is deferred because the deterministic
+part (raw numbers) is the harder half and is done; the interpretation side
+is ergonomic, not a correctness gap.
 
 ## How to revive
 
-Add the `analyze-conversation` skill (a `SKILL.md` loaded via the existing
-explicit `attini tell -S PATH`). It only needs to chain `session analyze`
-output with model judgment.
+Write the interpretation instructions and pass them in the prompt when you
+want an analysis (there is no skill flag anymore). It only needs to chain
+`session analyze` output with model judgment.

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,6 @@ use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
     Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
 };
-use crate::skills;
 use crate::tools::ToolExecutor;
 
 pub const EXIT_OK: u8 = 0;
@@ -199,11 +198,6 @@ pub struct TellConfig {
     /// `attini tell --read-path`. Combined with the persistent
     /// entries from `permissions.json.extra_read_paths` on startup.
     pub extra_read_paths_cli: Vec<PathBuf>,
-    /// CLI `--reference` file paths to inject into the system prompt.
-    /// Relative paths resolve against `workspace_root`. Files larger
-    /// than [`REFERENCE_MAX_BYTES`] are not inlined; they are granted
-    /// as extra read roots and referenced by absolute path instead.
-    pub reference_paths: Vec<PathBuf>,
     /// Maximum tool calls admitted in a single model turn. Extras in
     /// the same response get a synthetic error result and the loop
     /// advances to the next turn.
@@ -215,12 +209,6 @@ pub struct TellConfig {
     /// stops the loop with [`InvocationEndReason::SessionToolCallExhausted`].
     /// `None` disables the check.
     pub session_tool_call_max: Option<usize>,
-    /// Optional CLI-selected skill path. When set, the SKILL.md body
-    /// (either the file itself or SKILL.md inside the directory) is
-    /// prepended as a system message before the first turn. Applies
-    /// only to fresh invocations; combining with `--approve` is
-    /// rejected in `main.rs`.
-    pub skill_path: Option<PathBuf>,
     /// How side-effecting tool calls are authorized in this
     /// invocation. `plan run` supplies
     /// [`Authorization::ApprovedPlan`]; every other entry point uses
@@ -301,15 +289,8 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     // that fails to canonicalise is warned + skipped so a single bad
     // entry does not disable the whole grant list.
     let loaded = permissions::load(&cfg.session_name)?;
-    let references = resolve_references(&cfg.workspace_root, &cfg.reference_paths)?;
     let mut candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
     candidates.extend(cfg.extra_read_paths_cli.iter().cloned());
-    candidates.extend(
-        references
-            .iter()
-            .filter(|r| r.inline.is_none())
-            .map(|r| r.abs_path.clone()),
-    );
     let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
     let executor = ToolExecutor::new(
         &cfg.workspace_root,
@@ -768,55 +749,6 @@ fn canonicalise_extra_read_roots(
     out
 }
 
-/// Files larger than this are not inlined into the system prompt by
-/// `attini tell --reference`; they are granted as extra read roots
-/// and referenced by absolute path instead.
-pub const REFERENCE_MAX_BYTES: usize = 32 * 1024;
-
-/// A resolved `--reference` file. Small files carry their content in
-/// `inline`; oversized files have `None` and are granted as extra
-/// read roots and referenced by absolute path instead.
-#[derive(Debug)]
-struct ResolvedReference {
-    abs_path: PathBuf,
-    inline: Option<String>,
-}
-
-/// Resolve `--reference` paths against `workspace_root`, read each
-/// file, and decide whether it can be inlined. Read failures are
-/// surfaced as a startup error so the user sees the reason immediately.
-fn resolve_references(
-    workspace_root: &std::path::Path,
-    reference_paths: &[PathBuf],
-) -> io::Result<Vec<ResolvedReference>> {
-    let mut out = Vec::with_capacity(reference_paths.len());
-    for p in reference_paths {
-        let abs = if p.is_absolute() {
-            p.clone()
-        } else {
-            workspace_root.join(p)
-        };
-        let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
-        let bytes = std::fs::read(&abs)
-            .map_err(|e| io::Error::other(format!("--reference {}: {e}", abs.display())))?;
-        let inline = if bytes.len() <= REFERENCE_MAX_BYTES {
-            Some(String::from_utf8(bytes).map_err(|e| {
-                io::Error::other(format!(
-                    "--reference {}: not valid UTF-8: {e}",
-                    abs.display()
-                ))
-            })?)
-        } else {
-            None
-        };
-        out.push(ResolvedReference {
-            abs_path: abs,
-            inline,
-        });
-    }
-    Ok(out)
-}
-
 fn build_initial_messages(session: &Session, cfg: &TellConfig) -> io::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
     let summaries = session.load_summaries()?;
@@ -835,28 +767,6 @@ fn build_initial_messages(session: &Session, cfg: &TellConfig) -> io::Result<Vec
     }
     if let Some(sys) = &cfg.system_prompt {
         messages.push(ChatMessage::System(sys.clone()));
-    }
-    if let Some(path) = &cfg.skill_path {
-        let body = load_cli_skill_body(&cfg.workspace_root, path)?;
-        messages.push(ChatMessage::System(body));
-    }
-    let references = resolve_references(&cfg.workspace_root, &cfg.reference_paths)?;
-    if !references.is_empty() {
-        let mut ref_block = String::from("# Reference files\n\n");
-        for r in &references {
-            match &r.inline {
-                Some(content) => {
-                    ref_block.push_str(&format!("### {}\n\n{}\n\n", r.abs_path.display(), content));
-                }
-                None => {
-                    ref_block.push_str(&format!(
-                        "- {} — too large to inline; readable via the `read` tool at this absolute path\n",
-                        r.abs_path.display()
-                    ));
-                }
-            }
-        }
-        messages.push(ChatMessage::System(ref_block));
     }
     messages.push(ChatMessage::System(render_scratchpad_note(
         &cfg.session_name,
@@ -925,18 +835,6 @@ fn render_tool_batching_note() -> String {
      together, and may precede an approval-gated call; just do not put \
      them after one.\n"
         .to_string()
-}
-
-/// Resolve and load a CLI-selected skill path. Called at the start of
-/// a fresh `attini tell --skill <PATH>` invocation. Any failure
-/// (missing / too large / bad UTF-8) is surfaced as a startup
-/// `io::Error` so the user sees the reason immediately, rather than
-/// the model getting a mysterious empty system message.
-fn load_cli_skill_body(workspace_root: &Path, path: &Path) -> io::Result<String> {
-    skills::load_from_path(workspace_root, path).map_err(|e| {
-        let (_, msg) = e.to_code_and_message();
-        io::Error::other(format!("--skill {}: {msg}", path.display()))
-    })
 }
 
 // -------------------------------------------------------------------
@@ -2689,11 +2587,9 @@ mod tests {
             max_turns: 0,
             mode: Mode::Default,
             extra_read_paths_cli: Vec::new(),
-            reference_paths: Vec::new(),
             turn_tool_call_limit: turn_limit,
             tool_call_rate: rate,
             session_tool_call_max: session_max,
-            skill_path: None,
             authorization: Authorization::PerTool,
             plan_override: None,
             temperature: None,
@@ -2844,67 +2740,6 @@ mod tests {
         // per the order).
         gate.begin_turn();
         assert_eq!(gate.admit(now), GateDecision::SessionExhausted);
-    }
-
-    // -------------------------------------------------------------
-    // resolve_references
-    // -------------------------------------------------------------
-
-    fn temp_ref_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("attini-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    #[test]
-    fn resolve_references_inlines_small_utf8_file() {
-        let dir = temp_ref_dir("ref-small");
-        let path = dir.join("a.md");
-        std::fs::write(&path, "hello reference\n").unwrap();
-
-        let refs = resolve_references(&dir, std::slice::from_ref(&path)).unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].abs_path, std::fs::canonicalize(&path).unwrap());
-        assert_eq!(refs[0].inline.as_deref(), Some("hello reference\n"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_references_marks_oversized_file_as_opaque() {
-        let dir = temp_ref_dir("ref-big");
-        let path = dir.join("big.md");
-        let big = "x".repeat(REFERENCE_MAX_BYTES + 1);
-        std::fs::write(&path, &big).unwrap();
-
-        let refs = resolve_references(&dir, std::slice::from_ref(&path)).unwrap();
-        assert_eq!(refs.len(), 1);
-        assert!(refs[0].inline.is_none());
-        assert_eq!(refs[0].abs_path, std::fs::canonicalize(&path).unwrap());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_references_resolves_relative_path_against_workspace() {
-        let dir = temp_ref_dir("ref-rel");
-        std::fs::write(dir.join("rel.md"), "relative\n").unwrap();
-
-        let refs = resolve_references(&dir, &[std::path::PathBuf::from("rel.md")]).unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].inline.as_deref(), Some("relative\n"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resolve_references_missing_file_errors() {
-        let dir = temp_ref_dir("ref-miss");
-        let err = resolve_references(&dir, &[dir.join("nope.md")]).unwrap_err();
-        assert!(err.to_string().contains("--reference"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------------------------------------------------

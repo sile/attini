@@ -22,8 +22,9 @@ have done the thinking for the model:
 - `plan` / `submit_plan` — would have amortised approval into a plan; removed
   (`4c7a211`, and the model-facing tool in later commits).
 - `skill_load` — would have pulled skill content in mid-run; removed
-  (`a159db0`). Implicit skill discovery was also removed: skills must be named
-  explicitly with `--skill PATH`.
+  (`a159db0`). Implicit skill discovery was also removed, and the explicit
+  `--skill PATH` flag that briefly replaced it has since been removed too —
+  context now enters only via the prompt or `--stdin`.
 - `subagent` — would have delegated a subtask to a child process; removed
   entirely (`ec12bc5`).
 
