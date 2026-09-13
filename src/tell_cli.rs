@@ -782,22 +782,21 @@ fn drive(
         }
     }
 
-    Err(io::Error::other(max_turns_error(
-        &cfg.session_name,
-        cfg.max_turns,
-    )))
+    Err(io::Error::other(max_turns_error(cfg.max_turns)))
 }
 
-/// Build the error message shown when `tell` runs out of turns. Names
-/// both follow-ups: `attini approve` to keep going, and `attini tell`
-/// to give a new instruction instead. Exit code stays the generic 1 (a
-/// `tell` loop that used all its turns is a runtime failure, not a
-/// success).
-fn max_turns_error(session_name: &str, max_turns: usize) -> String {
+/// Build the error message shown when `tell` runs out of turns. The
+/// continuation command is placed on its own line so it can be copied
+/// verbatim; the session is taken from `-s` / `ATTINI_SESSION_NAME`
+/// (defaulting to `main`), so it is omitted here rather than restating
+/// a name that is already implicit in context. Exit code stays the
+/// generic 1 (a `tell` loop that used all its turns is a runtime
+/// failure, not a success).
+fn max_turns_error(max_turns: usize) -> String {
     format!(
-        "tell loop exceeded max_turns={max_turns}; to continue this session run: \
-         `attini approve -s {session_name}` (or give a new instruction with \
-         `attini tell -s {session_name} \"...\"`)"
+        "tell loop exceeded max_turns={max_turns}; continue this session? \
+         run the following command:\n\
+         attini approve  # or give a new instruction with: attini tell '...'"
     )
 }
 
@@ -3096,12 +3095,12 @@ mod tests {
 
     #[test]
     fn max_turns_error_points_at_approve_and_tell() {
-        let msg = max_turns_error("work", 20);
+        let msg = max_turns_error(20);
         assert!(msg.contains("max_turns=20"));
-        // The continuation path names the session explicitly.
-        assert!(msg.contains("attini approve -s work"));
-        // And redirects new instructions to `tell`.
-        assert!(msg.contains("attini tell -s work"));
+        // The continuation command sits on its own line, ready to copy,
+        // and does not restate the (implicit) session name.
+        assert!(msg.contains("\nattini approve  # or give a new instruction"));
+        assert!(!msg.contains("-s "));
     }
 
     #[test]
