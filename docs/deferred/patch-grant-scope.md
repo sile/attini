@@ -32,6 +32,13 @@ There is no middle ground of the form "let this model keep patching files under
    needs its own careful boundary discussion (workspace only, deny rules first,
    etc.) rather than riding in on the approve-command change.
 
+## Related
+
+`docs/deferred/write-permission-type.md` records the declarative-file-rule version of
+the same idea (a `write` rule type in `docs/design/permissions-file.md`). A file rule and
+a `--grant` analogue are two shapes of the same thing; if either is revived, decide which
+one subsumes the other before building both.
+
 ## If revived
 
 - Decide the grant shape: a path prefix, an exact path, or a glob (avoid globs

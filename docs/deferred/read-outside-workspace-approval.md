@@ -1,7 +1,22 @@
 # Read outside the workspace with on-the-spot approval (deferred)
 
 **Status:** Deferred. Not implemented. This memo records a design idea related to
-`docs/deferred/approve-command.md` (the dedicated `attini approve` command + `--grant`).
+`docs/deferred/approve-command.md` (the dedicated `attini approve` command + `--grant`)
+and to `docs/design/permissions-file.md` (the `read` rule type).
+
+## Two related cases
+
+This memo covers two shapes of the same itch:
+
+1. **Read outside the workspace.** The path is under no granted root, so today it is
+   rejected outright. The model cannot ask to look at it *now*.
+2. **Read under a `read` `allow:false` rule.** The path is inside the workspace, but a
+   permission rule denies it. `docs/design/permissions-file.md` makes this a *silent*
+   error today; ideally the model could ask and the human could approve a one-off read.
+
+Both want the same mechanism: turn a read denial into an approval request instead of a
+flat error. For now (case 2) the design keeps the error, and this memo records the
+ideal.
 
 ## Problem
 
@@ -80,9 +95,20 @@ path + a suspension path for read-only) and worth doing only together with the
 `approve`/`--grant` work in `docs/deferred/approve-command.md`, so the two share one
 approval vocabulary rather than growing two.
 
+## Connection to the permissions file
+
+With the JSONL permissions file (`docs/design/permissions-file.md`), a denied read is no
+longer only "outside every root"; it can also be a `read` rule with `allow:false` that
+wins the override chain. That gives the approval flow a cleaner thing to ask about: the
+model requested a specific path, a rule denied it, so approve/deny for *that path*. The
+ideal end state is that both cases (outside the workspace, and denied by a rule) surface
+the same "approve this read?" prompt. For now the file design returns a plain error for
+a denied read; this memo records the promotion into an approval request.
+
 ## How to revive
 
 Land `docs/deferred/approve-command.md` first (dedicated `attini approve` + `--grant
-SCOPE`). Then extend the same scope vocabulary to read roots: on `OutsideWorkspace`,
-park a pending read request, and on approval add the path as a read root under the chosen
-scope, persisting it so a resumed invocation rebuilds it in `run()`.
+SCOPE`). Then extend the same scope vocabulary to read roots: on `OutsideWorkspace` **or a
+`read` `allow:false` match**, park a pending read request, and on approval add the path as
+a read root under the chosen scope, persisting it so a resumed invocation rebuilds it in
+`run()`.
