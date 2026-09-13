@@ -173,6 +173,17 @@ fn run() -> Result<RunOutcome, RunError> {
             return Ok(RunOutcome::Ok);
         }
     }
+    match try_run_approve(&mut args)? {
+        CommandOutcome::NotHandled => {}
+        CommandOutcome::Done => return Ok(RunOutcome::Ok),
+        CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
+        CommandOutcome::Help => {
+            if let Some(help) = args.finish()? {
+                print!("{help}");
+            }
+            return Ok(RunOutcome::Ok);
+        }
+    }
     match try_run_ask(&mut args)? {
         CommandOutcome::NotHandled => {}
         CommandOutcome::Done => return Ok(RunOutcome::Ok),
@@ -223,10 +234,6 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .doc("Optional system prompt prepended to the conversation")
         .take(args)
         .present_and_then(|o| o.value().parse())?;
-    let approve = noargs::flag("approve")
-        .doc("Resume the session by approving its pending tool call")
-        .take(args)
-        .is_present();
     let local_only = noargs::flag("local-only")
         .doc("Local-only mode: auto-run commands matched by a `network: false` rule; leave others for approval")
         .take(args)
@@ -309,8 +316,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
             "Load a skill (a directory containing SKILL.md, or a SKILL.md file) \
              and prepend its body as a system message before PROMPT. Relative \
              paths resolve against the workspace root. There is no implicit \
-             skill discovery — the path must be given explicitly. \
-             Cannot be combined with --approve.",
+             skill discovery — the path must be given explicitly.",
         )
         .take(args)
         .present_and_then(|o| o.value().parse::<String>())?
@@ -361,7 +367,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         .is_present();
 
     let prompt: Option<String> = noargs::arg("[PROMPT]")
-        .doc("User prompt (required unless --approve is given)")
+        .doc("User prompt for this turn")
         .example("List the files in src/")
         .take(args)
         .present_and_then(|a| a.value().parse())?;
@@ -376,42 +382,23 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     let tool_call_rate = parse_tool_call_rate(&tool_call_rate_raw)?;
     let session_tool_call_max = parse_session_tool_call_max(&session_tool_call_max_raw)?;
 
-    if skill_path.is_some() && approve {
-        return Err(RunError::Runtime(
-            "--skill cannot be combined with --approve".to_string(),
-        ));
-    }
-    if use_stdin && approve {
-        return Err(RunError::Runtime(
-            "--stdin cannot be combined with --approve".to_string(),
-        ));
-    }
-    let cont = if approve {
-        if prompt.is_some() {
+    let p = match prompt {
+        Some(p) => p,
+        None => {
             return Err(RunError::Runtime(
-                "PROMPT must be omitted when using --approve".to_string(),
+                "PROMPT is required (to approve a pending call, use `attini approve`)".to_string(),
             ));
         }
-        Continuation::Approve
-    } else {
-        let p = match prompt {
-            Some(p) => p,
-            None => {
-                return Err(RunError::Runtime(
-                    "PROMPT is required unless --approve is given".to_string(),
-                ));
-            }
-        };
-        let p = if use_stdin {
-            match read_stdin_auxiliary()? {
-                Some(text) => append_stdin_aux(p, &text),
-                None => p,
-            }
-        } else {
-            p
-        };
-        Continuation::Prompt(p)
     };
+    let p = if use_stdin {
+        match read_stdin_auxiliary()? {
+            Some(text) => append_stdin_aux(p, &text),
+            None => p,
+        }
+    } else {
+        p
+    };
+    let cont = Continuation::Prompt(p);
 
     let mode = if local_only {
         attini::sansio::permissions::Mode::LocalOnly
@@ -439,8 +426,106 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         authorization,
         plan_override,
         temperature,
+        grant_request: agent_cli::GrantRequest::None,
     };
     match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
+        agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
+    }
+}
+
+// -------------------------------------------------------------------
+// `attini approve` command
+// -------------------------------------------------------------------
+
+/// Approve a session's pending tool call(s).
+///
+/// This is a dedicated subcommand rather than a `--approve` flag on
+/// `agent`: `agent` keeps an optional positional `<PROMPT>`, so a
+/// mistyped flag (`--approv`) is silently absorbed as the prompt and
+/// starts an unintended model turn. A subcommand has no positional, so
+/// an unknown flag fails cleanly. See `docs/deferred/approve-command.md`.
+fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("approve")
+        .doc("Approve the session's pending tool call(s) and continue the turn")
+        .take(args)
+        .is_present()
+    {
+        return Ok(CommandOutcome::NotHandled);
+    }
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; directory is .attini/<NAME>/")
+        .default("main")
+        .env(SESSION_ENV)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    let model: String = noargs::opt("model")
+        .ty("NAME")
+        .doc("Model name")
+        .default(DEFAULT_MODEL)
+        .env(MODEL_ENV)
+        .take(args)
+        .then(|o| o.value().parse())?;
+    // --grant <SCOPE>: fold a persistent auto-approve rule into the
+    // approval, replacing the separate `attini session grant` invocation.
+    let grant: agent_cli::GrantRequest = match noargs::opt("grant")
+        .ty("SCOPE")
+        .doc(
+            "Also persist an auto-approve rule for the approved command: \
+             `oneshot` (approve only, persist nothing — the default), \
+             `session` (append the argv-prefix to the session permissions.json), or \
+             `workspace` (append to the workspace-wide permissions.json).",
+        )
+        .take(args)
+        .present_and_then(|o| o.value().parse::<String>())?
+    {
+        Some(s) => match s.as_str() {
+            "oneshot" => agent_cli::GrantRequest::Oneshot,
+            "session" => agent_cli::GrantRequest::Session,
+            "workspace" => agent_cli::GrantRequest::Workspace,
+            other => {
+                return Err(RunError::Runtime(format!(
+                    "--grant must be 'oneshot', 'session', or 'workspace', got '{other}'"
+                )));
+            }
+        },
+        None => agent_cli::GrantRequest::None,
+    };
+
+    if args.metadata().help_mode {
+        return Ok(CommandOutcome::Help);
+    }
+    // No positional: an unknown token (e.g. `--approv`) is a hard error,
+    // not silently absorbed.
+    check_unconsumed_args(args)?;
+
+    let workspace_root = std::env::current_dir()
+        .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
+    let cfg = AgentConfig {
+        session_name,
+        model,
+        max_tokens: None,
+        workspace_root,
+        system_prompt: None,
+        max_turns: DEFAULT_MAX_TURNS,
+        mode: attini::sansio::permissions::Mode::Default,
+        extra_read_paths_cli: Vec::new(),
+        reference_paths: Vec::new(),
+        turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
+            .parse()
+            .map_err(|e| RunError::Runtime(format!("bad default turn limit: {e}")))?,
+        tool_call_rate: parse_tool_call_rate(DEFAULT_TOOL_CALL_RATE_STR)?,
+        session_tool_call_max: parse_session_tool_call_max(DEFAULT_SESSION_TOOL_CALL_MAX_STR)?,
+        skill_path: None,
+        authorization: attini::sansio::permissions::Authorization::PerTool,
+        plan_override: None,
+        temperature: None,
+        grant_request: grant,
+    };
+    match agent_cli::run(cfg, Continuation::Approve)
+        .map_err(|e| RunError::Runtime(e.to_string()))?
+    {
         agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
     }
 }

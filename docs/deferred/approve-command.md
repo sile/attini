@@ -1,9 +1,10 @@
 # Dedicated `attini approve` command and one-shot `--grant` (deferred)
 
-**Status:** Deferred. Not implemented. Records the case for replacing the `--approve` flag
-with a dedicated subcommand, and for adding a `--grant SCOPE` sugar to reduce grant
-friction. The motivation has been verified live and the semantics below are settled; only
-implementation remains.
+**Status:** Implemented. `attini approve` exists, `attini agent --approve` is removed, and
+`--grant oneshot|session|workspace` folds a persistent rule into the approval. The sections
+below are the design record; see the git history / README for the shipped form. Kept here
+because the *rationale* (why a subcommand rather than a flag) is still worth reading before
+anyone proposes re-adding `--approve`.
 
 ## The observation
 

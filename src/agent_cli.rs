@@ -235,6 +235,29 @@ pub struct AgentConfig {
     /// default (`Some(0.0)`, deterministic code editing); `Some(t)`
     /// overrides it.
     pub temperature: Option<f64>,
+    /// Requested one-shot grant to run alongside a `Continuation::Approve`:
+    /// `attini approve --grant <SCOPE>`. Persists an auto-approve rule for
+    /// the approved command's argv-prefix after the approval succeeds.
+    /// `None` for every other entry point.
+    pub grant_request: GrantRequest,
+}
+
+/// The `--grant SCOPE` value accepted by `attini approve`.
+///
+/// `Oneshot` is the default: approve the pending call and persist
+/// nothing. `Session` / `Workspace` additionally append the approved
+/// command's argv-prefix as an auto-approve rule, mirroring
+/// `attini session grant <prefix> [--workspace]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantRequest {
+    /// No grant was requested (`--grant` omitted, or not an approve run).
+    None,
+    /// `--grant oneshot`: persist nothing (the default approve behavior).
+    Oneshot,
+    /// `--grant session`: append to the session-local `permissions.json`.
+    Session,
+    /// `--grant workspace`: append to the workspace-wide `permissions.json`.
+    Workspace,
 }
 
 pub const DEFAULT_TURN_TOOL_CALL_LIMIT: usize = 20;
@@ -485,6 +508,11 @@ fn drive(
         }
         Continuation::Approve => {
             let pendings = load_pending_or_err(session)?;
+            // `--grant` is validated here (after the pending set is known)
+            // but applied only after every approval has succeeded, so a
+            // rejected/broken pending set never leaves a grant behind. See
+            // [`plan_grant`] for the up-front checks.
+            let grant_prefix = plan_grant(cfg.grant_request, &pendings)?;
             for pending in &pendings {
                 session.append(&SessionRecord::ToolApproval {
                     ts: now_unix_millis(),
@@ -496,6 +524,11 @@ fn drive(
                 append_tool(session, &mut messages, &pending.call_id, content)?;
             }
             session.clear_pending()?;
+            // Best-effort: the approval already stands, so a grant failure
+            // is a warning, not a rollback.
+            if let Some(prefix) = grant_prefix {
+                apply_grant(cfg, &prefix);
+            }
         }
     }
 
@@ -1539,14 +1572,104 @@ fn append_auto_approval(
 /// subcommand`) so the rule stays a general prefix rather than
 /// baking every flag in.
 fn emit_suggested_rule(argv: &[String]) {
-    if argv.is_empty() {
+    let Some(prefix) = grant_prefix(argv) else {
         return;
-    }
-    let take = argv.len().min(2);
-    let prefix_display = shell_escape_argv(&argv[..take]);
+    };
+    let prefix_display = shell_escape_argv(&prefix);
     eprintln!("suggested rule (persist separately after approve):");
     eprintln!("  attini session grant {prefix_display}                # session-local");
     eprintln!("  attini session grant {prefix_display} --workspace    # workspace-wide");
+    eprintln!(
+        "  attini approve --grant session                       # the same, folded into approve"
+    );
+}
+
+/// Truncate an argv to the prefix an auto-approve rule should use: at most
+/// two elements (typical pattern: `program subcommand`) so the rule stays a
+/// general prefix rather than baking every flag in. Shared by
+/// [`emit_suggested_rule`] and `attini approve --grant` so the two can never
+/// disagree about what prefix would be written.
+fn grant_prefix(argv: &[String]) -> Option<Vec<String>> {
+    if argv.is_empty() {
+        return None;
+    }
+    let take = argv.len().min(2);
+    Some(argv[..take].to_vec())
+}
+
+/// Validate and resolve the `attini approve --grant` request against the
+/// pending set, returning the argv-prefix to persist (if any).
+///
+/// A grant that cannot be formed is an error, not a silent no-op: if the
+/// pending call(s) are not exactly one command, or its argv yields no
+/// prefix, `--grant` is rejected before any approval is recorded.
+/// `--grant oneshot` (and no grant at all) never persist anything and
+/// therefore never depend on the pending set.
+fn plan_grant(request: GrantRequest, pendings: &[Pending]) -> io::Result<Option<Vec<String>>> {
+    let argv = match request {
+        GrantRequest::None | GrantRequest::Oneshot => return Ok(None),
+        GrantRequest::Session | GrantRequest::Workspace => {
+            let commands: Vec<&Pending> = pendings
+                .iter()
+                .filter(|p| p.tool_kind == PendingToolKind::Command)
+                .collect();
+            match (commands.len(), pendings.len()) {
+                (0, _) => {
+                    return Err(io::Error::other(
+                        "--grant applies to commands only; the pending call(s) are not a command"
+                            .to_string(),
+                    ));
+                }
+                (1, 1) => {}
+                _ => {
+                    return Err(io::Error::other(
+                        "--grant is ambiguous with multiple pending calls; approve one at a time"
+                            .to_string(),
+                    ));
+                }
+            }
+            let inv = CommandInvocation::parse(&commands[0].arguments_json).map_err(|e| {
+                io::Error::other(format!(
+                    "--grant: could not read the pending command: {e:?}"
+                ))
+            })?;
+            match grant_prefix(&inv.argv) {
+                Some(prefix) => prefix,
+                None => {
+                    return Err(io::Error::other(
+                        "--grant: the pending command has no argv to persist".to_string(),
+                    ));
+                }
+            }
+        }
+    };
+    Ok(Some(argv))
+}
+
+/// Best-effort persistence of the resolved grant, run after every pending
+/// call has been approved. The approval already stands, so any failure is
+/// reported as a one-line warning rather than rolling the approval back.
+fn apply_grant(cfg: &AgentConfig, argv_prefix: &[String]) {
+    let scope = match cfg.grant_request {
+        GrantRequest::Session => permissions::GrantScope::Session(&cfg.session_name),
+        GrantRequest::Workspace => permissions::GrantScope::Workspace,
+        GrantRequest::None | GrantRequest::Oneshot => return,
+    };
+    let display = shell_escape_argv(argv_prefix);
+    match permissions::grant(scope, argv_prefix) {
+        Ok(permissions::GrantOutcome::Appended(path)) => {
+            eprintln!(
+                "[approve] granted: appended '{display}' to {}",
+                path.display()
+            );
+        }
+        Ok(permissions::GrantOutcome::AlreadyGranted(path)) => {
+            eprintln!("[approve] already granted (no-op): {}", path.display());
+        }
+        Err(e) => {
+            eprintln!("[approve] warning: grant of '{display}' failed: {e}; approval still stands");
+        }
+    }
 }
 
 /// Unconditionally wrap `s` in POSIX single-quotes, escaping any
@@ -2574,6 +2697,7 @@ mod tests {
             authorization: Authorization::PerTool,
             plan_override: None,
             temperature: None,
+            grant_request: GrantRequest::None,
         }
     }
 
@@ -3116,6 +3240,79 @@ mod tests {
         assert!(note.contains("read"));
         assert!(note.contains("search"));
         assert!(note.contains("do not put"));
+    }
+
+    // -------------------------------------------------------------
+    // grant_prefix / plan_grant
+    // -------------------------------------------------------------
+
+    fn command_pending(call_id: &str, argv: &[&str]) -> Pending {
+        let argv_json = argv
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        Pending {
+            ts: 0,
+            call_id: call_id.to_string(),
+            tool_kind: PendingToolKind::Command,
+            function_name: "command".to_string(),
+            arguments_json: format!("{{\"argv\":[{argv_json}]}}"),
+            preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn grant_prefix_truncates_to_two_elements() {
+        assert_eq!(grant_prefix(&[]), None);
+        assert_eq!(
+            grant_prefix(&["cargo".to_string()]),
+            Some(vec!["cargo".to_string()])
+        );
+        assert_eq!(
+            grant_prefix(&["cargo".to_string(), "test".to_string(), "-q".to_string()]),
+            Some(vec!["cargo".to_string(), "test".to_string()])
+        );
+    }
+
+    #[test]
+    fn plan_grant_none_and_oneshot_never_persist() {
+        let pendings = vec![command_pending("c1", &["cargo", "test"])];
+        assert_eq!(plan_grant(GrantRequest::None, &pendings).unwrap(), None);
+        assert_eq!(plan_grant(GrantRequest::Oneshot, &pendings).unwrap(), None);
+    }
+
+    #[test]
+    fn plan_grant_session_resolves_command_prefix() {
+        let pendings = vec![command_pending("c1", &["cargo", "test", "--all"])];
+        assert_eq!(
+            plan_grant(GrantRequest::Session, &pendings).unwrap(),
+            Some(vec!["cargo".to_string(), "test".to_string()])
+        );
+    }
+
+    #[test]
+    fn plan_grant_rejects_non_command_pending() {
+        let pendings = vec![Pending {
+            ts: 0,
+            call_id: "p1".to_string(),
+            tool_kind: PendingToolKind::Patch,
+            function_name: "patch".to_string(),
+            arguments_json: "{}".to_string(),
+            preview: String::new(),
+        }];
+        let err = plan_grant(GrantRequest::Session, &pendings).unwrap_err();
+        assert!(err.to_string().contains("commands only"), "{err}");
+    }
+
+    #[test]
+    fn plan_grant_rejects_multiple_pending_commands() {
+        let pendings = vec![
+            command_pending("c1", &["cargo", "test"]),
+            command_pending("c2", &["git", "status"]),
+        ];
+        let err = plan_grant(GrantRequest::Workspace, &pendings).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
     // -------------------------------------------------------------

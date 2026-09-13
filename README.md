@@ -82,6 +82,8 @@ export DEEPSEEK_API_KEY=sk-...
 
 ```sh
 attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
+
+attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
 
 `--reference PATH` / `-r PATH` (repeatable) inlines the contents of an arbitrary
@@ -95,7 +97,7 @@ clearly marked `--- stdin ---` block, so small pasted fragments need no temp
 file. When stdin is a terminal it prints a note and reads interactively until
 EOF (Ctrl+D); Ctrl+C cancels. It caps input at 1 MiB and warns when stdin is
 empty. It is meant for *data*, not background context — use `--reference PATH`
-for that. `--stdin` cannot be combined with `--approve`.
+for that.
 
 Extra positional tokens are now rejected as a usage error (`attini agent hello
 world` fails instead of silently dropping `world`), so multi-word prompts must
@@ -113,14 +115,13 @@ or a `SKILL.md` file directly. Its body is prepended to the system prompt before
 the first turn. Relative paths resolve against the workspace root. There is **no
 implicit skill discovery** — attini never scans `~/.attini/skills` or
 `.attini/skills`, and the model has no `skill_load` tool. Context enters only
-because you asked for it, explicitly, at invocation start. `--skill` cannot be
-combined with `--approve`.
+because you asked for it, explicitly, at invocation start.
 
 `--plan=on` / `--plan=off` turns plan mode on or off **persistently** for the
 session. In plan mode every patch — including edits on git-tracked files, which
 would otherwise be auto-applied — requires explicit human approval before it
 touches the workspace. Commands are unchanged (deny rules still hard-reject),
-and `--approve` still works. The flag persists in
+and `attini approve` still works. The flag persists in
 `.attini/<SESSION>/plan_mode` and is reflected in `attini session show`; omitting
 it leaves the session's current plan-mode state unchanged.
 
@@ -130,6 +131,36 @@ enable chain-of-thought. The human is the final gate, so a private exploration
 is mostly wasted, and it was the largest source of context bloat — see
 `docs/design/thinking-mode.md`. With thinking off no `reasoning_content` is
 produced or replayed, and `temperature` is always effective.
+
+### Approving (`attini approve`)
+
+```sh
+attini approve [-s NAME] [--grant oneshot|session|workspace]
+```
+
+Approving a session's pending tool call(s) is a **dedicated subcommand**, not a
+`--approve` flag on `agent`. The reason is typo safety: `agent` keeps an optional
+positional `<PROMPT>`, so a mistyped flag like `attini agent --approv` is
+silently absorbed as the prompt and starts an unintended model turn. `approve`
+has no positional, so `attini approve --approv` fails cleanly as an unknown
+flag. (`attini agent --approve` was removed, not deprecated.)
+
+`--grant SCOPE` folds a persistent auto-approve rule into the approval, so you
+do not have to copy-paste the `attini session grant ...` suggestion afterward:
+
+| `SCOPE` | Effect |
+|---|---|
+| `oneshot` | approve only, persist nothing (the default) |
+| `session` | approve, then append the command's argv-prefix to the session `permissions.json` |
+| `workspace` | approve, then append it to the workspace-wide `permissions.json` |
+
+Approval and grant are independent: the approval always stands, and a grant that
+cannot be written (already granted, a conflicting deny rule, or an I/O error) is
+reported as a one-line warning rather than rolling the approval back. A grant
+that cannot be *formed* — the pending call is not a command, its argv yields no
+prefix, or several commands are pending — is rejected up front. The argv-prefix
+is truncated the same way as the printed suggestion (first two elements, e.g.
+`cargo test`), so the two never disagree.
 
 When an `attini agent` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
