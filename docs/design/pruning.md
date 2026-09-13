@@ -11,7 +11,7 @@ long session. Pruning is the step that actually removes those older records.
 
 There is deliberately **no `attini prune` command**. Pruning is housekeeping, not a
 decision a human should have to remember to make, and a manual command would fight the
-read-only inspection tools (`attini analyze` / `attini show`) that read the same log.
+read-only inspection tools (`attini logstats` / `attini status`) that read the same log.
 Instead, pruning runs automatically the next time the log has grown past a byte
 threshold, as part of the same pass that compaction already performs.
 
@@ -48,7 +48,7 @@ crash mid-write cannot truncate the conversation.
 
 ## Interaction with inspection
 
-Pruning removes history that `attini analyze` / `attini show` would otherwise read.
+Pruning removes history that `attini logstats` / `attini status` would otherwise read.
 That is acceptable because it is automatic and infrequent (only past 100 MB), and
 because the records it drops are already folded into a summary that inspection still
 shows. Pruning never touches the newest summary or the retained tail.

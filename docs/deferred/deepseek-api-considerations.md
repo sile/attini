@@ -1,15 +1,13 @@
 # DeepSeek API deferred options
 
-**Status:** Deferred. Options 2, 5, and 6 below remain open. Implemented and
+**Status:** Deferred. Options 5 and 6 below remain open. Implemented and
 explicitly-not-planned decisions are recorded in
 `docs/design/deepseek-api.md`.
 
-## 2. `reasoning_content` resend spec (watch item)
-
-`docs/deferred/deepseek-reasoning-resend.md` records the documented rule: when
-a request carries `tools`, `reasoning_content` must be passed back or the API
-returns 400. Commit `52a9ee6` strips it. No 400 has been observed in practice;
-kept as a watch item.
+> Option 2 (`reasoning_content` resend) is **moot**: thinking mode and the
+> whole reasoning pipeline were later removed, so no `reasoning_content` is
+> generated or sent. The former memo `docs/deferred/deepseek-reasoning-resend.md`
+> was deleted with that change. Kept out of the open list below.
 
 ## 5. Model split (agent vs. summariser vs. ask)
 
@@ -28,10 +26,11 @@ would help the model react. Low priority.
 
 ## How to revive
 
-Implement Option 1 first (explicit `thinking` / `reasoning_effort`), verify
-with a live run that tool-calling still works with `thinking: disabled`, then
-wire `temperature: 0`. Retry (Option 4) is currently rejected — revisit
-only if transient failures become frequent enough that a manual re-run
-becomes genuinely painful. Re-check all model names / parameter names
-against the official docs at implementation time; this note's values came
-from the docs review session and could drift.
+Option 5 (model split) only matters once the primary agent model changes
+(e.g. if a tool-capable `deepseek-reasoner` variant becomes the default).
+Option 6 (`content_filter` / `insufficient_system_resource` finish reasons)
+is a small, self-contained addition to the response handling. Retry (Option 4)
+is currently rejected — revisit only if transient failures become frequent
+enough that a manual re-run becomes genuinely painful. Re-check all model
+names / parameter names against the official docs at implementation time;
+this note's values came from the docs review session and could drift.

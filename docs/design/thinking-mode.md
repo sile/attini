@@ -38,13 +38,14 @@ context growth and a whole set of conditional-strip questions disappear.
 
 ### It removed a lingering spec liability
 
-`docs/deferred/deepseek-reasoning-resend.md` records an unresolved gap:
-DeepSeek's Thinking Mode guide requires that, for tools-bearing requests,
-`reasoning_content` be resent in **all** subsequent requests or the API may
-return a 400. attini strips it. The strict path was never observed to fire,
-but the concern was real. With thinking disabled, no `reasoning_content`
-exists to resend, so the spec requirement does not apply at all — the question
-is closed by construction rather than answered.
+A former deferred memo (`docs/deferred/deepseek-reasoning-resend.md`, since
+removed) recorded an unresolved gap: DeepSeek's Thinking Mode guide requires
+that, for tools-bearing requests, `reasoning_content` be resent in **all**
+subsequent requests or the API may return a 400. attini stripped it. The
+strict path was never observed to fire, but the concern was real. With
+thinking disabled, no `reasoning_content` exists to resend, so the spec
+requirement does not apply at all — the question is closed by construction
+rather than answered.
 
 ## What was removed
 

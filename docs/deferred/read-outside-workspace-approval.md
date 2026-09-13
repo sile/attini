@@ -1,7 +1,7 @@
 # Read outside the workspace with on-the-spot approval (deferred)
 
 **Status:** Deferred. Not implemented. This memo records a design idea related to
-`docs/deferred/approve-command.md` (the dedicated `attini approve` command + `--grant`)
+`docs/design/approve-command.md` (the dedicated `attini approve` command + `--grant`)
 and to `docs/design/permissions-file.md` (the `read` rule type).
 
 ## Two related cases
@@ -72,7 +72,7 @@ one is cancelled), a parked read behaves like any other approval-gated call.
 ## Open questions
 
 - **Scope of approval.** One path? The containing directory? A session grant? This is
-  where `docs/deferred/approve-command.md`'s `--grant SCOPE<oneshot|session|workspace>`
+  where `docs/design/approve-command.md`'s `--grant SCOPE<oneshot|session|workspace>`
   directly connects: the read case wants the same vocabulary, and `oneshot` is awkward
   here because a read root is inherently session-lived once added.
 - **Mutability of `ToolExecutor`.** Either `extra_read_roots` becomes interior-mutable
@@ -92,7 +92,7 @@ one is cancelled), a parked read behaves like any other approval-gated call.
 **Deferred.** The itch is real (workspace-only reads are awkward when the path is found
 mid-task), but the fix is structural (mutable/rebuildable executor + a new persistence
 path + a suspension path for read-only) and worth doing only together with the
-`approve`/`--grant` work in `docs/deferred/approve-command.md`, so the two share one
+`approve`/`--grant` work in `docs/design/approve-command.md`, so the two share one
 approval vocabulary rather than growing two.
 
 ## Connection to the permissions file
@@ -107,7 +107,7 @@ a denied read; this memo records the promotion into an approval request.
 
 ## How to revive
 
-Land `docs/deferred/approve-command.md` first (dedicated `attini approve` + `--grant
+Land `docs/design/approve-command.md` first (dedicated `attini approve` + `--grant
 SCOPE`). Then extend the same scope vocabulary to read roots: on `OutsideWorkspace` **or a
 `read` `allow:false` match**, park a pending read request, and on approval add the path as
 a read root under the chosen scope, persisting it so a resumed invocation rebuilds it in

@@ -358,7 +358,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
 /// `tell`: `tell` keeps an optional positional `<PROMPT>`, so a
 /// mistyped flag (`--approv`) is silently absorbed as the prompt and
 /// starts an unintended model turn. A subcommand has no positional, so
-/// an unknown flag fails cleanly. See `docs/deferred/approve-command.md`.
+/// an unknown flag fails cleanly. See `docs/design/approve-command.md`.
 fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("approve")
         .doc("Resume a stopped session: approve its pending tool call(s), or continue at max_turns")

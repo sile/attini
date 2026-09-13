@@ -1,7 +1,7 @@
 # Patch grant scope (deferred)
 
 **Status:** Deferred. Not implemented. This memo records a future idea that
-surfaces while designing `docs/deferred/approve-command.md` (the dedicated
+surfaces while designing `docs/design/approve-command.md` (the dedicated
 `attini approve` command with `--grant SCOPE`).
 
 ## The idea
@@ -44,7 +44,7 @@ one subsumes the other before building both.
 - Decide the grant shape: a path prefix, an exact path, or a glob (avoid globs
   if a pure prefix suffices).
 - Reuse the same approve-then-grant independence rules from
-  `docs/deferred/approve-command.md`: the grant is best-effort and its failure is
+  `docs/design/approve-command.md`: the grant is best-effort and its failure is
   a warning, not a rollback.
 - Keep the command-side `SCOPE` and the patch-side scope as separate options
   (e.g. `--grant-command SCOPE` vs. `--grant-patch SCOPE`) if a shared vocabulary

@@ -1,10 +1,10 @@
-# Dedicated `attini approve` command and one-shot `--grant` (deferred)
+# Dedicated `attini approve` command and one-shot `--grant`
 
-**Status:** Implemented. `attini approve` exists, `attini agent --approve` is removed, and
-`--grant oneshot|session|workspace` folds a persistent rule into the approval. The sections
-below are the design record; see the git history / README for the shipped form. Kept here
-because the *rationale* (why a subcommand rather than a flag) is still worth reading before
-anyone proposes re-adding `--approve`.
+**Status:** Implemented. `attini approve` exists, the `attini agent --approve` flag was
+removed, and `--grant oneshot|session|workspace` folds a persistent rule into the
+approval. The sections below are the design record; see the git history / README for the
+shipped form. The *rationale* (why a subcommand rather than a flag) is kept because it is
+still worth reading before anyone proposes re-adding `--approve`.
 
 The standalone `attini grant` / `attini grant-read` subcommands described below were later
 **removed**: with the JSONL format, rules are plain lines edited by hand, and the only
@@ -42,7 +42,7 @@ Two problems:
    only exists because `agent` must keep an optional `<PROMPT>`, and `--approve` rides
    along on that command.
 2. **It is conceptually a command, not a modifier.** "Approve the pending call" is a
-   self-contained action on a session, in the same family as `attini show` /
+   self-contained action on a session, in the same family as `attini status` /
    `attini ask`. Modelling it as a subcommand gives it its own `--help`, its own
    name in the top-level command list, and shell-completion/tab-completion ergonomics.
    Decisively: an `approve` subcommand has **no positional**, so `attini approve --approv`

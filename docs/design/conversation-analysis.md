@@ -38,7 +38,7 @@ kinds dominate, which tool results are largest, which files are read
 repeatedly, which external commands produce the most output, and how much of
 the assistant payload is `reasoning` vs `content`.
 
-## Implemented: `attini analyze <NAME>`
+## Implemented: `attini logstats <NAME>`
 
 A deterministic Rust subcommand that reads `conversation.jsonl` (no LOCK
 required, read-only) and prints:

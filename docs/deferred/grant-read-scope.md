@@ -55,7 +55,7 @@ family as the command one, instead of only being hand-editable.
 
 ## Related
 
-- `docs/deferred/approve-command.md` — the shipped `attini approve` + `--grant
+- `docs/design/approve-command.md` — the shipped `attini approve` + `--grant
   oneshot|session|workspace`; notes that standalone `grant` / `grant-read` were removed and
   that `--grant` has no `read` scope.
 - `docs/deferred/read-outside-workspace-approval.md` — the fuller "approve a read on the

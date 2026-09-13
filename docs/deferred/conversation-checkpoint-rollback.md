@@ -30,7 +30,7 @@ Every record in `conversation.jsonl` already has a `ts` (millis). Options:
 
 ### Surface the checkpoint at agent startup
 
-When `attini tell` opens a session, print (or record in `attini show`) the checkpoint at the tail — e.g. `checkpoint: seq=12341` or the `ts` of the last record. The human can then say "reset to seq=12341" if the following turns go wrong. This is the "output an identifier at startup, roll back to it" idea in its direct form.
+When `attini tell` opens a session, print (or record in `attini status`) the checkpoint at the tail — e.g. `checkpoint: seq=12341` or the `ts` of the last record. The human can then say "reset to seq=12341" if the following turns go wrong. This is the "output an identifier at startup, roll back to it" idea in its direct form.
 
 ### Rollback (reset)
 
@@ -50,7 +50,7 @@ The safer default, more like `git checkout` than `git reset`: create a **new ses
 
 ### Human CLI surface
 
-- Extend `attini show` to print a `checkpoint:` line.
+- Extend `attini status` to print a `checkpoint:` line.
 - New destructive `attini reset <SESSION> --at <checkpoint>` (confirmation prompt / `-y`).
 - New non-destructive `attini fork <SRC> --to <DST> --at <checkpoint>`.
 
@@ -81,6 +81,6 @@ The safer default, more like `git checkout` than `git reset`: create a **new ses
 
 ## How to revive
 
-Start with the non-destructive half: surface a checkpoint (`ts` or `seq`) in `attini show` and at agent invocation start, and add `attini fork <SRC> --to <DST> --at <checkpoint>`. Fork copies the recorded prefix, so summarised history stays as-is and avoids the compaction-truncation problem.
+Start with the non-destructive half: surface a checkpoint (`ts` or `seq`) in `attini status` and at agent invocation start, and add `attini fork <SRC> --to <DST> --at <checkpoint>`. Fork copies the recorded prefix, so summarised history stays as-is and avoids the compaction-truncation problem.
 
 Add the destructive `reset` only after fork experience shows demand, and only after solving the compaction edge case (either refuse rollback into a summarised range, or archive the pre-summary records).
