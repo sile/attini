@@ -20,6 +20,9 @@ const MAX_TOKENS_ENV: &str = "ATTINI_MAX_TOKENS";
 /// Environment variable that supplies a default sampling temperature when
 /// `--temperature` is omitted.
 const TEMPERATURE_ENV: &str = "ATTINI_TEMPERATURE";
+/// Environment variable that supplies a default system prompt when
+/// `--system-prompt` is omitted.
+const SYSTEM_PROMPT_ENV: &str = "ATTINI_SYSTEM_PROMPT";
 
 /// Cap on how many bytes `--stdin` may contribute to the prompt, to avoid
 /// bloating the user message with an unbounded paste.
@@ -238,9 +241,10 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .env(MODEL_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
-    let system: Option<String> = noargs::opt("system")
+    let system: Option<String> = noargs::opt("system-prompt")
         .ty("TEXT")
         .doc("Optional system prompt prepended to the conversation")
+        .env(SYSTEM_PROMPT_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse())?;
     let session_name: String = noargs::opt("session")
