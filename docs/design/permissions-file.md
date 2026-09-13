@@ -38,7 +38,6 @@ expressed by **which file it lives in**:
 |---|---|
 | workspace | `.attini/permissions.jsonl` |
 | session | `.attini/<NAME>/permissions.jsonl` |
-| oneshot | in-memory only, never written to disk |
 
 ## Rule shape
 
@@ -89,7 +88,7 @@ bytes.
 Rules are evaluated as one ordered list, built by concatenation:
 
 ```
-[ workspace rules ] ++ [ session rules ] ++ [ oneshot rules ]
+[ workspace rules ] ++ [ session rules ]
 ```
 
 Earlier layers are weaker; later layers override them. Evaluation walks the
@@ -107,12 +106,14 @@ The second is intentional: a local layer winning over a broader one is the
 whole point of having layers, and a session-scoped exception to a workspace
 denial is a normal operation.
 
-### The oneshot layer
+### One-shot approval
 
-`oneshot` is an in-memory set of prefixes approved **during the current
-invocation** (via `attini approve --grant oneshot`). It is never written to
-disk, so it disappears when the process exits. It sits last in the chain, so
-it can override both file layers for the remainder of that one invocation.
+`attini approve --grant oneshot` approves the pending call (which runs
+immediately) and persists nothing. That is enough while approval and
+execution stay in the same invocation, so there is no separate in-memory
+layer in the evaluation chain. A third "oneshot prefix set" layer would only
+matter if one invocation needed to pre-approve a prefix for several later
+calls, which the single-call approval flow does not require.
 
 ## Error handling
 
@@ -126,17 +127,11 @@ it can override both file layers for the remainder of that one invocation.
 
 The JSONL format, the `command`/`read` types, the required `allow` field, the
 recursive path matching, and last-match-wins evaluation over
-`[workspace] ++ [session] ++ [oneshot]` are all in place. `attini grant` /
-`grant-read` append a single line; hand-edited comments survive an append.
+`[workspace] ++ [session]` are all in place. `attini grant` / `grant-read`
+append a single line; hand-edited comments survive an append.
 
-Two pieces of the document are **not** wired up yet and are tracked elsewhere:
+One piece of the document is **not** wired up yet and is tracked elsewhere:
 
-- The **oneshot** layer exists structurally in the evaluation chain but is
-  always empty today: `attini approve --grant oneshot` approves the pending
-  call (which runs immediately) and persists nothing, which is sufficient
-  while approval and execution stay in the same invocation. Populating the
-  oneshot layer would only matter if a single invocation needed to pre-approve
-  a prefix for several later calls.
 - A matching `read` rule with `allow:false` is not yet enforced as an
   approval request; read access is still governed by the executor's granted
   roots. See `docs/deferred/read-outside-workspace-approval.md`.

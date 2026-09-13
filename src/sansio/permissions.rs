@@ -5,7 +5,7 @@
 //! (argv-prefix matcher) or a `read` rule (recursive path matcher),
 //! and carries an explicit `allow` boolean. Evaluation is
 //! **last-match-wins** over the concatenated list
-//! `[workspace] ++ [session] ++ [oneshot]`; if no rule matches, the
+//! `[workspace] ++ [session]`; if no rule matches, the
 //! outcome is `Pending`. No I/O — file loading and session record
 //! writing live in the impl-layer `crate::permissions` and
 //! `crate::tell_cli`.
@@ -76,13 +76,12 @@ impl Rule {
 }
 
 /// Which layer a rule came from, for history output. The layer is a
-/// property of which file the rule was loaded from (or the in-memory
-/// oneshot set), not a field in the rule itself.
+/// property of which file the rule was loaded from, not a field in the
+/// rule itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleScope {
     Workspace,
     Session,
-    Oneshot,
 }
 
 impl RuleScope {
@@ -90,7 +89,6 @@ impl RuleScope {
         match self {
             Self::Workspace => "workspace",
             Self::Session => "session",
-            Self::Oneshot => "oneshot",
         }
     }
 }
@@ -138,7 +136,7 @@ pub struct RuleMatch {
 
 /// Evaluate a command against the permission rules. `layers` is the
 /// concatenated rule chain in increasing precedence, e.g.
-/// `[(Workspace, ws), (Session, sess), (Oneshot, oneshot)]`. The
+/// `[(Workspace, ws), (Session, sess)]`. The
 /// decision of the **last** matching `command` rule wins; no match
 /// yields `Pending`.
 pub fn evaluate(

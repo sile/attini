@@ -592,14 +592,10 @@ fn drive(
 
     let tools = build_tool_defs();
     let rules = permissions::load(&cfg.session_name)?;
-    // Rule chain in increasing precedence: workspace, then session, then
-    // oneshot. The oneshot layer is in-memory only and currently empty
-    // (populated in a later step); an empty slice is fine.
-    let oneshot_rules: Vec<Rule> = Vec::new();
+    // Rule chain in increasing precedence: workspace, then session.
     let permission_layers: Vec<(RuleScope, &[Rule])> = vec![
         (RuleScope::Workspace, rules.workspace.as_slice()),
         (RuleScope::Session, rules.session.as_slice()),
-        (RuleScope::Oneshot, oneshot_rules.as_slice()),
     ];
     let mut gate = ToolCallGate::new(cfg);
 
