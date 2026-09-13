@@ -9,7 +9,8 @@ anyone proposes re-adding `--approve`.
 The standalone `attini grant` / `attini grant-read` subcommands described below were later
 **removed**: with the JSONL format, rules are plain lines edited by hand, and the only
 write path is `attini approve --grant` (commands). `--grant` has no `read` scope, so read
-rules are always added by hand.
+rules are always added by hand; that asymmetry is recorded in
+`docs/deferred/grant-read-scope.md`.
 
 ## The observation
 
