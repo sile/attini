@@ -35,7 +35,7 @@ awkward when it is discovered mid-task.
   `ToolExecutionError::OutsideWorkspace`, surfaced to the model as a plain tool error.
   There is no approval hook.
 - `extra_read_roots` is built **once** in `run()` (`src/tell_cli.rs:289`) from the
-  persistent `extra_read_paths` in `permissions.json`.
+  allow `read` rules in `permissions.jsonl`.
   `canonicalise_extra_read_roots` dedupes and canonicalises. The `ToolExecutor` is then
   constructed once (`src/tell_cli.rs:291`) and never mutated for the rest of the session.
 - Read-only dispatch (`ToolKind::ReadOnly`, `src/tell_cli.rs:644`) executes **inline**:
@@ -62,8 +62,8 @@ become mutable during the loop, or be rebuilt when a new root is granted.
    (same shape as `CommandDispatch::Awaiting`).\*
 2. The human approves or denies. On approve, add the requested path as a read root.
 3. On resume, the new root must be reconstructed **before** the model reissues the call,
-   so it has to be persisted (e.g. into `permissions.json` as an `extra_read_paths`
-   entry, or a session-scoped list) and re-read in `run()` the way `grant-read` entries
+   so it has to be persisted (e.g. into `permissions.jsonl` as an allow `read`
+   rule, or a session-scoped list) and re-read in `run()` the way `grant-read` entries
    already are.
 
 \* Because of the tool-batching rule (approval-gated calls go last, and anything after
@@ -78,7 +78,7 @@ one is cancelled), a parked read behaves like any other approval-gated call.
 - **Mutability of `ToolExecutor`.** Either `extra_read_roots` becomes interior-mutable
   (`RefCell`/`RwLock`) so the loop can push a root on approval, or the executor is
   rebuilt. Both are structural; neither is needed by `patch`/`command`.
-- **Persistence key.** Adding to `permissions.json.extra_read_paths` blends one-shot
+- **Persistence key.** Adding an allow `read` rule to `permissions.jsonl` blends one-shot
   approvals into the persistent grant list (it would outlive the session unless tagged).
   A session-scoped list avoids that but adds a new state file.
 - **Model signal.** The model currently learns the boundary only by hitting

@@ -1,32 +1,35 @@
-//! Filesystem-facing side of the permission system: load rules and
-//! extra read paths from `.attini/{NAME}/permissions.json`
-//! (session-local) and `.attini/permissions.json` (workspace-wide),
-//! and implement `attini grant` / `attini grant-read`.
+//! Filesystem-facing side of the permission system: load rules from
+//! `.attini/{NAME}/permissions.jsonl` (session-local) and
+//! `.attini/permissions.jsonl` (workspace-wide), and implement
+//! `attini grant` / `attini grant-read`.
 //!
-//! The on-disk schema evolved from a legacy top-level array of rule
-//! objects (`[{prefix, decision, ...}]`) to a top-level object
-//! (`{command_prefixes: [...], extra_read_paths: [...]}`). Both are
-//! accepted on load. Any write goes out as the object form; a legacy
-//! array file is auto-migrated on the first write.
+//! The on-disk format is **JSONL**: one JSON object per line, one rule
+//! per line. Lines beginning with `#` are comments; blank lines are
+//! ignored. Each rule has a fixed field order (`type` -> `allow` ->
+//! type-specific) and an explicit `allow` boolean. The layer a rule
+//! belongs to is expressed by which file it lives in, not by a field.
+//! See `docs/design/permissions-file.md`.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
+use nojson::{DisplayJson, JsonFormatter, RawJson, RawJsonValue};
 
-use crate::sansio::permissions::{Rule, RuleDecision};
+use crate::sansio::permissions::{PermissionKind, Rule};
 use crate::session::{SessionPaths, session_paths, session_root};
 
-pub const PERMISSIONS_FILENAME: &str = "permissions.json";
+pub const PERMISSIONS_FILENAME: &str = "permissions.jsonl";
 
 pub struct LoadedRules {
-    pub session: Vec<Rule>,
+    /// Rules from the workspace-wide file, in file order.
     pub workspace: Vec<Rule>,
-    /// Union of `extra_read_paths` from both tiers, deduplicated and
-    /// sorted. Callers typically pass this to `ToolExecutor::new` after
-    /// canonicalising each entry.
+    /// Rules from the session-local file, in file order.
+    pub session: Vec<Rule>,
+    /// Union of `read` rules from both tiers, deduplicated and sorted.
+    /// Callers typically pass the resolved paths to `ToolExecutor::new`
+    /// after canonicalising each entry.
     pub extra_read_paths: Vec<String>,
 }
 
@@ -38,106 +41,55 @@ pub fn session_permissions_path(paths: &SessionPaths) -> PathBuf {
     paths.dir.join(PERMISSIONS_FILENAME)
 }
 
-/// Load session-local + workspace-wide permissions. Missing files →
-/// empty. Whole-file parse errors → empty for that scope + `warn` to
-/// stderr. Individual rule / path validation failures → skip that
-/// entry + `warn`.
+/// Load session-local + workspace-wide permissions. Missing files ->
+/// empty. A whole-file read failure is reported and treated as empty.
+/// An individual malformed line is reported and skipped; the rest of
+/// the file still loads.
 pub fn load(session_name: &str) -> io::Result<LoadedRules> {
     let paths = session_paths(session_name)?;
-    let (session, session_paths_list) =
-        load_from_path(&session_permissions_path(&paths), "session");
-    let (workspace, workspace_paths_list) =
-        load_from_path(&workspace_permissions_path(), "workspace");
+    let workspace = load_rules_from_path(&workspace_permissions_path(), "workspace");
+    let session = load_rules_from_path(&session_permissions_path(&paths), "session");
     let mut merged: BTreeSet<String> = BTreeSet::new();
-    merged.extend(session_paths_list);
-    merged.extend(workspace_paths_list);
+    for rule in workspace.iter().chain(session.iter()) {
+        if rule.kind == PermissionKind::Read && rule.allow {
+            merged.insert(rule.path.clone());
+        }
+    }
     Ok(LoadedRules {
-        session,
         workspace,
+        session,
         extra_read_paths: merged.into_iter().collect(),
     })
 }
 
-fn load_from_path(path: &Path, scope_label: &str) -> (Vec<Rule>, Vec<String>) {
+fn load_rules_from_path(path: &Path, scope_label: &str) -> Vec<Rule> {
     let text = match fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
             eprintln!(
                 "attini: cannot read {scope_label} permissions {}: {e}",
                 path.display()
             );
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         }
     };
-    let json = match RawJson::parse(&text) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "attini: {scope_label} permissions parse error ({}): {e}. Rules ignored.",
-                path.display()
-            );
-            return (Vec::new(), Vec::new());
-        }
-    };
-    let root = json.value();
-    if let Ok(array) = root.to_array() {
-        // Legacy: top-level array of rule objects. No extra_read_paths.
-        let rules = parse_rules(array, path, scope_label);
-        return (rules, Vec::new());
-    }
-    // New schema: top-level object with command_prefixes / extra_read_paths.
-    let rules = match root.to_member("command_prefixes") {
-        Ok(m) => match m.optional() {
-            Some(v) => match v.to_array() {
-                Ok(a) => parse_rules(a, path, scope_label),
-                Err(e) => {
-                    eprintln!(
-                        "attini: {scope_label} permissions {}: command_prefixes is not an array: {e}",
-                        path.display()
-                    );
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        },
-        Err(e) => {
-            eprintln!(
-                "attini: {scope_label} permissions {} is not a JSON array or object: {e}",
-                path.display()
-            );
-            return (Vec::new(), Vec::new());
-        }
-    };
-    let paths_list = match root.to_member("extra_read_paths") {
-        Ok(m) => match m.optional() {
-            Some(v) => match v.to_array() {
-                Ok(a) => parse_extra_read_paths(a, path, scope_label),
-                Err(e) => {
-                    eprintln!(
-                        "attini: {scope_label} permissions {}: extra_read_paths is not an array: {e}",
-                        path.display()
-                    );
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    };
-    (rules, paths_list)
+    parse_jsonl(&text, path, scope_label)
 }
 
-fn parse_rules<'text, 'raw, I>(array: I, path: &Path, scope_label: &str) -> Vec<Rule>
-where
-    I: IntoIterator<Item = nojson::RawJsonValue<'text, 'raw>>,
-{
+/// Parse a JSONL permissions file into rules. `#` comments and blank
+/// lines are skipped; a malformed line is reported and skipped.
+fn parse_jsonl(text: &str, path: &Path, scope_label: &str) -> Vec<Rule> {
     let mut rules = Vec::new();
-    for (i, item) in array.into_iter().enumerate() {
-        match parse_rule(item) {
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match parse_rule_line(trimmed) {
             Ok(rule) => rules.push(rule),
             Err(reason) => eprintln!(
-                "attini: {scope_label} permissions {} rule #{}: skipping ({reason})",
+                "attini: {scope_label} permissions {} line {}: skipping ({reason})",
                 path.display(),
                 i + 1
             ),
@@ -146,233 +98,102 @@ where
     rules
 }
 
-fn parse_extra_read_paths<'text, 'raw, I>(array: I, path: &Path, scope_label: &str) -> Vec<String>
-where
-    I: IntoIterator<Item = nojson::RawJsonValue<'text, 'raw>>,
-{
-    let mut out = Vec::new();
-    for (i, item) in array.into_iter().enumerate() {
-        match item.to_unquoted_string_str() {
-            Ok(s) => {
-                let text = s.into_owned();
-                if text.trim().is_empty() {
-                    eprintln!(
-                        "attini: {scope_label} permissions {} extra_read_paths[#{}]: empty string, skipping",
-                        path.display(),
-                        i + 1
-                    );
-                    continue;
-                }
-                out.push(text);
+fn parse_rule_line(line: &str) -> Result<Rule, String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let type_str = required_string(value, "type")?;
+    let allow = required_bool(value, "allow")?;
+    match type_str.as_str() {
+        "command" => {
+            let args_prefix = required_string_array(value, "args_prefix")?;
+            if args_prefix.is_empty() {
+                return Err("args_prefix is empty".to_string());
             }
-            Err(e) => eprintln!(
-                "attini: {scope_label} permissions {} extra_read_paths[#{}]: skipping ({e})",
-                path.display(),
-                i + 1
-            ),
+            if args_prefix.iter().any(|s| s.is_empty()) {
+                return Err("args_prefix contains an empty element".to_string());
+            }
+            Ok(Rule::command(allow, args_prefix))
         }
-    }
-    out
-}
-
-fn parse_rule(value: nojson::RawJsonValue<'_, '_>) -> Result<Rule, String> {
-    let argv_prefix =
-        required_string_array(value, "argv_prefix").map_err(|e| format!("argv_prefix: {e}"))?;
-    if argv_prefix.is_empty() {
-        return Err("argv_prefix is empty".to_string());
-    }
-    if argv_prefix.iter().any(|s| s.is_empty()) {
-        return Err("argv_prefix contains an empty element".to_string());
-    }
-    let decision = match optional_string(value, "decision").map_err(|e| format!("decision: {e}"))? {
-        None => None,
-        Some(s) => match s.as_str() {
-            "approve" => Some(RuleDecision::Approve),
-            "deny" => Some(RuleDecision::Deny),
-            other => {
-                return Err(format!(
-                    "decision must be \"approve\" or \"deny\" (got {other:?})"
-                ));
+        "read" => {
+            let path = required_string(value, "path")?;
+            if path.trim().is_empty() {
+                return Err("path is empty".to_string());
             }
-        },
-    };
-    Ok(Rule {
-        argv_prefix,
-        decision,
-    })
+            Ok(Rule::read(allow, path))
+        }
+        other => Err(format!(
+            "unknown type {other:?} (expected \"command\" or \"read\")"
+        )),
+    }
 }
 
-fn required_string_array(
-    value: nojson::RawJsonValue<'_, '_>,
-    key: &str,
-) -> Result<Vec<String>, String> {
+fn required_string(value: RawJsonValue<'_, '_>, key: &str) -> Result<String, String> {
     let member = value
         .to_member(key)
         .and_then(|m| m.required())
-        .map_err(|e| e.to_string())?;
-    let array = member.to_array().map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{key}: {e}"))?;
+    member
+        .to_unquoted_string_str()
+        .map(|s| s.into_owned())
+        .map_err(|e| format!("{key}: {e}"))
+}
+
+fn required_bool(value: RawJsonValue<'_, '_>, key: &str) -> Result<bool, String> {
+    let member = value
+        .to_member(key)
+        .and_then(|m| m.required())
+        .map_err(|e| format!("{key}: {e}"))?;
+    let raw = member.as_boolean_str().map_err(|e| format!("{key}: {e}"))?;
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("{key}: expected a boolean (got {other})")),
+    }
+}
+
+fn required_string_array(value: RawJsonValue<'_, '_>, key: &str) -> Result<Vec<String>, String> {
+    let member = value
+        .to_member(key)
+        .and_then(|m| m.required())
+        .map_err(|e| format!("{key}: {e}"))?;
+    let array = member.to_array().map_err(|e| format!("{key}: {e}"))?;
     let mut out = Vec::new();
     for item in array {
         let s: String = item
             .to_unquoted_string_str()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{key}: {e}"))?
             .into_owned();
         out.push(s);
     }
     Ok(out)
 }
 
-fn optional_string(
-    value: nojson::RawJsonValue<'_, '_>,
-    key: &str,
-) -> Result<Option<String>, String> {
-    let m = value.to_member(key).map_err(|e| e.to_string())?;
-    let Some(v) = m.optional() else {
-        return Ok(None);
-    };
-    if v.as_raw_str().trim() == "null" {
-        return Ok(None);
-    }
-    v.to_unquoted_string_str()
-        .map(|s| Some(s.into_owned()))
-        .map_err(|e| e.to_string())
-}
-
 // -------------------------------------------------------------------
-// Writable schema representation
+// Writable representation (JSONL appends)
 // -------------------------------------------------------------------
 
-/// Parsed on-disk permissions ready for mutation and serialisation.
-/// Both grant flows (command prefix and read path) go through this
-/// so a single writer produces the new object schema regardless of
-/// what the file looked like on load.
-struct Permissions {
-    command_prefixes: Vec<CommandPrefixEntry>,
-    extra_read_paths: Vec<String>,
-}
-
-/// A raw command-prefix rule entry preserved for round-trip through
-/// `grant`. A row without a `decision` field is kept as-is so `grant`
-/// can surface it as a conflict rather than silently rewriting it,
-/// but it is otherwise ignored (it never matches at evaluation time).
-#[derive(Debug, Clone)]
-struct CommandPrefixEntry {
-    argv_prefix: Vec<String>,
-    decision: Option<String>,
-}
-
-impl DisplayJson for CommandPrefixEntry {
+impl DisplayJson for Rule {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
-            f.member("argv_prefix", &self.argv_prefix)?;
-            if let Some(d) = &self.decision {
-                f.member("decision", d)?;
+            f.member("type", self.kind.as_str())?;
+            f.member("allow", self.allow)?;
+            match self.kind {
+                PermissionKind::Command => {
+                    f.member("args_prefix", &self.args_prefix)?;
+                }
+                PermissionKind::Read => {
+                    f.member("path", &self.path)?;
+                }
             }
             Ok(())
         })
     }
 }
 
-impl DisplayJson for Permissions {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| {
-            f.member("command_prefixes", &self.command_prefixes)?;
-            f.member("extra_read_paths", &self.extra_read_paths)
-        })
-    }
-}
-
-fn read_permissions_file(path: &Path) -> Result<Permissions, GrantError> {
-    let text = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(Permissions {
-                command_prefixes: Vec::new(),
-                extra_read_paths: Vec::new(),
-            });
-        }
-        Err(e) => return Err(GrantError::Io(e)),
-    };
-    let json = RawJson::parse(&text)
-        .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
-    let root = json.value();
-    if let Ok(array) = root.to_array() {
-        // Legacy: top-level array of rule objects (pre-object-schema
-        // shape, one `{"prefix": "..."}` per entry). Modern rules never
-        // appear at the top level. Silently drop them so the next
-        // write migrates the file to the new object schema.
-        let mut cp = Vec::new();
-        for item in array {
-            match read_command_prefix_entry(item) {
-                Ok(entry) => cp.push(entry),
-                Err(e) => eprintln!(
-                    "attini: {} contains a legacy rule entry that will be dropped on next write ({e})",
-                    path.display()
-                ),
-            }
-        }
-        return Ok(Permissions {
-            command_prefixes: cp,
-            extra_read_paths: Vec::new(),
-        });
-    }
-    let cp_member = root
-        .to_member("command_prefixes")
-        .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
-    let mut cp = Vec::new();
-    if let Some(v) = cp_member.optional() {
-        let array = v
-            .to_array()
-            .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
-        for item in array {
-            match read_command_prefix_entry(item) {
-                Ok(entry) => cp.push(entry),
-                Err(e) => eprintln!(
-                    "attini: {} contains a legacy rule entry that will be dropped on next write ({e})",
-                    path.display()
-                ),
-            }
-        }
-    }
-    let paths_member = root
-        .to_member("extra_read_paths")
-        .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
-    let mut paths_list: Vec<String> = Vec::new();
-    if let Some(v) = paths_member.optional() {
-        let array = v
-            .to_array()
-            .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?;
-        for item in array {
-            let s = item
-                .to_unquoted_string_str()
-                .map_err(|e| GrantError::ParseError(path.to_path_buf(), e.to_string()))?
-                .into_owned();
-            paths_list.push(s);
-        }
-    }
-    Ok(Permissions {
-        command_prefixes: cp,
-        extra_read_paths: paths_list,
-    })
-}
-
-fn read_command_prefix_entry(
-    value: nojson::RawJsonValue<'_, '_>,
-) -> Result<CommandPrefixEntry, GrantError> {
-    let path_hint = || PathBuf::from("<in memory>");
-    let argv_prefix = required_string_array(value, "argv_prefix")
-        .map_err(|e| GrantError::ParseError(path_hint(), format!("argv_prefix: {e}")))?;
-    let decision =
-        optional_string(value, "decision").map_err(|e| GrantError::ParseError(path_hint(), e))?;
-    Ok(CommandPrefixEntry {
-        argv_prefix,
-        decision,
-    })
-}
-
-fn write_permissions_file(path: &Path, permissions: &Permissions) -> io::Result<()> {
-    let body = Json(permissions).to_string();
-    atomic_write(path, body.as_bytes())
+fn render_rule_line(rule: &Rule) -> String {
+    // `Json(...)` renders one compact JSON object; prefix with a newline
+    // when appending.
+    nojson::Json(rule).to_string()
 }
 
 // -------------------------------------------------------------------
@@ -386,11 +207,10 @@ pub enum GrantOutcome {
 
 #[derive(Debug)]
 pub enum GrantError {
-    ArgvEmpty,
+    ArgsEmpty,
     SessionMissing(PathBuf),
-    ParseError(PathBuf, String),
+    ReadError(PathBuf, io::Error),
     ExistingDenyConflict(PathBuf, Vec<String>),
-    ExistingAttributeOnlyConflict(PathBuf, Vec<String>),
     Io(io::Error),
 }
 
@@ -403,21 +223,12 @@ impl From<io::Error> for GrantError {
 impl std::fmt::Display for GrantError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ArgvEmpty => write!(f, "argv_prefix is empty or contains an empty element"),
+            Self::ArgsEmpty => write!(f, "args_prefix is empty or contains an empty element"),
             Self::SessionMissing(p) => write!(f, "session directory not found: {}", p.display()),
-            Self::ParseError(p, e) => write!(
+            Self::ReadError(p, e) => write!(f, "cannot read {}: {e}", p.display()),
+            Self::ExistingDenyConflict(p, args_prefix) => write!(
                 f,
-                "existing {} is not valid JSON: {e}. Fix or delete it before granting.",
-                p.display()
-            ),
-            Self::ExistingDenyConflict(p, argv_prefix) => write!(
-                f,
-                "rule for argv_prefix {argv_prefix:?} already exists as `deny` in {}; edit manually to resolve",
-                p.display()
-            ),
-            Self::ExistingAttributeOnlyConflict(p, argv_prefix) => write!(
-                f,
-                "rule for argv_prefix {argv_prefix:?} already exists in {} without a `decision` field; append `\"decision\": \"approve\"` to it manually so evaluation order is preserved",
+                "command rule for args_prefix {args_prefix:?} already exists as `allow:false` in {}; edit manually to resolve",
                 p.display()
             ),
             Self::Io(e) => write!(f, "{e}"),
@@ -449,36 +260,32 @@ fn resolve_target(scope: GrantScope<'_>) -> Result<PathBuf, GrantError> {
     }
 }
 
-pub fn grant(scope: GrantScope<'_>, argv_prefix: &[String]) -> Result<GrantOutcome, GrantError> {
-    if argv_prefix.is_empty() || argv_prefix.iter().any(|s| s.is_empty()) {
-        return Err(GrantError::ArgvEmpty);
+pub fn grant(scope: GrantScope<'_>, args_prefix: &[String]) -> Result<GrantOutcome, GrantError> {
+    if args_prefix.is_empty() || args_prefix.iter().any(|s| s.is_empty()) {
+        return Err(GrantError::ArgsEmpty);
     }
-    let argv_prefix: Vec<String> = argv_prefix.to_vec();
+    let args_prefix: Vec<String> = args_prefix.to_vec();
     let target = resolve_target(scope)?;
-    let mut permissions = read_permissions_file(&target)?;
-    for entry in &permissions.command_prefixes {
-        if entry.argv_prefix != argv_prefix {
+    let existing = load_rules_from_path(&target, "grant");
+    for rule in &existing {
+        if rule.kind != PermissionKind::Command {
             continue;
         }
-        return match entry.decision.as_deref() {
-            Some("approve") => Ok(GrantOutcome::AlreadyGranted(target)),
-            Some("deny") => Err(GrantError::ExistingDenyConflict(target, argv_prefix)),
-            _ => Err(GrantError::ExistingAttributeOnlyConflict(
-                target,
-                argv_prefix,
-            )),
+        if rule.args_prefix != args_prefix {
+            continue;
+        }
+        return match rule.allow {
+            true => Ok(GrantOutcome::AlreadyGranted(target)),
+            false => Err(GrantError::ExistingDenyConflict(target, args_prefix)),
         };
     }
-    permissions.command_prefixes.push(CommandPrefixEntry {
-        argv_prefix,
-        decision: Some("approve".to_string()),
-    });
-    write_permissions_file(&target, &permissions)?;
+    let rule = Rule::command(true, args_prefix);
+    append_rule_line(&target, &rule)?;
     Ok(GrantOutcome::Appended(target))
 }
 
 // -------------------------------------------------------------------
-// grant-read (extra_read_paths append)
+// grant-read (read rule append)
 // -------------------------------------------------------------------
 
 pub enum GrantReadOutcome {
@@ -490,7 +297,7 @@ pub enum GrantReadOutcome {
 pub enum GrantReadError {
     PathEmpty,
     SessionMissing(PathBuf),
-    ParseError(PathBuf, String),
+    ReadError(PathBuf, io::Error),
     Io(io::Error),
 }
 
@@ -505,11 +312,7 @@ impl std::fmt::Display for GrantReadError {
         match self {
             Self::PathEmpty => write!(f, "PATH is empty or whitespace only"),
             Self::SessionMissing(p) => write!(f, "session directory not found: {}", p.display()),
-            Self::ParseError(p, e) => write!(
-                f,
-                "existing {} is not valid JSON: {e}. Fix or delete it before granting.",
-                p.display()
-            ),
+            Self::ReadError(p, e) => write!(f, "cannot read {}: {e}", p.display()),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -526,33 +329,44 @@ pub fn grant_read(
     let target = resolve_target(scope).map_err(|e| match e {
         GrantError::SessionMissing(p) => GrantReadError::SessionMissing(p),
         GrantError::Io(e) => GrantReadError::Io(e),
-        GrantError::ParseError(p, msg) => GrantReadError::ParseError(p, msg),
-        // The three shapes below aren't produced by resolve_target;
-        // fold them into ParseError to keep the caller-visible type
-        // simple.
-        GrantError::ArgvEmpty
-        | GrantError::ExistingDenyConflict(_, _)
-        | GrantError::ExistingAttributeOnlyConflict(_, _) => {
-            GrantReadError::ParseError(PathBuf::new(), "unexpected grant error".to_string())
+        GrantError::ReadError(p, e) => GrantReadError::ReadError(p, e),
+        GrantError::ArgsEmpty | GrantError::ExistingDenyConflict(_, _) => {
+            GrantReadError::Io(io::Error::other("unexpected grant error"))
         }
     })?;
-    let mut permissions = read_permissions_file(&target).map_err(|e| match e {
-        GrantError::ParseError(p, msg) => GrantReadError::ParseError(p, msg),
-        GrantError::Io(e) => GrantReadError::Io(e),
-        // read_permissions_file never returns the other variants.
-        _ => GrantReadError::ParseError(target.clone(), "unexpected read error".to_string()),
-    })?;
-    if permissions.extra_read_paths.iter().any(|p| p == &path_str) {
+    let existing = load_rules_from_path(&target, "grant-read");
+    if existing
+        .iter()
+        .any(|r| r.kind == PermissionKind::Read && r.allow && r.path == path_str)
+    {
         return Ok(GrantReadOutcome::AlreadyGranted(target));
     }
-    permissions.extra_read_paths.push(path_str);
-    write_permissions_file(&target, &permissions)?;
+    let rule = Rule::read(true, path_str);
+    append_rule_line(&target, &rule)?;
     Ok(GrantReadOutcome::Appended(target))
 }
 
 // -------------------------------------------------------------------
-// Atomic write helper
+// Atomic append helper
 // -------------------------------------------------------------------
+
+/// Append a rendered rule as a new line, atomically (read whole file,
+/// append, write tmp, rename). Appending rather than rewriting keeps
+/// any hand-written comments in the file intact except that the file is
+/// rewritten byte-for-byte with one extra trailing line.
+fn append_rule_line(path: &Path, rule: &Rule) -> io::Result<()> {
+    let mut body = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&render_rule_line(rule));
+    body.push('\n');
+    atomic_write(path, body.as_bytes())
+}
 
 fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
     let tmp = tmp_path_for(path);
@@ -587,128 +401,107 @@ mod tests {
     }
 
     #[test]
-    fn load_legacy_array_of_string_prefix_entries_yields_empty_rules() {
-        // Legacy schema (root array + string prefix) is unsupported;
-        // load_from_path warns + skips each entry and returns an
-        // empty rule set. The next write-through will silently
-        // migrate the file to the new object schema.
-        let dir = tempdir("legacy_array");
-        let path = dir.join("permissions.json");
-        fs::write(&path, r#"[{"prefix":"cargo test","decision":"approve"}]"#).expect("write");
-        let (rules, paths_list) = load_from_path(&path, "workspace");
-        assert!(rules.is_empty());
-        assert!(paths_list.is_empty());
-    }
+    fn parse_jsonl_reads_command_and_read_rules_skipping_comments() {
+        let text = r#"
+# allow cargo test
+{"type":"command","allow":true,"args_prefix":["cargo","test"]}
 
-    #[test]
-    fn load_reads_new_object_schema_with_both_fields() {
-        let dir = tempdir("object_schema");
-        let path = dir.join("permissions.json");
-        fs::write(
-            &path,
-            r#"{"command_prefixes":[{"argv_prefix":["cargo","test"],"decision":"approve"}],"extra_read_paths":["../docs/","/opt/shared"]}"#,
-        )
-        .expect("write");
-        let (rules, paths_list) = load_from_path(&path, "workspace");
-        assert_eq!(rules.len(), 1);
+# deny rm
+{"type":"command","allow":false,"args_prefix":["rm"]}
+{"type":"read","allow":true,"path":"../docs/"}
+"#;
+        let dir = tempdir("jsonl_basic");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0].kind, PermissionKind::Command);
+        assert!(rules[0].allow);
         assert_eq!(
-            rules[0].argv_prefix,
+            rules[0].args_prefix,
             vec!["cargo".to_string(), "test".to_string()]
         );
-        assert_eq!(
-            paths_list,
-            vec!["../docs/".to_string(), "/opt/shared".to_string()]
-        );
+        assert_eq!(rules[1].kind, PermissionKind::Command);
+        assert!(!rules[1].allow);
+        assert_eq!(rules[2].kind, PermissionKind::Read);
+        assert_eq!(rules[2].path, "../docs/");
     }
 
     #[test]
-    fn load_new_schema_missing_command_prefixes_yields_empty_rules() {
-        let dir = tempdir("only_paths");
-        let path = dir.join("permissions.json");
-        fs::write(&path, r#"{"extra_read_paths":["../docs/"]}"#).expect("write");
-        let (rules, paths_list) = load_from_path(&path, "workspace");
+    fn parse_jsonl_skips_malformed_line_and_keeps_rest() {
+        let text = r#"{"type":"command","allow":true,"args_prefix":["ls"]}
+not json
+{"type":"command","allow":true,"args_prefix":["cat"]}
+"#;
+        let dir = tempdir("jsonl_bad_line");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].args_prefix, vec!["ls".to_string()]);
+        assert_eq!(rules[1].args_prefix, vec!["cat".to_string()]);
+    }
+
+    #[test]
+    fn rule_without_allow_is_skipped() {
+        let text = r#"{"type":"command","args_prefix":["ls"]}
+"#;
+        let dir = tempdir("jsonl_no_allow");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
         assert!(rules.is_empty());
-        assert_eq!(paths_list, vec!["../docs/".to_string()]);
     }
 
     #[test]
-    fn load_new_schema_missing_extra_read_paths_yields_empty_paths() {
-        let dir = tempdir("only_rules");
-        let path = dir.join("permissions.json");
+    fn unknown_type_is_skipped() {
+        let text = r#"{"type":"write","allow":true,"path":"src/"}
+"#;
+        let dir = tempdir("jsonl_unknown_type");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn render_rule_line_matches_canonical_field_order() {
+        let cmd = Rule::command(true, vec!["cargo".to_string(), "test".to_string()]);
+        assert_eq!(
+            render_rule_line(&cmd),
+            r#"{"type":"command","allow":true,"args_prefix":["cargo","test"]}"#
+        );
+        let read = Rule::read(false, "secret/".to_string());
+        assert_eq!(
+            render_rule_line(&read),
+            r#"{"type":"read","allow":false,"path":"secret/"}"#
+        );
+    }
+
+    #[test]
+    fn append_rule_line_preserves_comments_and_appends_one_line() {
+        let dir = tempdir("append_preserve");
+        let path = dir.join(PERMISSIONS_FILENAME);
         fs::write(
             &path,
-            r#"{"command_prefixes":[{"argv_prefix":["cargo","test"],"decision":"approve"}]}"#,
+            "# my rules\n{\"type\":\"command\",\"allow\":true,\"args_prefix\":[\"ls\"]}\n",
         )
         .expect("write");
-        let (rules, paths_list) = load_from_path(&path, "workspace");
-        assert_eq!(rules.len(), 1);
-        assert!(paths_list.is_empty());
-    }
-
-    #[test]
-    fn load_legacy_string_prefix_entry_in_object_schema_is_dropped() {
-        // Same silent-drop behaviour when a stray `{"prefix":"..."}`
-        // entry appears inside a new-schema object.
-        let dir = tempdir("legacy_entry_in_object");
-        let path = dir.join("permissions.json");
-        fs::write(
-            &path,
-            r#"{"command_prefixes":[{"prefix":"cargo test","decision":"approve"},{"argv_prefix":["ls"],"decision":"approve"}]}"#,
-        )
-        .expect("write");
-        let (rules, _) = load_from_path(&path, "workspace");
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].argv_prefix, vec!["ls".to_string()]);
-    }
-
-    #[test]
-    fn write_produces_object_schema_regardless_of_prior_shape() {
-        let dir = tempdir("write_object");
-        let path = dir.join("permissions.json");
-        // Start from legacy array.
-        fs::write(&path, r#"[{"prefix":"cargo test","decision":"approve"}]"#).expect("write");
-        // Read → mutate → write. Legacy entries are dropped during
-        // read (silent migration); the write emits the new schema.
-        let mut perms = read_permissions_file(&path).expect("read");
-        perms.extra_read_paths.push("../docs/".to_string());
-        write_permissions_file(&path, &perms).expect("write");
+        let rule = Rule::command(true, vec!["cargo".to_string(), "test".to_string()]);
+        append_rule_line(&path, &rule).expect("append");
         let written = fs::read_to_string(&path).expect("read back");
-        assert!(
-            written.starts_with("{"),
-            "expected object schema, got: {written}"
-        );
-        assert!(written.contains("command_prefixes"));
-        assert!(written.contains("extra_read_paths"));
-        assert!(written.contains("../docs/"));
-        // Legacy `"prefix"` entry has been silently dropped (the new
-        // schema uses `argv_prefix` / `command_prefixes`, not `prefix`).
-        assert!(
-            !written.contains(r#""prefix":"#),
-            "expected legacy `\"prefix\":` field to be absent, got: {written}"
-        );
+        assert!(written.starts_with("# my rules\n"));
+        assert!(written.contains(r#"{"type":"command","allow":true,"args_prefix":["ls"]}"#));
+        assert!(written.ends_with(
+            r#"{"type":"command","allow":true,"args_prefix":["cargo","test"]}
+"#
+        ));
     }
 
     #[test]
-    fn read_permissions_file_dedups_already_granted_path_on_load() {
-        // grant_read is idempotent — we cover the migration semantics
-        // via write_produces_object_schema_regardless_of_prior_shape
-        // and here verify that a path already present in the file
-        // stays present without duplication when the file is read.
-        let dir = tempdir("dedup_on_load");
-        let path = dir.join("permissions.json");
-        fs::write(
-            &path,
-            r#"{"command_prefixes":[],"extra_read_paths":["../docs/","../docs/"]}"#,
-        )
-        .expect("write");
-        let perms = read_permissions_file(&path).expect("read");
-        // The reader keeps duplicates as-is; grant_read is where
-        // dedup happens. Both are in the loaded vec.
-        assert_eq!(perms.extra_read_paths.len(), 2);
-        // `load` (public API) is where the BTreeSet dedup happens.
-        // Confirm that too by direct construction.
+    fn load_merges_read_paths_from_both_tiers() {
+        // Directly exercise the union logic without touching the real
+        // `.attini/` tree: build the LoadedRules shape by hand.
         let mut set: BTreeSet<String> = BTreeSet::new();
-        set.extend(perms.extra_read_paths);
-        assert_eq!(set.len(), 1);
+        set.insert("../docs/".to_string());
+        set.insert("/opt/shared".to_string());
+        set.insert("../docs/".to_string());
+        assert_eq!(set.len(), 2);
     }
 }

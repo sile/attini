@@ -1,10 +1,11 @@
 # The permissions file: format and evaluation
 
-**Status:** Design. This document records the settled shape of the
-permissions file (`.attini/permissions.jsonl` and
-`.attini/<NAME>/permissions.jsonl`) and the rule-evaluation model. It is the
-target that the JSONL migration, the override-chain evaluation, and the
-history output are implemented against.
+**Status:** Implemented (format + last-match-wins evaluation). The
+`docs/deferred/permissions-json-editability.md` memo is superseded by this
+document and has been removed. Two pieces remain deferred and are noted below:
+the `write` type (`docs/deferred/write-permission-type.md`) and promoting a
+`read` denial into an approval request
+(`docs/deferred/read-outside-workspace-approval.md`).
 
 ## Why change it
 
@@ -121,14 +122,31 @@ it can override both file layers for the remainder of that one invocation.
 - A malformed line is reported and **skipped**; the rest of the file still
   loads. Malformed is never silently ignored.
 
+## What is implemented today
+
+The JSONL format, the `command`/`read` types, the required `allow` field, the
+recursive path matching, and last-match-wins evaluation over
+`[workspace] ++ [session] ++ [oneshot]` are all in place. `attini grant` /
+`grant-read` append a single line; hand-edited comments survive an append.
+
+Two pieces of the document are **not** wired up yet and are tracked elsewhere:
+
+- The **oneshot** layer exists structurally in the evaluation chain but is
+  always empty today: `attini approve --grant oneshot` approves the pending
+  call (which runs immediately) and persists nothing, which is sufficient
+  while approval and execution stay in the same invocation. Populating the
+  oneshot layer would only matter if a single invocation needed to pre-approve
+  a prefix for several later calls.
+- A matching `read` rule with `allow:false` is not yet enforced as an
+  approval request; read access is still governed by the executor's granted
+  roots. See `docs/deferred/read-outside-workspace-approval.md`.
+
 ## History output
 
 Every `command` evaluation records, in the `tool_approval` session record, not
 just the final decision but **every rule that matched** during the walk, in
-evaluation order, each marked as adopted or not. This lets a reader reconstruct
-which layer's rule produced the final answer, instead of seeing only the
-outcome. (Details of the record shape live with `AutoDecision` /
-`AutoDecidedBy`.)
+evaluation order, each marked as adopted or not (`AutoDecidedBy` / `matches`).
+This lets a reader reconstruct which layer's rule produced the final answer.
 
 ## Related
 

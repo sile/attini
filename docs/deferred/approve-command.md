@@ -99,8 +99,8 @@ where `SCOPE` is one of:
 | `SCOPE` | Meaning | Equivalent to |
 |---|---|---|
 | `oneshot` | approve this call only, persist nothing | default (current `--approve`) |
-| `session` | approve and append the argv-prefix rule to the session `permissions.json` | `approve` + `attini grant <prefix>` |
-| `workspace` | approve and append to the workspace `permissions.json` | `approve` + `attini grant <prefix> --workspace` |
+| `session` | approve and append the args-prefix rule to the session `permissions.jsonl` | `approve` + `attini grant <prefix>` |
+| `workspace` | approve and append to the workspace `permissions.jsonl` | `approve` + `attini grant <prefix> --workspace` |
 
 Settled semantics:
 
@@ -131,10 +131,10 @@ Settled semantics:
   For `--grant`, if more than one command is pending, `--grant` is an error (ambiguous
   which prefix to persist); `--grant oneshot` is unaffected because it persists nothing.
   This keeps `--grant` a deliberate, single-target action.
-- **Reuse the existing machinery.** `permissions::grant(scope, argv_prefix)` and
+- **Reuse the existing machinery.** `permissions::grant(scope, args_prefix)` and
   `GrantScope::{Session, Workspace}` already exist (`src/permissions.rs`); the command
   just calls them after a successful approve, inheriting the existing
-  `AlreadyGranted` / `ExistingDenyConflict` / `ExistingAttributeOnlyConflict` handling.
+  `AlreadyGranted` / `ExistingDenyConflict` handling.
 
 ## Why it is only *deferred*
 

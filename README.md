@@ -161,8 +161,8 @@ do not have to copy-paste the `attini grant ...` suggestion afterward:
 | `SCOPE` | Effect |
 |---|---|
 | `oneshot` | approve only, persist nothing (the default) |
-| `session` | approve, then append the command's argv-prefix to the session `permissions.json` |
-| `workspace` | approve, then append it to the workspace-wide `permissions.json` |
+| `session` | approve, then append the command's args-prefix to the session `permissions.jsonl` |
+| `workspace` | approve, then append it to the workspace-wide `permissions.jsonl` |
 
 Approval and grant are independent: the approval always stands, and a grant that
 cannot be written (already granted, a conflicting deny rule, or an I/O error) is
@@ -212,12 +212,26 @@ There is no manual `prune`: `conversation.jsonl` is append-only, but once it gro
 past 100 MB the next compaction pass drops the records before the midpoint at a safe
 boundary (never splitting an `assistant -> tool` pair), roughly halving the file.
 
-Permissions live in plain `permissions.json` files and are edited by hand (or
-appended by `attini grant` / `attini grant-read`):
+Permissions live in plain `permissions.jsonl` files -- **JSONL**: one rule per
+line, `#` comments allowed, edited by hand (or appended by `attini grant` /
+`attini grant-read`). Each rule has `type` (`command` or `read`) and `allow`
+(`true`/`false`), and the layer a rule belongs to is the file it lives in:
+`.attini/permissions.jsonl` (workspace) or `.attini/<NAME>/permissions.jsonl`
+(session). Evaluation is last-match-wins over `workspace ++ session`, so a
+session rule overrides a workspace one.
+
+```jsonl
+# allow cargo test
+{"type":"command","allow":true,"args_prefix":["cargo","test"]}
+# deny destructive rm
+{"type":"command","allow":false,"args_prefix":["rm"]}
+# read outside the workspace
+{"type":"read","allow":true,"path":"../docs/"}
+```
 
 ```sh
-attini grant      [-s NAME] [--workspace] <ARG0> [ARG]...   # auto-approve argv-prefix
-attini grant-read [-s NAME] [--workspace] <PATH>            # workspace-external read root
+attini grant      [-s NAME] [--workspace] <ARG0> [ARG]...   # append a `command` rule (args-prefix)
+attini grant-read [-s NAME] [--workspace] <PATH>            # append a `read` rule
 ```
 
 ### Model selection

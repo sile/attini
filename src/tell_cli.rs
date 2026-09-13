@@ -9,16 +9,19 @@ use std::time::{Duration, Instant};
 use nojson::{DisplayJson, RawJson};
 
 use crate::curl::{self, ProgressSinks};
-use crate::permissions::{self, LoadedRules};
+use crate::permissions;
 use crate::sansio::agent::{
     CommandError, CommandInvocation, PatchInvocation, PatchPreview, PatchTool, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
-use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, evaluate};
+use crate::sansio::permissions::{
+    Authorization, AutoDecision, Judgment, Rule, RuleScope, evaluate,
+};
 use crate::session::{
-    ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
-    Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
+    ApprovalDecision, AutoDecidedBy, AutoDecidedMatch, ChatMessageWithTs, InvocationEndReason,
+    MetricsSnapshotBody, Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody,
+    now_unix_millis,
 };
 use crate::tools::ToolExecutor;
 
@@ -239,9 +242,9 @@ pub enum GrantRequest {
     None,
     /// `--grant oneshot`: persist nothing (the default approve behavior).
     Oneshot,
-    /// `--grant session`: append to the session-local `permissions.json`.
+    /// `--grant session`: append to the session-local `permissions.jsonl`.
     Session,
-    /// `--grant workspace`: append to the workspace-wide `permissions.json`.
+    /// `--grant workspace`: append to the workspace-wide `permissions.jsonl`.
     Workspace,
 }
 
@@ -292,7 +295,7 @@ pub enum TellOutcome {
 pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
     // Canonicalise the persistent extra_read_paths (from
-    // permissions.json, appended by `attini grant-read`) and
+    // permissions.jsonl, appended by `attini grant-read`) and
     // hand the resulting Vec to the ToolExecutor. Any path that fails
     // to canonicalise is warned + skipped so a single bad entry does
     // not disable the whole grant list.
@@ -589,6 +592,15 @@ fn drive(
 
     let tools = build_tool_defs();
     let rules = permissions::load(&cfg.session_name)?;
+    // Rule chain in increasing precedence: workspace, then session, then
+    // oneshot. The oneshot layer is in-memory only and currently empty
+    // (populated in a later step); an empty slice is fine.
+    let oneshot_rules: Vec<Rule> = Vec::new();
+    let permission_layers: Vec<(RuleScope, &[Rule])> = vec![
+        (RuleScope::Workspace, rules.workspace.as_slice()),
+        (RuleScope::Session, rules.session.as_slice()),
+        (RuleScope::Oneshot, oneshot_rules.as_slice()),
+    ];
     let mut gate = ToolCallGate::new(cfg);
 
     for _ in 0..cfg.max_turns {
@@ -757,7 +769,7 @@ fn drive(
                     if let CommandDispatch::Awaiting(pending) = dispatch_command(
                         tc,
                         executor,
-                        &rules,
+                        &permission_layers,
                         &cfg.authorization,
                         session,
                         &mut messages,
@@ -1574,7 +1586,7 @@ enum CommandDispatch {
 fn dispatch_command(
     tc: &ToolCall,
     executor: &ToolExecutor,
-    rules: &LoadedRules,
+    layers: &[(RuleScope, &[Rule])],
     authorization: &Authorization,
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
@@ -1593,12 +1605,12 @@ fn dispatch_command(
             return Ok(CommandDispatch::Continue);
         }
     };
-    let judgment = evaluate(&rules.session, &rules.workspace, &inv.argv, authorization);
+    let judgment = evaluate(layers, &inv.argv, authorization);
     let display = shell_escape_argv(&inv.argv);
     match judgment {
         Judgment::AutoApprove(dec) => {
             if !dry_run {
-                let dec_display = shell_escape_argv(&dec.argv_prefix);
+                let dec_display = shell_escape_argv(&dec.args_prefix);
                 eprintln!(
                     "[command] auto-approve via {} rule '{}': {}",
                     dec.scope.as_str(),
@@ -1622,7 +1634,7 @@ fn dispatch_command(
         }
         Judgment::AutoDeny(dec) => {
             if !dry_run {
-                let dec_display = shell_escape_argv(&dec.argv_prefix);
+                let dec_display = shell_escape_argv(&dec.args_prefix);
                 eprintln!(
                     "[command] auto-deny via {} rule '{}': {}",
                     dec.scope.as_str(),
@@ -1633,9 +1645,9 @@ fn dispatch_command(
                 let content = tool_error_json(
                     "denied_by_rule",
                     &format!(
-                        "auto-denied by {} rule argv_prefix {:?}",
+                        "auto-denied by {} rule args_prefix {:?}",
                         dec.scope.as_str(),
-                        dec.argv_prefix
+                        dec.args_prefix
                     ),
                 );
                 counters.tool_errors += 1;
@@ -1665,8 +1677,20 @@ fn append_auto_approval(
 ) -> io::Result<()> {
     let sidecar = AutoDecidedBy {
         scope: dec.scope.as_str().to_string(),
-        argv_prefix: dec.argv_prefix.clone(),
-        reason: dec.reason.as_str().to_string(),
+        args_prefix: dec.args_prefix.clone(),
+        allow: dec.allowed,
+        matches: dec
+            .matches
+            .iter()
+            .map(|m| AutoDecidedMatch {
+                scope: m.scope.as_str().to_string(),
+                kind: m.kind.as_str().to_string(),
+                allow: m.allow,
+                args_prefix: m.args_prefix.clone(),
+                path: m.path.clone(),
+                adopted: m.adopted,
+            })
+            .collect(),
     };
     session.append(&SessionRecord::ToolApproval {
         ts: now_unix_millis(),
@@ -2359,8 +2383,9 @@ fn repair_orphaned_tool_calls(
                 decision: ApprovalDecision::Reject,
                 auto_decided_by: Some(AutoDecidedBy {
                     scope: "repair".to_string(),
-                    argv_prefix: Vec::new(),
-                    reason: "unanswered_tool_call_repair".to_string(),
+                    args_prefix: Vec::new(),
+                    allow: false,
+                    matches: Vec::new(),
                 }),
             })?;
             session.append(&SessionRecord::Tool {

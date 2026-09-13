@@ -844,21 +844,53 @@ impl ApprovalDecision {
 }
 
 /// Sidecar attached to `SessionRecord::ToolApproval` when the
-/// decision was made automatically (rule match, planning-mode reject,
-/// or an approved plan action).
+/// decision was made automatically (rule match, or an approved plan
+/// action).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoDecidedBy {
+    /// The scope of the winning (last matching) rule.
     pub scope: String,
-    pub argv_prefix: Vec<String>,
-    pub reason: String,
+    /// The winning rule's argv prefix (command rules).
+    pub args_prefix: Vec<String>,
+    /// The winning rule's decision.
+    pub allow: bool,
+    /// Every rule that matched during the walk, in evaluation order,
+    /// each marked with whether it was the one finally adopted.
+    pub matches: Vec<AutoDecidedMatch>,
+}
+
+/// One matched rule in an automatic decision's evaluation history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoDecidedMatch {
+    pub scope: String,
+    pub kind: String,
+    pub allow: bool,
+    pub args_prefix: Vec<String>,
+    pub path: String,
+    pub adopted: bool,
+}
+
+impl DisplayJson for AutoDecidedMatch {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("scope", &self.scope)?;
+            f.member("kind", &self.kind)?;
+            f.member("allow", self.allow)?;
+            f.member("args_prefix", &self.args_prefix)?;
+            f.member("path", &self.path)?;
+            f.member("adopted", self.adopted)?;
+            Ok(())
+        })
+    }
 }
 
 impl DisplayJson for AutoDecidedBy {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
             f.member("scope", &self.scope)?;
-            f.member("argv_prefix", &self.argv_prefix)?;
-            f.member("reason", &self.reason)?;
+            f.member("args_prefix", &self.args_prefix)?;
+            f.member("allow", self.allow)?;
+            f.member("matches", &self.matches)?;
             Ok(())
         })
     }
@@ -1633,24 +1665,61 @@ fn parse_auto_decided_by(
         return Ok(None);
     }
     let scope = read_string(m, "scope")?;
-    let reason = read_string(m, "reason")?;
-    let mut argv_prefix = Vec::new();
+    let allow = read_bool(m, "allow")?;
+    let args_prefix = read_string_array(m, "args_prefix")?;
+    let mut matches = Vec::new();
     let list = m
-        .to_member("argv_prefix")
+        .to_member("matches")
         .and_then(|arr| arr.required())
         .map_err(|e| e.to_string())?;
     for item in list.to_array().map_err(|e| e.to_string())? {
-        argv_prefix.push(
-            item.to_unquoted_string_str()
-                .map_err(|e| e.to_string())?
-                .into_owned(),
-        );
+        matches.push(AutoDecidedMatch {
+            scope: read_string(item, "scope")?,
+            kind: read_string(item, "kind")?,
+            allow: read_bool(item, "allow")?,
+            args_prefix: read_string_array(item, "args_prefix")?,
+            path: read_string(item, "path")?,
+            adopted: read_bool(item, "adopted")?,
+        });
     }
     Ok(Some(AutoDecidedBy {
         scope,
-        argv_prefix,
-        reason,
+        args_prefix,
+        allow,
+        matches,
     }))
+}
+
+fn read_bool(value: nojson::RawJsonValue<'_, '_>, key: &str) -> Result<bool, String> {
+    let raw = value
+        .to_member(key)
+        .and_then(|m| m.required())
+        .and_then(|m| m.as_boolean_str())
+        .map_err(|e: JsonParseError| e.to_string())?;
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("{key}: expected a boolean (got {other})")),
+    }
+}
+
+fn read_string_array(
+    value: nojson::RawJsonValue<'_, '_>,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let list = value
+        .to_member(key)
+        .and_then(|arr| arr.required())
+        .map_err(|e| format!("{key}: {e}"))?;
+    let mut out = Vec::new();
+    for item in list.to_array().map_err(|e| format!("{key}: {e}"))? {
+        out.push(
+            item.to_unquoted_string_str()
+                .map_err(|e| format!("{key}: {e}"))?
+                .into_owned(),
+        );
+    }
+    Ok(out)
 }
 
 fn parse_metrics_counters(

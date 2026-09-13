@@ -28,7 +28,7 @@ pub struct ToolExecutor {
     /// Workspace root. Both read-only and patch tools use this as the
     /// primary boundary. Patch tool uses only this field.
     root: PathBuf,
-    /// Additional read-only roots granted via `permissions.json`
+    /// Additional read-only roots granted via `permissions.jsonl`
     /// (appended by `attini grant-read`). Read-only tools
     /// accept paths that canonicalise into any of these roots. Patch
     /// tool ignores this field entirely (write access to these paths
@@ -55,7 +55,7 @@ enum GitState {
 
 impl ToolExecutor {
     /// Create an executor rooted at `root` with additional read-only
-    /// roots granted from `permissions.json`. The
+    /// roots granted from `permissions.jsonl`. The
     /// workspace root is canonicalised so later boundary checks
     /// compare against a stable prefix; `extra_read_roots` are
     /// expected to already be canonicalised by the caller (paths
@@ -673,7 +673,7 @@ fn layer1_reject_reason(rel: &Path) -> Option<&'static str> {
             let name1 = seg(1)?;
             if comps.len() == 2 {
                 match name1 {
-                    "permissions.json" => Some("workspace permissions"),
+                    "permissions.jsonl" => Some("workspace permissions"),
                     _ => None,
                 }
             } else if comps.len() == 3 {
@@ -681,7 +681,7 @@ fn layer1_reject_reason(rel: &Path) -> Option<&'static str> {
                     "LOCK" => Some("session runtime state"),
                     "conversation.jsonl" => Some("session runtime state"),
                     "pending.json" => Some("session runtime state"),
-                    "permissions.json" => Some("session permissions"),
+                    "permissions.jsonl" => Some("session permissions"),
                     _ => None,
                 }
             } else {

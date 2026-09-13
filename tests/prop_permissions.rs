@@ -1,7 +1,7 @@
 //! Property-based tests for `attini::sansio::permissions::evaluate`
 //! focusing on the argv-prefix matching contract.
 
-use attini::sansio::permissions::{Authorization, Judgment, Rule, RuleDecision, evaluate};
+use attini::sansio::permissions::{Authorization, Judgment, Rule, RuleScope, evaluate};
 
 const ITERATIONS: usize = 512;
 const SEED_ENV: &str = "ATTINI_PBT_SEED";
@@ -16,11 +16,8 @@ fn sample_argv(ctx: &mut noprop::TestCaseContext, min: usize, max: usize) -> Vec
     (0..n).map(|_| sample_token(ctx)).collect()
 }
 
-fn approve_rule(argv_prefix: Vec<String>) -> Rule {
-    Rule {
-        argv_prefix,
-        decision: Some(RuleDecision::Approve),
-    }
+fn approve_rule(args_prefix: Vec<String>) -> Rule {
+    Rule::command(true, args_prefix)
 }
 
 #[test]
@@ -32,9 +29,11 @@ fn rule_shorter_than_argv_with_matching_head_auto_approves() -> noprop::RunResul
         let mut argv = prefix.clone();
         argv.extend(extra_tail);
         let rule = approve_rule(prefix.clone());
-        match evaluate(&[rule], &[], &argv, &Authorization::PerTool) {
+        let rules = std::slice::from_ref(&rule);
+        let layers = [(RuleScope::Workspace, rules)];
+        match evaluate(&layers, &argv, &Authorization::PerTool) {
             Judgment::AutoApprove(d) => {
-                assert_eq!(d.argv_prefix, prefix);
+                assert_eq!(d.args_prefix, prefix);
                 Ok(())
             }
             other => {
@@ -54,8 +53,10 @@ fn rule_longer_than_argv_never_matches() -> noprop::RunResult {
         let mut prefix = argv.clone();
         prefix.extend(extra);
         let rule = approve_rule(prefix);
+        let rules = std::slice::from_ref(&rule);
+        let layers = [(RuleScope::Workspace, rules)];
         assert!(matches!(
-            evaluate(&[rule], &[], &argv, &Authorization::PerTool),
+            evaluate(&layers, &argv, &Authorization::PerTool),
             Judgment::Pending
         ));
         Ok(())
@@ -76,8 +77,10 @@ fn any_element_mismatch_prevents_match() -> noprop::RunResult {
         // coincidentally equals the original.
         argv[flip_at] = format!("X_{}", argv[flip_at]);
         let rule = approve_rule(prefix);
+        let rules = std::slice::from_ref(&rule);
+        let layers = [(RuleScope::Workspace, rules)];
         assert!(matches!(
-            evaluate(&[rule], &[], &argv, &Authorization::PerTool),
+            evaluate(&layers, &argv, &Authorization::PerTool),
             Judgment::Pending
         ));
         Ok(())

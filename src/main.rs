@@ -395,8 +395,8 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .doc(
             "Also persist an auto-approve rule for the approved command: \
              `oneshot` (approve only, persist nothing — the default), \
-             `session` (append the argv-prefix to the session permissions.json), or \
-             `workspace` (append to the workspace-wide permissions.json).",
+             `session` (append the args-prefix to the session permissions.jsonl), or \
+             `workspace` (append to the workspace-wide permissions.jsonl).",
         )
         .take(args)
         .present_and_then(|o| o.value().parse::<String>())?
@@ -582,7 +582,7 @@ fn try_run_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
 fn try_run_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("grant-read")
         .doc(
-            "Append a workspace-external read-only path to permissions.json. \
+            "Append a workspace-external read-only path to permissions.jsonl. \
              Read-only tools (list / read / search) will accept paths under this prefix.",
         )
         .take(args)
@@ -593,14 +593,14 @@ fn try_run_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunE
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
-        .doc("Session name; writes to .attini/<NAME>/permissions.json")
+        .doc("Session name; writes to .attini/<NAME>/permissions.jsonl")
         .default("main")
         .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
         .doc(
-            "Write to workspace-wide .attini/permissions.json instead of session-local; \
+            "Write to workspace-wide .attini/permissions.jsonl instead of session-local; \
              -s / --session (or ATTINI_SESSION_NAME) is ignored when set",
         )
         .take(args)
@@ -637,8 +637,8 @@ fn try_run_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunE
 fn try_run_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("grant")
         .doc(
-            "Append an auto-approve permissions rule (argv_prefix) to permissions.json. \
-             Positional args form the argv-prefix: `attini grant cargo test` grants \
+            "Append an auto-approve command rule (args-prefix) to permissions.jsonl. \
+             Positional args form the args-prefix: `attini grant cargo test` grants \
              any command whose argv starts with [\"cargo\", \"test\"].",
         )
         .take(args)
@@ -649,13 +649,13 @@ fn try_run_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
-        .doc("Session name; writes to .attini/<NAME>/permissions.json")
+        .doc("Session name; writes to .attini/<NAME>/permissions.jsonl")
         .default("main")
         .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
     let workspace = noargs::flag("workspace")
-        .doc("Write to workspace-wide .attini/permissions.json instead of session-local; -s / --session (or ATTINI_SESSION_NAME) is ignored when set")
+        .doc("Write to workspace-wide .attini/permissions.jsonl instead of session-local; -s / --session (or ATTINI_SESSION_NAME) is ignored when set")
         .take(args)
         .is_present();
     // argv-prefix as variadic positional args: read until args is exhausted.

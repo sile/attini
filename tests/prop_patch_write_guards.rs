@@ -84,9 +84,9 @@ fn sample_layer1_variant(ctx: &mut noprop::TestCaseContext) -> (String, String, 
         (".attini/test/LOCK", "current-session-lock"),
         (".attini/test/conversation.jsonl", "current-session-conv"),
         (".attini/test/pending.json", "current-session-pending"),
-        (".attini/test/permissions.json", "current-session-perms"),
+        (".attini/test/permissions.jsonl", "current-session-perms"),
         (".attini/other/LOCK", "other-session-lock"),
-        (".attini/permissions.json", "workspace-perms"),
+        (".attini/permissions.jsonl", "workspace-perms"),
     ];
     let (base, kind) = noprop::sample_choice(ctx, bases);
     let variant = mangle_syntactic(ctx, base);
@@ -198,9 +198,9 @@ fn prop_layer1_syntactic_variants_all_reject() -> noprop::RunResult {
             ".attini/test/LOCK",
             ".attini/test/conversation.jsonl",
             ".attini/test/pending.json",
-            ".attini/test/permissions.json",
+            ".attini/test/permissions.jsonl",
             ".attini/other/LOCK",
-            ".attini/permissions.json",
+            ".attini/permissions.jsonl",
         ] {
             fs::write(ws.root().join(f), b"seed\n").expect("write layer1 target");
         }
