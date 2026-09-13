@@ -234,8 +234,8 @@ pub struct TellConfig {
 ///
 /// `Oneshot` is the default: approve the pending call and persist
 /// nothing. `Session` / `Workspace` additionally append the approved
-/// command's argv-prefix as an auto-approve rule, mirroring
-/// `attini grant <prefix> [--workspace]`.
+/// command's argv-prefix as an auto-approve rule to the corresponding
+/// `permissions.jsonl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantRequest {
     /// No grant was requested (`--grant` omitted, or not an approve run).
@@ -295,10 +295,10 @@ pub enum TellOutcome {
 pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
     // Canonicalise the persistent extra_read_paths (from
-    // permissions.jsonl, appended by `attini grant-read`) and
-    // hand the resulting Vec to the ToolExecutor. Any path that fails
+    // permissions.jsonl) and hand the resulting Vec to the
+    // ToolExecutor. Any path that fails
     // to canonicalise is warned + skipped so a single bad entry does
-    // not disable the whole grant list.
+    // not disable the whole read-path list.
     let loaded = permissions::load(&cfg.session_name)?;
     let candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
     let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
@@ -1696,7 +1696,7 @@ fn append_auto_approval(
     })
 }
 
-/// Suggest the two `attini grant` invocations that would
+/// Suggest the `attini approve --grant` invocation that would
 /// pre-approve the argv-prefix of the pending command. `argv` is
 /// truncated to at most two elements (typical pattern: `program
 /// subcommand`) so the rule stays a general prefix rather than
@@ -1706,12 +1706,9 @@ fn emit_suggested_rule(argv: &[String]) {
         return;
     };
     let prefix_display = shell_escape_argv(&prefix);
-    eprintln!("suggested rule (persist separately after approve):");
-    eprintln!("  attini grant {prefix_display}                # session-local");
-    eprintln!("  attini grant {prefix_display} --workspace    # workspace-wide");
-    eprintln!(
-        "  attini approve --grant session                       # the same, folded into approve"
-    );
+    eprintln!("suggested rule (fold into the next approve):");
+    eprintln!("  attini approve --grant session      # allow {prefix_display} (session-local)");
+    eprintln!("  attini approve --grant workspace    # allow {prefix_display} (workspace-wide)");
 }
 
 /// Truncate an argv to the prefix an auto-approve rule should use: at most

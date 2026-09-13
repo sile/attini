@@ -127,8 +127,9 @@ calls, which the single-call approval flow does not require.
 
 The JSONL format, the `command`/`read` types, the required `allow` field, the
 recursive path matching, and last-match-wins evaluation over
-`[workspace] ++ [session]` are all in place. `attini grant` / `grant-read`
-append a single line; hand-edited comments survive an append.
+`[workspace] ++ [session]` are all in place. Rules are hand-edited; the only
+programmatic writer is `attini approve --grant` (commands), which appends a
+single line and leaves hand-written comments intact.
 
 One piece of the document is **not** wired up yet and is tracked elsewhere:
 

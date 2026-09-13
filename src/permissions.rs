@@ -1,7 +1,7 @@
 //! Filesystem-facing side of the permission system: load rules from
 //! `.attini/{NAME}/permissions.jsonl` (session-local) and
-//! `.attini/permissions.jsonl` (workspace-wide), and implement
-//! `attini grant` / `attini grant-read`.
+//! `.attini/permissions.jsonl` (workspace-wide), and implement the
+//! rule append used by `attini approve --grant`.
 //!
 //! The on-disk format is **JSONL**: one JSON object per line, one rule
 //! per line. Lines beginning with `#` are comments; blank lines are
@@ -282,68 +282,6 @@ pub fn grant(scope: GrantScope<'_>, args_prefix: &[String]) -> Result<GrantOutco
     let rule = Rule::command(true, args_prefix);
     append_rule_line(&target, &rule)?;
     Ok(GrantOutcome::Appended(target))
-}
-
-// -------------------------------------------------------------------
-// grant-read (read rule append)
-// -------------------------------------------------------------------
-
-pub enum GrantReadOutcome {
-    Appended(PathBuf),
-    AlreadyGranted(PathBuf),
-}
-
-#[derive(Debug)]
-pub enum GrantReadError {
-    PathEmpty,
-    SessionMissing(PathBuf),
-    ReadError(PathBuf, io::Error),
-    Io(io::Error),
-}
-
-impl From<io::Error> for GrantReadError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl std::fmt::Display for GrantReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PathEmpty => write!(f, "PATH is empty or whitespace only"),
-            Self::SessionMissing(p) => write!(f, "session directory not found: {}", p.display()),
-            Self::ReadError(p, e) => write!(f, "cannot read {}: {e}", p.display()),
-            Self::Io(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-pub fn grant_read(
-    scope: GrantScope<'_>,
-    path_arg: &str,
-) -> Result<GrantReadOutcome, GrantReadError> {
-    let path_str = path_arg.trim().to_string();
-    if path_str.is_empty() {
-        return Err(GrantReadError::PathEmpty);
-    }
-    let target = resolve_target(scope).map_err(|e| match e {
-        GrantError::SessionMissing(p) => GrantReadError::SessionMissing(p),
-        GrantError::Io(e) => GrantReadError::Io(e),
-        GrantError::ReadError(p, e) => GrantReadError::ReadError(p, e),
-        GrantError::ArgsEmpty | GrantError::ExistingDenyConflict(_, _) => {
-            GrantReadError::Io(io::Error::other("unexpected grant error"))
-        }
-    })?;
-    let existing = load_rules_from_path(&target, "grant-read");
-    if existing
-        .iter()
-        .any(|r| r.kind == PermissionKind::Read && r.allow && r.path == path_str)
-    {
-        return Ok(GrantReadOutcome::AlreadyGranted(target));
-    }
-    let rule = Rule::read(true, path_str);
-    append_rule_line(&target, &rule)?;
-    Ok(GrantReadOutcome::Appended(target))
 }
 
 // -------------------------------------------------------------------

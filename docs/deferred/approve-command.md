@@ -6,6 +6,11 @@ below are the design record; see the git history / README for the shipped form. 
 because the *rationale* (why a subcommand rather than a flag) is still worth reading before
 anyone proposes re-adding `--approve`.
 
+The standalone `attini grant` / `attini grant-read` subcommands described below were later
+**removed**: with the JSONL format, rules are plain lines edited by hand, and the only
+write path is `attini approve --grant` (commands). `--grant` has no `read` scope, so read
+rules are always added by hand.
+
 ## The observation
 
 Approving a pending tool call is one of the two ways to advance an `attini agent`

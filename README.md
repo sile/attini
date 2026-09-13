@@ -156,7 +156,7 @@ starts an unintended model turn. `approve` has no positional, so `attini approve
 removed, not deprecated.)
 
 `--grant SCOPE` folds a persistent auto-approve rule into the approval, so you
-do not have to copy-paste the `attini grant ...` suggestion afterward:
+do not have to edit `permissions.jsonl` by hand afterward:
 
 | `SCOPE` | Effect |
 |---|---|
@@ -213,8 +213,8 @@ past 100 MB the next compaction pass drops the records before the midpoint at a 
 boundary (never splitting an `assistant -> tool` pair), roughly halving the file.
 
 Permissions live in plain `permissions.jsonl` files -- **JSONL**: one rule per
-line, `#` comments allowed, edited by hand (or appended by `attini grant` /
-`attini grant-read`). Each rule has `type` (`command` or `read`) and `allow`
+line, `#` comments allowed, edited by hand. Each rule has `type` (`command`
+or `read`) and `allow`
 (`true`/`false`), and the layer a rule belongs to is the file it lives in:
 `.attini/permissions.jsonl` (workspace) or `.attini/<NAME>/permissions.jsonl`
 (session). Evaluation is last-match-wins over `workspace ++ session`, so a
@@ -229,10 +229,9 @@ session rule overrides a workspace one.
 {"type":"read","allow":true,"path":"../docs/"}
 ```
 
-```sh
-attini grant      [-s NAME] [--workspace] <ARG0> [ARG]...   # append a `command` rule (args-prefix)
-attini grant-read [-s NAME] [--workspace] <PATH>            # append a `read` rule
-```
+Rules are added by hand, or through `attini approve --grant` (see the Approving
+section above), which folds a persistent rule into the approval you were already
+giving.
 
 ### Model selection
 

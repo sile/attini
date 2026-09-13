@@ -182,8 +182,6 @@ fn run() -> Result<RunOutcome, RunError> {
         try_run_show(&mut args)?,
         try_run_metrics(&mut args)?,
         try_run_analyze(&mut args)?,
-        try_run_grant(&mut args)?,
-        try_run_grant_read(&mut args)?,
     ] {
         match outcome {
             CommandOutcome::NotHandled => {}
@@ -389,7 +387,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .take(args)
         .then(|o| o.value().parse())?;
     // --grant <SCOPE>: fold a persistent auto-approve rule into the
-    // approval, replacing the separate `attini grant` invocation.
+    // approval, so the rule is written without editing permissions.jsonl.
     let grant: tell_cli::GrantRequest = match noargs::opt("grant")
         .ty("SCOPE")
         .doc(
@@ -577,124 +575,6 @@ fn try_run_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
     }
     session_cmd::run_show(&name).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
-}
-
-fn try_run_grant_read(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("grant-read")
-        .doc(
-            "Append a workspace-external read-only path to permissions.jsonl. \
-             Read-only tools (list / read / search) will accept paths under this prefix.",
-        )
-        .take(args)
-        .is_present()
-    {
-        return Ok(CommandOutcome::NotHandled);
-    }
-    let session_name: String = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session name; writes to .attini/<NAME>/permissions.jsonl")
-        .default("main")
-        .env(SESSION_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let workspace = noargs::flag("workspace")
-        .doc(
-            "Write to workspace-wide .attini/permissions.jsonl instead of session-local; \
-             -s / --session (or ATTINI_SESSION_NAME) is ignored when set",
-        )
-        .take(args)
-        .is_present();
-    let path: String = noargs::arg("<PATH>")
-        .doc(
-            "Read-only path prefix to grant. Workspace-relative or absolute; \
-             stored as-given and canonicalised on load.",
-        )
-        .example("../shared-docs/")
-        .take(args)
-        .then(|a| a.value().parse())?;
-    if args.metadata().help_mode {
-        return Ok(CommandOutcome::Help);
-    }
-    let scope = if workspace {
-        attini::permissions::GrantScope::Workspace
-    } else {
-        attini::permissions::GrantScope::Session(&session_name)
-    };
-    match attini::permissions::grant_read(scope, &path) {
-        Ok(attini::permissions::GrantReadOutcome::Appended(p)) => {
-            eprintln!("granted read: appended to {}", p.display());
-            Ok(CommandOutcome::Done)
-        }
-        Ok(attini::permissions::GrantReadOutcome::AlreadyGranted(p)) => {
-            eprintln!("already granted (no-op): {}", p.display());
-            Ok(CommandOutcome::Done)
-        }
-        Err(e) => Err(RunError::Runtime(e.to_string())),
-    }
-}
-
-fn try_run_grant(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("grant")
-        .doc(
-            "Append an auto-approve command rule (args-prefix) to permissions.jsonl. \
-             Positional args form the args-prefix: `attini grant cargo test` grants \
-             any command whose argv starts with [\"cargo\", \"test\"].",
-        )
-        .take(args)
-        .is_present()
-    {
-        return Ok(CommandOutcome::NotHandled);
-    }
-    let session_name: String = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session name; writes to .attini/<NAME>/permissions.jsonl")
-        .default("main")
-        .env(SESSION_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let workspace = noargs::flag("workspace")
-        .doc("Write to workspace-wide .attini/permissions.jsonl instead of session-local; -s / --session (or ATTINI_SESSION_NAME) is ignored when set")
-        .take(args)
-        .is_present();
-    // argv-prefix as variadic positional args: read until args is exhausted.
-    let head: String = noargs::arg("<ARG0>")
-        .doc("First element of the argv_prefix to auto-approve (the program name).")
-        .example("cargo")
-        .take(args)
-        .then(|a| a.value().parse())?;
-    let mut argv_prefix: Vec<String> = vec![head];
-    loop {
-        let taken = noargs::arg("[ARG]")
-            .doc("Further argv_prefix elements; repeat for a longer prefix.")
-            .example("test")
-            .take(args);
-        if !taken.is_present() {
-            break;
-        }
-        let s: String = taken.then(|a| a.value().parse())?;
-        argv_prefix.push(s);
-    }
-    if args.metadata().help_mode {
-        return Ok(CommandOutcome::Help);
-    }
-    let scope = if workspace {
-        attini::permissions::GrantScope::Workspace
-    } else {
-        attini::permissions::GrantScope::Session(&session_name)
-    };
-    match attini::permissions::grant(scope, &argv_prefix) {
-        Ok(attini::permissions::GrantOutcome::Appended(path)) => {
-            eprintln!("granted: appended to {}", path.display());
-            Ok(CommandOutcome::Done)
-        }
-        Ok(attini::permissions::GrantOutcome::AlreadyGranted(path)) => {
-            eprintln!("already granted (no-op): {}", path.display());
-            Ok(CommandOutcome::Done)
-        }
-        Err(e) => Err(RunError::Runtime(e.to_string())),
-    }
 }
 
 fn try_run_metrics(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {

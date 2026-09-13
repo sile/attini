@@ -24,7 +24,7 @@ Read-only tools (`read` / `list` / `search`) can only touch paths under the work
 root or under a root granted **before the invocation starts**. If the model wants to look
 at something outside the workspace *now*, there is no way for it to ask and have the
 human approve that specific read. The human must already know the path and pre-grant it
-with `attini grant-read`. That is fine when the path is known up front and
+by adding a `read` rule to `permissions.jsonl`. That is fine when the path is known up front and
 awkward when it is discovered mid-task.
 
 ## Current mechanics (grounding)
@@ -63,7 +63,7 @@ become mutable during the loop, or be rebuilt when a new root is granted.
 2. The human approves or denies. On approve, add the requested path as a read root.
 3. On resume, the new root must be reconstructed **before** the model reissues the call,
    so it has to be persisted (e.g. into `permissions.jsonl` as an allow `read`
-   rule, or a session-scoped list) and re-read in `run()` the way `grant-read` entries
+   rule, or a session-scoped list) and re-read in `run()` the way `read` rules
    already are.
 
 \* Because of the tool-batching rule (approval-gated calls go last, and anything after
