@@ -1,10 +1,10 @@
-//! Top-level session inspection subcommands (show / metrics / analyze /
-//! prune). Session data lives under `.attini/<NAME>/`; attini
-//! keeps no abstraction over it, so listing/removing sessions and reading
-//! `conversation.jsonl` are done directly on the filesystem.
+//! Top-level session inspection subcommands (show / metrics / analyze).
+//! Session data lives under `.attini/<NAME>/`; attini
+//! keeps no abstraction over it, so reading `conversation.jsonl` is done
+//! directly on the filesystem.
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
@@ -1406,153 +1406,10 @@ impl DisplayJson for TotalDurationJson {
     }
 }
 
-pub fn run_prune(session_name: &str, yes: bool) -> io::Result<()> {
-    let paths = session_paths(session_name)?;
-    if !paths.dir.try_exists()? {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "session {session_name:?} not found ({})",
-                paths.dir.display()
-            ),
-        ));
-    }
-    if let LockStatus::PidAlive(pid) = inspect_lock(&paths.lock) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "session {session_name:?} is held by pid {pid}; refusing to prune a running session"
-            ),
-        ));
-    }
-
-    let cutoff = match locate_last_summary_offset(&paths.conversation)? {
-        Some(loc) => loc,
-        None => {
-            eprintln!("session {session_name:?}: no summary record found; nothing to prune");
-            return Ok(());
-        }
-    };
-    if cutoff.byte_offset == 0 {
-        eprintln!(
-            "session {session_name:?}: last summary is already at the start of the file; nothing to prune"
-        );
-        return Ok(());
-    }
-
-    let orig_size = fs::metadata(&paths.conversation)?.len();
-    let dropped_records = cutoff.line_index; // number of lines strictly before the summary
-    if !yes {
-        if !io::stdin().is_terminal() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "session {session_name:?}: non-interactive prune requires --yes (stdin is not a TTY)"
-                ),
-            ));
-        }
-        print!(
-            "Prune {} records before the last summary of {}? [y/N] ",
-            dropped_records,
-            paths.conversation.display()
-        );
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if !matches!(answer.trim(), "y" | "Y") {
-            eprintln!("cancelled");
-            return Ok(());
-        }
-    }
-
-    rewrite_from_offset(&paths.conversation, cutoff.byte_offset)?;
-    let new_size = fs::metadata(&paths.conversation)?.len();
-    eprintln!(
-        "pruned: {dropped_records} records removed, {} {} -> {} bytes",
-        paths.conversation.display(),
-        orig_size,
-        new_size
-    );
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SummaryLocation {
-    /// Byte offset of the last `summary` line in the file.
-    byte_offset: u64,
-    /// Number of lines strictly before that summary (i.e. the number
-    /// of records prune would drop).
-    line_index: u64,
-}
-
-fn locate_last_summary_offset(path: &Path) -> io::Result<Option<SummaryLocation>> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let mut reader = BufReader::new(file);
-    let mut offset: u64 = 0;
-    let mut line_index: u64 = 0;
-    let mut latest: Option<SummaryLocation> = None;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let start = offset;
-        let read_bytes = reader.read_line(&mut line)?;
-        if read_bytes == 0 {
-            break;
-        }
-        offset += read_bytes as u64;
-        if line.trim().is_empty() {
-            line_index += 1;
-            continue;
-        }
-        if line_is_summary(&line) {
-            latest = Some(SummaryLocation {
-                byte_offset: start,
-                line_index,
-            });
-        }
-        line_index += 1;
-    }
-    Ok(latest)
-}
-
-fn line_is_summary(line: &str) -> bool {
-    let json = match nojson::RawJson::parse(line) {
-        Ok(j) => j,
-        Err(_) => return false,
-    };
-    let kind = json
-        .value()
-        .to_member("kind")
-        .and_then(|m| m.required())
-        .and_then(|m| m.to_unquoted_string_str());
-    matches!(kind, Ok(ref s) if s.as_ref() == "summary")
-}
-
-fn rewrite_from_offset(path: &Path, offset: u64) -> io::Result<()> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    drop(file);
-
-    let tmp = path.with_extension("jsonl.prune-tmp");
-    // Best-effort cleanup of any leftover tmp from a previous crash.
-    let _ = fs::remove_file(&tmp);
-    {
-        let mut out = File::create(&tmp)?;
-        out.write_all(&buf)?;
-        out.sync_all()?;
-    }
-    fs::rename(&tmp, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn render_prior_ask_context_takes_last_two_and_truncates_answers() {
@@ -1589,14 +1446,6 @@ mod tests {
         assert!(render_prior_ask_context(&[]).is_none());
     }
 
-    fn tempdir(name: &str) -> std::path::PathBuf {
-        let base =
-            std::env::temp_dir().join(format!("attini-prune-test-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).expect("create tempdir");
-        base
-    }
-
     fn write_lines(path: &Path, lines: &[&str]) {
         let mut f = File::create(path).expect("create");
         for l in lines {
@@ -1604,79 +1453,6 @@ mod tests {
             f.write_all(b"\n").expect("newline");
         }
         f.sync_all().expect("sync");
-    }
-
-    #[test]
-    fn line_is_summary_matches_only_summary_kind() {
-        assert!(line_is_summary(
-            r#"{"kind":"summary","ts":1,"since_ts":0,"cutoff_ts":0,"text":""}"#
-        ));
-        assert!(!line_is_summary(r#"{"kind":"user","ts":1,"text":"hi"}"#));
-        // A user record whose text happens to contain the word summary
-        // must NOT be misclassified as a summary.
-        assert!(!line_is_summary(
-            r#"{"kind":"user","ts":1,"text":"here is a summary of foo"}"#
-        ));
-        assert!(!line_is_summary("not json at all"));
-        assert!(!line_is_summary(""));
-    }
-
-    #[test]
-    fn locate_last_summary_offset_returns_none_when_no_summary() {
-        let dir = tempdir("no_summary");
-        let path = dir.join("conv.jsonl");
-        write_lines(
-            &path,
-            &[
-                r#"{"kind":"user","ts":1,"text":"a"}"#,
-                r#"{"kind":"assistant","ts":2,"content":"b","tool_calls":[]}"#,
-            ],
-        );
-        assert!(locate_last_summary_offset(&path).expect("ok").is_none());
-    }
-
-    #[test]
-    fn locate_last_summary_offset_returns_offset_of_last_summary() {
-        let dir = tempdir("last_summary");
-        let path = dir.join("conv.jsonl");
-        let lines = [
-            r#"{"kind":"user","ts":1,"text":"first"}"#,
-            r#"{"kind":"summary","ts":2,"since_ts":1,"cutoff_ts":1,"text":"s1"}"#,
-            r#"{"kind":"user","ts":3,"text":"second"}"#,
-            r#"{"kind":"summary","ts":4,"since_ts":3,"cutoff_ts":3,"text":"s2"}"#,
-            r#"{"kind":"user","ts":5,"text":"third"}"#,
-        ];
-        write_lines(&path, &lines);
-        let loc = locate_last_summary_offset(&path)
-            .expect("ok")
-            .expect("summary present");
-        let expected_offset: u64 =
-            (lines[0].len() + 1 + lines[1].len() + 1 + lines[2].len() + 1) as u64;
-        assert_eq!(loc.byte_offset, expected_offset);
-        assert_eq!(loc.line_index, 3); // three records precede the last summary
-    }
-
-    #[test]
-    fn rewrite_from_offset_keeps_suffix_only() {
-        let dir = tempdir("rewrite");
-        let path = dir.join("conv.jsonl");
-        let lines = [
-            r#"{"kind":"user","ts":1,"text":"first"}"#,
-            r#"{"kind":"summary","ts":2,"since_ts":1,"cutoff_ts":1,"text":"s1"}"#,
-            r#"{"kind":"user","ts":3,"text":"after"}"#,
-        ];
-        write_lines(&path, &lines);
-        let cutoff = locate_last_summary_offset(&path)
-            .expect("ok")
-            .expect("summary present");
-        rewrite_from_offset(&path, cutoff.byte_offset).expect("rewrite ok");
-
-        let contents = fs::read_to_string(&path).expect("read");
-        let kept: Vec<&str> = contents.trim_end_matches('\n').split('\n').collect();
-        assert_eq!(kept.len(), 2);
-        assert!(kept[0].contains(r#""kind":"summary""#));
-        assert!(kept[1].contains(r#""kind":"user""#));
-        assert!(kept[1].contains("after"));
     }
 
     // ---- metrics scanner ---------------------------------------

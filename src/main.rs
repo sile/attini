@@ -182,7 +182,6 @@ fn run() -> Result<RunOutcome, RunError> {
         try_run_show(&mut args)?,
         try_run_metrics(&mut args)?,
         try_run_analyze(&mut args)?,
-        try_run_prune(&mut args)?,
         try_run_grant(&mut args)?,
         try_run_grant_read(&mut args)?,
     ] {
@@ -766,37 +765,6 @@ fn try_run_analyze(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         return Ok(CommandOutcome::Help);
     }
     session_cmd::run_analyze(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(CommandOutcome::Done)
-}
-
-fn try_run_prune(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("prune")
-        .doc(
-            "Drop records before the last summary in conversation.jsonl. \
-             Refuses if the session is held or missing.",
-        )
-        .take(args)
-        .is_present()
-    {
-        return Ok(CommandOutcome::NotHandled);
-    }
-    let session_name: String = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session name; directory is .attini/<NAME>/")
-        .default("main")
-        .env(SESSION_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let yes = noargs::flag("yes")
-        .short('y')
-        .doc("Skip the confirmation prompt (required when stdin is not a TTY)")
-        .take(args)
-        .is_present();
-    if args.metadata().help_mode {
-        return Ok(CommandOutcome::Help);
-    }
-    session_cmd::run_prune(&session_name, yes).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 

@@ -206,8 +206,11 @@ attini show    -s NAME            # invocation/approval/message counts + pending
 attini metrics [-s NAME | --all] [--json]
 attini analyze -s NAME [--json]   # record-kind histogram, bytes by tool/command family
 attini ask     -s NAME [QUESTION] # ask the model to summarise the current state
-attini prune   -s NAME [-y]       # drop records before the last summary
 ```
+
+There is no manual `prune`: `conversation.jsonl` is append-only, but once it grows
+past 100 MB the next compaction pass drops the records before the midpoint at a safe
+boundary (never splitting an `assistant -> tool` pair), roughly halving the file.
 
 Permissions live in plain `permissions.json` files and are edited by hand (or
 appended by `attini grant` / `attini grant-read`):

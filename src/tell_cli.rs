@@ -183,6 +183,14 @@ pub const RETAINED_TAIL_MAX_CHARS: usize = 250_000;
 /// [`RETAINED_TAIL_MAX_CHARS`] for consistency.
 pub const RECORDS_TOTAL_MAX_CHARS: usize = 250_000;
 
+/// Byte size of `conversation.jsonl` at which an automatic physical
+/// prune pass runs. Compaction appends a summary but never deletes the
+/// records it summarised, so the append-only log grows without bound;
+/// once it crosses this size the records before the midpoint are
+/// dropped at a safe boundary. 100 MB is far larger than any session
+/// that still benefits from full history, so this fires rarely.
+pub const CONVERSATION_PRUNE_TRIGGER_BYTES: u64 = 100 * 1024 * 1024;
+
 pub struct TellConfig {
     pub session_name: String,
     pub model: String,
@@ -936,6 +944,13 @@ fn try_auto_compact(
     if session.load_pending()?.is_some() {
         return Ok(());
     }
+    // Physical pruning is independent of summarisation: it fires purely
+    // on file size, so it must be checked even when the records since
+    // the last summary are already small. It runs while the session
+    // LOCK is held, so the log is only rewritten by its owner.
+    if let Err(e) = maybe_prune_conversation(session) {
+        eprintln!("[prune] skipped: {e}");
+    }
     // Judge the need to compact from two independent signals:
     //   * the token threshold, which reflects the *last successful* turn;
     //   * the raw size of the real records since the last summary, which
@@ -1023,6 +1038,154 @@ pub fn compact_conversation(
     })?;
     eprintln!("[compaction] applied. summarised {record_count} records into ~{words} words.");
     Ok(())
+}
+
+/// Automatic physical pruning: when `conversation.jsonl` has grown past
+/// [`CONVERSATION_PRUNE_TRIGGER_BYTES`], drop every record before the
+/// first safe boundary at or after the byte midpoint, roughly halving
+/// the file. There is no manual `prune` command; this is the only path.
+///
+/// Called from `try_auto_compact` while the session `LOCK` is held, so
+/// the log is only ever rewritten by the process that owns the session.
+/// Returns `Ok(None)` when the file is under the threshold or no safe
+/// boundary exists past the midpoint (in which case the file is left
+/// untouched rather than split a pair).
+fn maybe_prune_conversation(session: &Session) -> io::Result<Option<PruneStats>> {
+    let path = session.conversation_path();
+    let orig_size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if orig_size <= CONVERSATION_PRUNE_TRIGGER_BYTES {
+        return Ok(None);
+    }
+    let Some((offset, dropped)) = prune_offset_past_midpoint(path, orig_size)? else {
+        return Ok(None);
+    };
+    if offset == 0 {
+        return Ok(None);
+    }
+    rewrite_file_from_offset(path, offset)?;
+    let new_size = std::fs::metadata(path)?.len();
+    eprintln!(
+        "[prune] dropped {dropped} records, {orig_size} -> {new_size} bytes (file crossed \
+         {CONVERSATION_PRUNE_TRIGGER_BYTES} bytes)"
+    );
+    Ok(Some(PruneStats {
+        dropped_records: dropped,
+        orig_size,
+        new_size,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PruneStats {
+    dropped_records: u64,
+    orig_size: u64,
+    new_size: u64,
+}
+
+/// Scan `conversation.jsonl` and return the byte offset of the first
+/// *safe* record boundary at or after `orig_size / 2`, together with
+/// the number of records strictly before it.
+///
+/// A safe boundary is a line whose message is a User record or an
+/// Assistant record without pending `tool_calls` (see
+/// [`is_safe_boundary`]); cutting there never separates an
+/// `assistant -> tool` pair. Returns `Ok(None)` when no such boundary
+/// exists at or after the midpoint (the whole tail is one unresolved
+/// pair), so the caller leaves the file alone.
+fn prune_offset_past_midpoint(
+    path: &std::path::Path,
+    orig_size: u64,
+) -> io::Result<Option<(u64, u64)>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let midpoint = orig_size / 2;
+    let mut offset: u64 = 0;
+    let mut line_index: u64 = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let start = offset;
+        let read_bytes = reader.read_line(&mut line)?;
+        if read_bytes == 0 {
+            break;
+        }
+        offset += read_bytes as u64;
+        if !line.trim().is_empty() {
+            if start >= midpoint && line_is_safe_boundary(&line) {
+                return Ok(Some((start, line_index)));
+            }
+            line_index += 1;
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a raw conversation line is a safe prune boundary: it parses
+/// as a `user` record, or as an `assistant` record whose `tool_calls`
+/// are empty. Anything else (`tool`, an assistant turn awaiting tools,
+/// a non-message record) is unsafe to cut at.
+fn line_is_safe_boundary(line: &str) -> bool {
+    let json = match RawJson::parse(line) {
+        Ok(j) => j,
+        Err(_) => return false,
+    };
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str());
+    match kind {
+        Ok(ref k) if k.as_ref() == "user" => true,
+        Ok(ref k) if k.as_ref() == "assistant" => {
+            // Safe when it carries non-empty `text` (a final answer).
+            let has_text = value
+                .to_member("text")
+                .and_then(|m| m.required())
+                .ok()
+                .and_then(|t| t.to_unquoted_string_str().ok())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if has_text {
+                return true;
+            }
+            // Otherwise safe only when it carries no pending tool calls.
+            let has_calls = value
+                .to_member("tool_calls")
+                .and_then(|m| m.required())
+                .ok()
+                .and_then(|tc| tc.to_array().ok())
+                .map(|mut a| a.next().is_some())
+                .unwrap_or(false);
+            !has_calls
+        }
+        _ => false,
+    }
+}
+
+/// Copy the suffix of `path` starting at `offset` over the whole file,
+/// via a tmp file + rename so a crash mid-write cannot truncate the
+/// conversation.
+fn rewrite_file_from_offset(path: &std::path::Path, offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    drop(file);
+
+    let tmp = path.with_extension("jsonl.prune-tmp");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut out = std::fs::File::create(&tmp)?;
+        out.write_all(&buf)?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 const ASK_SYSTEM_PROMPT: &str = "You are an OUTSIDE observer reading a recording of a \
@@ -2617,6 +2780,128 @@ mod tests {
         let keep = safe_tail_start(&records, 2);
         assert!(keep > 0 && keep < records.len());
         assert_eq!(compaction_cutoff(&records, 2, 100), Some(keep));
+    }
+
+    // -------------------------------------------------------------
+    // Automatic pruning
+    // -------------------------------------------------------------
+
+    fn prune_tempdir(name: &str) -> std::path::PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("attini-prune-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create tempdir");
+        base
+    }
+
+    fn write_lines(path: &std::path::Path, lines: &[&str]) {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path).expect("create");
+        for l in lines {
+            f.write_all(l.as_bytes()).expect("write");
+            f.write_all(b"\n").expect("newline");
+        }
+        f.sync_all().expect("sync");
+    }
+
+    #[test]
+    fn line_is_safe_boundary_classifies_records_as_expected() {
+        assert!(line_is_safe_boundary(
+            r#"{"kind":"user","ts":1,"text":"hi"}"#
+        ));
+        assert!(line_is_safe_boundary(
+            r#"{"kind":"assistant","ts":2,"text":"done","tool_calls":[]}"#
+        ));
+        // Assistant with empty text but no tool calls is a final answer.
+        assert!(line_is_safe_boundary(
+            r#"{"kind":"assistant","ts":3,"text":"","tool_calls":[]}"#
+        ));
+        // Assistant awaiting tools is unsafe.
+        assert!(!line_is_safe_boundary(
+            r#"{"kind":"assistant","ts":4,"text":"","tool_calls":[{"id":"c"}]}"#
+        ));
+        assert!(!line_is_safe_boundary(
+            r#"{"kind":"tool","ts":5,"text":"x"}"#
+        ));
+        assert!(!line_is_safe_boundary(r#"{"kind":"summary","ts":6}"#));
+        assert!(!line_is_safe_boundary("not json"));
+        assert!(!line_is_safe_boundary(""));
+    }
+
+    #[test]
+    fn prune_offset_past_midpoint_lands_on_safe_boundary_after_half() {
+        let dir = prune_tempdir("midpoint");
+        let path = dir.join("conv.jsonl");
+        // Pad the file so the midpoint falls inside the first chunks.
+        let pad = "x".repeat(400);
+        let lines = [
+            format!(r#"{{"kind":"user","ts":1,"text":"{pad}"}}"#),
+            format!(r#"{{"kind":"tool","ts":2,"text":"{pad}"}}"#),
+            format!(r#"{{"kind":"assistant","ts":3,"text":"{pad}","tool_calls":[]}}"#),
+            format!(r#"{{"kind":"user","ts":4,"text":"{pad}"}}"#),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_lines(&path, &refs);
+        let size = std::fs::metadata(&path).expect("meta").len();
+        let (offset, dropped) = prune_offset_past_midpoint(&path, size)
+            .expect("ok")
+            .expect("boundary");
+        // The chosen line must be a safe boundary at/after the midpoint.
+        assert!(offset >= size / 2);
+        assert!(dropped >= 1);
+        // Compute the start offset of the first safe line at/after the
+        // midpoint by replaying the line lengths.
+        let mut cursor: u64 = 0;
+        let mut expected: Option<(u64, u64)> = None;
+        for (i, l) in refs.iter().enumerate() {
+            let start = cursor;
+            cursor += l.len() as u64 + 1;
+            if start >= size / 2 && line_is_safe_boundary(l) {
+                expected = Some((start, i as u64));
+                break;
+            }
+        }
+        assert_eq!(Some((offset, dropped)), expected);
+    }
+
+    #[test]
+    fn prune_offset_past_midpoint_returns_none_when_pair_spans_tail() {
+        let dir = prune_tempdir("no_safe");
+        let path = dir.join("conv.jsonl");
+        let pad = "x".repeat(400);
+        // Past the midpoint the file is a single unresolved
+        // assistant -> tool pair with no safe boundary, so no cut.
+        let lines = [
+            format!(r#"{{"kind":"user","ts":1,"text":"{pad}"}}"#),
+            r#"{"kind":"assistant","ts":2,"text":"","tool_calls":[{"id":"c"}]}"#.to_string(),
+            format!(r#"{{"kind":"tool","ts":3,"text":"{pad}"}}"#),
+        ];
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        write_lines(&path, &refs);
+        let size = std::fs::metadata(&path).expect("meta").len();
+        assert!(
+            prune_offset_past_midpoint(&path, size)
+                .expect("ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rewrite_file_from_offset_keeps_suffix_only() {
+        let dir = prune_tempdir("rewrite");
+        let path = dir.join("conv.jsonl");
+        let lines = [
+            r#"{"kind":"user","ts":1,"text":"first"}"#,
+            r#"{"kind":"summary","ts":2,"text":"s1"}"#,
+            r#"{"kind":"user","ts":3,"text":"after"}"#,
+        ];
+        write_lines(&path, &lines);
+        let offset: u64 = (lines[0].len() + 1 + lines[1].len() + 1) as u64;
+        rewrite_file_from_offset(&path, offset).expect("rewrite ok");
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let kept: Vec<&str> = contents.trim_end_matches('\n').split('\n').collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].contains("after"));
     }
 
     // -------------------------------------------------------------
