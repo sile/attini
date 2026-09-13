@@ -10,6 +10,11 @@ changes are applied without a prompt; anything consequential — a new file, a
 change outside git, a command that isn't explicitly allowed — is shown as a
 preview and waits for your approval.
 
+The name comes from the Attini tribe of ants — leaf-cutter ants that do not eat
+the leaves they gather, but cultivate a fungus with them. attini follows the
+same idea: the agent gathers changes, but nothing becomes real until the human
+cultivates it through approval.
+
 > This README is a work-in-progress draft. Keep it in sync with the implementation.
 
 ## Overview
