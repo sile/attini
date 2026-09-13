@@ -1,4 +1,4 @@
-//! Top-level session inspection subcommands (status / analyze).
+//! Top-level session inspection subcommands (status / logstats).
 //! Session data lives under `.attini/<NAME>/`; attini
 //! keeps no abstraction over it, so reading `conversation.jsonl` is done
 //! directly on the filesystem.
@@ -478,7 +478,7 @@ fn print_session_metrics_human_tail(m: &PerSessionMetrics) {
     );
 }
 
-pub fn run_analyze(name: &str, json: bool) -> io::Result<()> {
+pub fn run_logstats(name: &str, json: bool) -> io::Result<()> {
     let paths = session_paths(name)?;
     if !paths.dir.try_exists()? {
         return Err(io::Error::new(
@@ -488,14 +488,14 @@ pub fn run_analyze(name: &str, json: bool) -> io::Result<()> {
     }
     let analysis = analyze_conversation(&paths.conversation)?;
     if json {
-        println!("{}", Json(&AnalyzeJson(&analysis, name)));
+        println!("{}", Json(&LogstatsJson(&analysis, name)));
     } else {
-        print_analyze_human(name, &paths, &analysis);
+        print_logstats_human(name, &paths, &analysis);
     }
     Ok(())
 }
 
-const ANALYZE_TOP_N: usize = 10;
+const LOGSTATS_TOP_N: usize = 10;
 
 fn format_bytes(n: u64) -> String {
     if n >= 1_000_000 {
@@ -507,7 +507,7 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysis) {
+fn print_logstats_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysis) {
     println!("session: {}", name);
     println!("path: {}", paths.conversation.display());
     println!(
@@ -547,7 +547,7 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
         "BYTES / MAX",
         &tools
             .iter()
-            .take(ANALYZE_TOP_N)
+            .take(LOGSTATS_TOP_N)
             .map(|(k, s)| {
                 (
                     k.clone(),
@@ -557,8 +557,8 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
             })
             .collect::<Vec<_>>(),
     );
-    if tools.len() > ANALYZE_TOP_N {
-        println!("  ... {} more function(s)", tools.len() - ANALYZE_TOP_N);
+    if tools.len() > LOGSTATS_TOP_N {
+        println!("  ... {} more function(s)", tools.len() - LOGSTATS_TOP_N);
     }
 
     let read_rows: Vec<(String, String)> = a
@@ -577,7 +577,10 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
             )
         })
         .collect();
-    println!("\nread targets, top {}", ANALYZE_TOP_N.min(read_rows.len()));
+    println!(
+        "\nread targets, top {}",
+        LOGSTATS_TOP_N.min(read_rows.len())
+    );
     let mut reads = a.read_targets.clone();
     reads.sort_by_key(|x| std::cmp::Reverse(x.1.bytes));
     print_three_col(
@@ -586,7 +589,7 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
         "BYTES / MAX / RANGES",
         &reads
             .iter()
-            .take(ANALYZE_TOP_N)
+            .take(LOGSTATS_TOP_N)
             .map(|(k, s)| {
                 (
                     k.clone(),
@@ -601,32 +604,32 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
             })
             .collect::<Vec<_>>(),
     );
-    if reads.len() > ANALYZE_TOP_N {
-        println!("  ... {} more path(s)", reads.len() - ANALYZE_TOP_N);
+    if reads.len() > LOGSTATS_TOP_N {
+        println!("  ... {} more path(s)", reads.len() - LOGSTATS_TOP_N);
     }
 
     let mut programs = a.programs.clone();
     programs.sort_by_key(|x| std::cmp::Reverse(x.1.bytes));
-    println!("\nprograms, top {}", ANALYZE_TOP_N.min(programs.len()));
+    println!("\nprograms, top {}", LOGSTATS_TOP_N.min(programs.len()));
     print_three_col(
         "PROGRAM",
         "COUNT",
         "BYTES",
         &programs
             .iter()
-            .take(ANALYZE_TOP_N)
+            .take(LOGSTATS_TOP_N)
             .map(|(k, s)| (k.clone(), s.count.to_string(), format_bytes(s.bytes)))
             .collect::<Vec<_>>(),
     );
-    if programs.len() > ANALYZE_TOP_N {
-        println!("  ... {} more program(s)", programs.len() - ANALYZE_TOP_N);
+    if programs.len() > LOGSTATS_TOP_N {
+        println!("  ... {} more program(s)", programs.len() - LOGSTATS_TOP_N);
     }
 
     let mut fams = a.command_families.clone();
     fams.sort_by_key(|x| std::cmp::Reverse(x.1.bytes));
     println!(
         "\ncommand families (argv[0] x argv[1]), top {}",
-        ANALYZE_TOP_N.min(fams.len())
+        LOGSTATS_TOP_N.min(fams.len())
     );
     print_three_col(
         "(PROGRAM, SUBCOMMAND)",
@@ -634,7 +637,7 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
         "BYTES",
         &fams
             .iter()
-            .take(ANALYZE_TOP_N)
+            .take(LOGSTATS_TOP_N)
             .map(|(fam, st)| {
                 (
                     format!(
@@ -648,8 +651,8 @@ fn print_analyze_human(name: &str, paths: &SessionPaths, a: &ConversationAnalysi
             })
             .collect::<Vec<_>>(),
     );
-    if fams.len() > ANALYZE_TOP_N {
-        println!("  ... {} more family(ies)", fams.len() - ANALYZE_TOP_N);
+    if fams.len() > LOGSTATS_TOP_N {
+        println!("  ... {} more family(ies)", fams.len() - LOGSTATS_TOP_N);
     }
 
     let t = &a.token_usage;
@@ -712,12 +715,12 @@ fn print_three_col(header: &str, header2: &str, header3: &str, rows: &[(String, 
     }
 }
 
-/// `--json` renderer for `attini analyze`. Emits the entire
+/// `--json` renderer for `attini logstats`. Emits the entire
 /// analysis (not just the top-N) so the output is a complete,
 /// diffable baseline.
-struct AnalyzeJson<'a>(&'a ConversationAnalysis, &'a str);
+struct LogstatsJson<'a>(&'a ConversationAnalysis, &'a str);
 
-impl DisplayJson for AnalyzeJson<'_> {
+impl DisplayJson for LogstatsJson<'_> {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         let a = self.0;
         let name = self.1;

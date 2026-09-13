@@ -202,9 +202,9 @@ A few read-only helpers remain, for cases where parsing the log by hand is
 tedious. None of them acquire the session `LOCK` or write to the conversation log:
 
 ```sh
-attini status  -s NAME [--json]   # lock + summary + pending calls + aggregate metrics
-attini analyze -s NAME [--json]   # record-kind histogram, bytes by tool/command family
-attini ask     -s NAME [QUESTION] # ask the model to summarise the current state
+attini status   -s NAME [--json]   # lock + summary + pending calls + aggregate metrics
+attini logstats -s NAME [--json]   # record-kind histogram, bytes by tool/command family
+attini ask      -s NAME [QUESTION] # ask the model to summarise the current state
 ```
 
 There is no manual `prune`: `conversation.jsonl` is append-only, but once it grows

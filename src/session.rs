@@ -368,8 +368,8 @@ pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
 }
 
 // -------------------------------------------------------------------
-// Read-only inspection helpers for the top-level `attini show` /
-// `attini metrics` / `attini analyze` subcommands
+// Read-only inspection helpers for the top-level `attini status` /
+// `attini logstats` subcommands
 // -------------------------------------------------------------------
 
 /// Aggregate counters over one `conversation.jsonl`. Used by both
@@ -1255,7 +1255,7 @@ pub struct TokenUsageAggregate {
 }
 
 /// Whole-file analysis of a conversation log for `attini
-/// analyze`. Produced by [`analyze_conversation`]; renderers decide
+/// logstats`. Produced by [`analyze_conversation`]; renderers decide
 /// how many rows to display (human vs `--json`).
 #[derive(Debug, Clone, Default)]
 pub struct ConversationAnalysis {

@@ -178,7 +178,7 @@ fn run() -> Result<RunOutcome, RunError> {
             return Ok(RunOutcome::Ok);
         }
     }
-    for outcome in [try_run_status(&mut args)?, try_run_analyze(&mut args)?] {
+    for outcome in [try_run_status(&mut args)?, try_run_logstats(&mut args)?] {
         match outcome {
             CommandOutcome::NotHandled => {}
             CommandOutcome::Done => return Ok(RunOutcome::Ok),
@@ -577,10 +577,10 @@ fn try_run_status(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError
     Ok(CommandOutcome::Done)
 }
 
-fn try_run_analyze(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("analyze")
+fn try_run_logstats(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("logstats")
         .doc(
-            "Analyze one session's conversation log: record-kind histogram, \
+            "Summarise one session's conversation log: record-kind histogram, \
              assistant payload split, tool-result bytes by function, read \
              targets, command programs/families, token-usage totals. \
              Read-only; never acquires the session LOCK.",
@@ -605,7 +605,7 @@ fn try_run_analyze(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
-    session_cmd::run_analyze(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
+    session_cmd::run_logstats(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 
