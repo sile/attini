@@ -28,10 +28,11 @@ pub struct ToolExecutor {
     /// Workspace root. Both read-only and patch tools use this as the
     /// primary boundary. Patch tool uses only this field.
     root: PathBuf,
-    /// Additional read-only roots granted via `permissions.json` and
-    /// `attini tell --read-path`. Read-only tools accept paths that
-    /// canonicalise into any of these roots. Patch tool ignores this
-    /// field entirely (write access to these paths is out of scope).
+    /// Additional read-only roots granted via `permissions.json`
+    /// (appended by `attini session grant-read`). Read-only tools
+    /// accept paths that canonicalise into any of these roots. Patch
+    /// tool ignores this field entirely (write access to these paths
+    /// is out of scope).
     extra_read_roots: Vec<PathBuf>,
     /// Session name (`.attini/{name}/`). Used by the patch tool's
     /// Layer 2 rule to identify this session's scratchpad directory.
@@ -54,7 +55,7 @@ enum GitState {
 
 impl ToolExecutor {
     /// Create an executor rooted at `root` with additional read-only
-    /// roots granted from `permissions.json` / `--read-path`. The
+    /// roots granted from `permissions.json`. The
     /// workspace root is canonicalised so later boundary checks
     /// compare against a stable prefix; `extra_read_roots` are
     /// expected to already be canonicalised by the caller (paths

@@ -16,7 +16,7 @@ These are already possible with current features:
 
 1. **Manual copy.** The human carries the summary from repo A's session and pastes it into repo B's prompt.
 
-2. **Scratchpad relay.** repo A's model writes `scratchpad/relay.md` using the existing `patch` tool. The human starts repo B with `attini tell --read-path=<repoA>/<session>/scratchpad/`. repo B reads it with the `read` tool. **No new code.**
+2. **Scratchpad relay.** repo A's model writes `scratchpad/relay.md` using the existing `patch` tool. The human pre-grants read access in repo B with `attini session grant-read <repoA>/<session>/scratchpad/`, then repo B reads it with the `read` tool. **No new code.**
 
 ## Proposed design (if revived)
 
@@ -67,4 +67,4 @@ These are already possible with current features:
 
 ## How to revive
 
-Use the scratchpad relay (`--read-path`) in practice for a period. If it becomes a frequent, painful workflow, return to this document and implement — either the full model-tool design above, or a lighter middle ground (human CLI subcommands + startup injection only, which avoids the approval state machine).
+Use the scratchpad relay (`grant-read`) in practice for a period. If it becomes a frequent, painful workflow, return to this document and implement — either the full model-tool design above, or a lighter middle ground (human CLI subcommands + startup injection only, which avoids the approval state machine).

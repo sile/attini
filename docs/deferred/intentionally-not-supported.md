@@ -64,9 +64,8 @@ can distinguish "not implemented yet" from "intentionally not there".
   the model will obey (there is none, by LLM nature). If you want context in
   a session, type it in the prompt; for larger blobs paste via `--stdin`.
   The remaining real capability — granting read permission outside the
-  workspace — is a separate concern handled by `--read-path` / `attini
-  session grant-read` (and later, an approval flow), not by a "context"
-  flag. Removing them also keeps "context is requested, not discovered"
+  workspace — is a separate concern handled by `attini session grant-read`
+  (and later, an approval flow), not by a "context" flag. Removing them also keeps "context is requested, not discovered"
   honest: there is no longer a special flag that silently lands text in the
   system prompt.
 

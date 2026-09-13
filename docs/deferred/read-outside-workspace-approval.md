@@ -8,9 +8,9 @@
 Read-only tools (`read` / `list` / `search`) can only touch paths under the workspace
 root or under a root granted **before the invocation starts**. If the model wants to look
 at something outside the workspace *now*, there is no way for it to ask and have the
-human approve that specific read. The human must already know the path and pass
-`--read-path PATH` (or pre-grant it with `attini session grant-read`). That is fine when
-the path is known up front and awkward when it is discovered mid-task.
+human approve that specific read. The human must already know the path and pre-grant it
+with `attini session grant-read`. That is fine when the path is known up front and
+awkward when it is discovered mid-task.
 
 ## Current mechanics (grounding)
 
@@ -19,9 +19,8 @@ the path is known up front and awkward when it is discovered mid-task.
   `extra_read_roots`. A path outside all roots returns
   `ToolExecutionError::OutsideWorkspace`, surfaced to the model as a plain tool error.
   There is no approval hook.
-- `extra_read_roots` is built **once** in `run()` (`src/tell_cli.rs:290`) from:
-  1. persistent `extra_read_paths` in `permissions.json`,
-  2. CLI `--read-path` (`extra_read_paths_cli`).
+- `extra_read_roots` is built **once** in `run()` (`src/tell_cli.rs:289`) from the
+  persistent `extra_read_paths` in `permissions.json`.
   `canonicalise_extra_read_roots` dedupes and canonicalises. The `ToolExecutor` is then
   constructed once (`src/tell_cli.rs:291`) and never mutated for the rest of the session.
 - Read-only dispatch (`ToolKind::ReadOnly`, `src/tell_cli.rs:644`) executes **inline**:
@@ -49,8 +48,8 @@ become mutable during the loop, or be rebuilt when a new root is granted.
 2. The human approves or denies. On approve, add the requested path as a read root.
 3. On resume, the new root must be reconstructed **before** the model reissues the call,
    so it has to be persisted (e.g. into `permissions.json` as an `extra_read_paths`
-   entry, or a session-scoped list) and re-read in `run()` the way `--read-path` already
-   is.
+   entry, or a session-scoped list) and re-read in `run()` the way `grant-read` entries
+   already are.
 
 \* Because of the tool-batching rule (approval-gated calls go last, and anything after
 one is cancelled), a parked read behaves like any other approval-gated call.

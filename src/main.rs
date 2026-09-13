@@ -244,23 +244,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
-    // --read-path is repeatable; noargs' opt consumes one occurrence
-    // per take(), so we loop until nothing is left.
-    let mut read_paths: Vec<std::path::PathBuf> = Vec::new();
-    loop {
-        let taken = noargs::opt("read-path")
-            .ty("PATH")
-            .doc(
-                "Extra workspace-external read-only path prefix for this invocation only. \
-                 Repeatable. Persistent grants go through `attini session grant-read`.",
-            )
-            .take(args);
-        if !taken.is_present() {
-            break;
-        }
-        let s: String = taken.then(|o| o.value().parse())?;
-        read_paths.push(std::path::PathBuf::from(s));
-    }
     let turn_tool_call_limit: usize = noargs::opt("turn-tool-call-limit")
         .ty("N")
         .doc(
@@ -365,7 +348,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         system_prompt: system,
         max_turns: DEFAULT_MAX_TURNS,
         mode,
-        extra_read_paths_cli: read_paths,
         turn_tool_call_limit,
         tool_call_rate,
         session_tool_call_max,
@@ -455,7 +437,6 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         system_prompt: None,
         max_turns: DEFAULT_MAX_TURNS,
         mode: attini::sansio::permissions::Mode::Default,
-        extra_read_paths_cli: Vec::new(),
         turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
             .parse()
             .map_err(|e| RunError::Runtime(format!("bad default turn limit: {e}")))?,

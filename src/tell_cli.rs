@@ -194,10 +194,6 @@ pub struct TellConfig {
     pub system_prompt: Option<String>,
     pub max_turns: usize,
     pub mode: Mode,
-    /// Extra workspace-external read-only path prefixes granted via
-    /// `attini tell --read-path`. Combined with the persistent
-    /// entries from `permissions.json.extra_read_paths` on startup.
-    pub extra_read_paths_cli: Vec<PathBuf>,
     /// Maximum tool calls admitted in a single model turn. Extras in
     /// the same response get a synthetic error result and the loop
     /// advances to the next turn.
@@ -271,14 +267,13 @@ pub enum TellOutcome {
 
 pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
-    // Combine persistent extra_read_paths (from permissions.json) with
-    // CLI --read-path overrides for this invocation, canonicalise
-    // each, and hand the resulting Vec to the ToolExecutor. Any path
-    // that fails to canonicalise is warned + skipped so a single bad
-    // entry does not disable the whole grant list.
+    // Canonicalise the persistent extra_read_paths (from
+    // permissions.json, appended by `attini session grant-read`) and
+    // hand the resulting Vec to the ToolExecutor. Any path that fails
+    // to canonicalise is warned + skipped so a single bad entry does
+    // not disable the whole grant list.
     let loaded = permissions::load(&cfg.session_name)?;
-    let mut candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
-    candidates.extend(cfg.extra_read_paths_cli.iter().cloned());
+    let candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
     let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
     let executor = ToolExecutor::new(
         &cfg.workspace_root,
@@ -2545,7 +2540,6 @@ mod tests {
             system_prompt: None,
             max_turns: 0,
             mode: Mode::Default,
-            extra_read_paths_cli: Vec::new(),
             turn_tool_call_limit: turn_limit,
             tool_call_rate: rate,
             session_tool_call_max: session_max,

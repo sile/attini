@@ -82,7 +82,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Tell CLI (`attini tell`)
 
 ```sh
-attini tell [--read-path PATH ...] [--max-tokens N] [--temperature N] [--stdin] "<PROMPT>"
+attini tell [--max-tokens N] [--temperature N] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
