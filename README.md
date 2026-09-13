@@ -122,10 +122,15 @@ attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
 
 `approve` resumes a **stopped** session, which is the same human act — "yes, go
-on" — whether the stop was a pending tool call or hitting the turn cap:
+on" — however the stop happened:
 
 - **Pending tool call** (the loop suspended for approval): the call is approved
   and executed, then the turn continues.
+- **Transport failure** (a model call failed at the connection level — reset,
+  timeout, DNS — before any assistant output was recorded): the *identical*
+  request is re-issued. Nothing is appended, so a transient outage can be
+  retried with the same command. (A definitive HTTP/API rejection is **not**
+  offered this retry; only transport-level faults are.)
 - **No pending call** (the loop hit `DEFAULT_MAX_TURNS`): a fixed continuation
   message is appended and the turn continues, so the session — its context and
   the model's understanding — carries over.

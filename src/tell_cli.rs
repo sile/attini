@@ -252,9 +252,18 @@ pub enum Continuation {
     /// A fresh user prompt for this invocation.
     Prompt(String),
     /// Resume a stopped session: approve the pending tool call in the
-    /// session's `pending.json` if there is one, otherwise continue with
-    /// a fixed continuation message ([`RESUME_PROMPT`]).
+    /// session's `pending.json` if there is one; otherwise re-issue the
+    /// identical request when the previous invocation ended in a
+    /// retryable transport failure ([`Continuation::Retry`]); otherwise
+    /// continue with a fixed continuation message ([`RESUME_PROMPT`]).
     Approve,
+    /// Internal only: re-run the loop against the conversation exactly
+    /// as it stands, without appending any new user record. Produced by
+    /// normalising [`Continuation::Approve`] when the previous
+    /// invocation ended in [`InvocationEndReason::TransportError`] before
+    /// any assistant output was recorded, so the same request can safely
+    /// be sent again.
+    Retry,
 }
 
 /// Fixed user message appended when `attini approve` is run on a session
@@ -322,6 +331,7 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
         Ok(Driven::SessionToolCallExhausted) => {
             (InvocationEndReason::SessionToolCallExhausted, EXIT_ERROR)
         }
+        Ok(Driven::TransportFailed(_)) => (InvocationEndReason::TransportError, EXIT_ERROR),
         Err(_) => (InvocationEndReason::Error, EXIT_ERROR),
     };
 
@@ -336,6 +346,15 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
     match outcome {
+        Ok(Driven::TransportFailed(message)) => {
+            eprintln!("attini: {message}");
+            eprintln!(
+                "attini: this looks like a transient transport failure; run \
+                 `attini approve -s {}` to re-issue the same request",
+                cfg.session_name
+            );
+            Ok(TellOutcome::Exit(ExitCode::from(EXIT_ERROR)))
+        }
         Ok(_) => Ok(TellOutcome::Exit(ExitCode::from(exit_code))),
         Err(e) => {
             eprintln!("attini: {e}");
@@ -362,6 +381,12 @@ enum Driven {
     /// Invocation-scope tool-call backstop tripped
     /// ([`TellConfig::session_tool_call_max`]).
     SessionToolCallExhausted,
+    /// A model call failed at the transport layer before any assistant
+    /// output for the turn was recorded. Recorded as
+    /// [`InvocationEndReason::TransportError`] so a later `attini
+    /// approve` can re-issue the request. Carries the human-readable
+    /// failure message for the stderr diagnostic.
+    TransportFailed(String),
 }
 
 /// Enforces the three tool-call caps (per-turn, sliding rate window,
@@ -432,6 +457,21 @@ impl ToolCallGate {
     }
 }
 
+/// Map a pending-free `attini approve` to the continuation it should
+/// actually run, given the reason the previous invocation ended.
+///
+/// A retryable transport failure re-issues the identical request
+/// ([`Continuation::Retry`]); anything else falls back to the fixed
+/// continuation message. Pure so the decision can be unit-tested
+/// without a session.
+fn normalise_pending_free_approve(last: Option<InvocationEndReason>) -> Continuation {
+    if last == Some(InvocationEndReason::TransportError) {
+        Continuation::Retry
+    } else {
+        Continuation::Prompt(RESUME_PROMPT.to_string())
+    }
+}
+
 fn drive(
     session: &mut Session,
     executor: &ToolExecutor,
@@ -439,14 +479,23 @@ fn drive(
     cont: Continuation,
     counters: &mut Counters,
 ) -> io::Result<Driven> {
-    // `Approve` resumes a stopped session: if the session has a pending
-    // tool call, that call is approved and executed; if it has none (the
-    // session stopped at `max_turns`), it degrades to a fixed
-    // continuation message — the same behavior as a `Prompt`. Normalise
-    // the no-pending case here so the rest of `drive` stays single-path.
+    // `Approve` resumes a stopped session. Normalise the no-pending
+    // cases here so the rest of `drive` stays single-path:
+    //   1. pending tool call present  -> approve + execute (unchanged).
+    //   2. else, previous invocation ended in a retryable transport
+    //      failure -> re-issue the identical request
+    //      ([`Continuation::Retry`]); nothing new is appended.
+    //   3. else (stopped at `max_turns`) -> fixed continuation message.
     let cont = match cont {
-        Continuation::Approve if session.load_pending()?.is_none() => {
-            Continuation::Prompt(RESUME_PROMPT.to_string())
+        Continuation::Approve if session.load_pending()?.is_some() => Continuation::Approve,
+        Continuation::Approve => {
+            let last = session.last_invocation_end_reason()?;
+            if last == Some(InvocationEndReason::TransportError) {
+                eprintln!(
+                    "[approve] previous invocation ended in a transport error; re-issuing the same request"
+                );
+            }
+            normalise_pending_free_approve(last)
         }
         other => other,
     };
@@ -456,17 +505,21 @@ fn drive(
     }
 
     let is_prompt = matches!(cont, Continuation::Prompt(_));
+    let is_retry = matches!(cont, Continuation::Retry);
     let is_approve = matches!(cont, Continuation::Approve);
 
     let mut messages = build_initial_messages(session, cfg)?;
 
     // The `Prompt` path appends a fresh user record before the model
-    // call. Any assistant `tool_call` left unanswered when the loop
-    // previously suspended must be answered *before* that user record
-    // is appended, otherwise a synthetic tool result would be
-    // persisted after the user and break the assistant -> tool
-    // continuity the API requires.
-    if is_prompt {
+    // call; `Retry` re-issues the existing conversation as-is. Any
+    // assistant `tool_call` left unanswered when the loop previously
+    // suspended must be answered *before* that user record is appended
+    // (or before the identical request is re-sent), otherwise a
+    // synthetic tool result would be persisted after the user and break
+    // the assistant -> tool continuity the API requires. A transport
+    // error leaves no assistant record, so `Retry` normally repairs
+    // nothing, but the pass is harmless and keeps the invariant.
+    if is_prompt || is_retry {
         let repaired = repair_orphaned_tool_calls(session, &mut messages)?;
         if repaired > 0 {
             eprintln!(
@@ -507,6 +560,9 @@ fn drive(
                 apply_grant(cfg, &prefix);
             }
         }
+        // Re-issue the identical request: append no new user record, just
+        // fall through to the model-call loop with the conversation as-is.
+        Continuation::Retry => {}
     }
 
     // `Approve` consumes the parked pending inside the match above
@@ -538,8 +594,20 @@ fn drive(
             let mut sinks = ProgressSinks {
                 content: &mut stdout,
             };
-            curl::call(&request, &mut sinks)
-                .map_err(|e| io::Error::other(format!("model call failed: {e}")))?
+            match curl::call(&request, &mut sinks) {
+                Ok(r) => r,
+                Err(e) if e.is_retryable() => {
+                    // Transport fault: the turn produced no assistant
+                    // output, so the identical request can be re-issued
+                    // by `attini approve`. Record it as a distinct end
+                    // reason and stop cleanly (exit 1) rather than
+                    // surfacing a raw error.
+                    return Ok(Driven::TransportFailed(format!("model call failed: {e}")));
+                }
+                Err(e) => {
+                    return Err(io::Error::other(format!("model call failed: {e}")));
+                }
+            }
         };
         let _ = writeln!(io::stdout());
 
@@ -3039,6 +3107,36 @@ mod tests {
     #[test]
     fn resume_prompt_is_non_empty() {
         assert!(!RESUME_PROMPT.trim().is_empty());
+    }
+
+    // -------------------------------------------------------------
+    // normalise_pending_free_approve
+    // -------------------------------------------------------------
+
+    #[test]
+    fn pending_free_approve_retries_a_transport_error() {
+        let cont = normalise_pending_free_approve(Some(InvocationEndReason::TransportError));
+        assert!(matches!(cont, Continuation::Retry));
+    }
+
+    #[test]
+    fn pending_free_approve_continues_after_other_endings() {
+        for last in [
+            Some(InvocationEndReason::Completed),
+            Some(InvocationEndReason::AwaitingApproval),
+            Some(InvocationEndReason::Error),
+            Some(InvocationEndReason::SessionToolCallExhausted),
+            None,
+        ] {
+            let cont = normalise_pending_free_approve(last);
+            match cont {
+                Continuation::Prompt(text) => assert_eq!(text, RESUME_PROMPT),
+                Continuation::Retry => panic!("expected Prompt for {last:?}, got Retry"),
+                Continuation::Approve => {
+                    panic!("expected Prompt for {last:?}, got Approve")
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------

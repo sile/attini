@@ -53,6 +53,57 @@ fn resolve_chat_completions_url() -> io::Result<String> {
     }
 }
 
+/// Why a [`call`] attempt failed, classified so the caller can tell a
+/// retryable transport fault from a definitive HTTP-level rejection.
+///
+/// - [`CurlError::Transport`] means the request never got a usable
+///   response: the curl process could not be spawned, exited non-zero
+///   without an API error body (connection reset, timeout, DNS), or the
+///   SSE stream was malformed mid-flight. A human may safely re-issue
+///   the same request.
+/// - [`CurlError::Http`] means the server answered with an API error
+///   (4xx/5xx with an `error.message` body). Re-sending identically
+///   would just fail the same way, so the caller should not offer a
+///   blind retry.
+/// - [`CurlError::Unavailable`] means the request could not even be
+///   attempted (missing/empty API key, bad base URL).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurlError {
+    /// Transient transport failure; safe to re-issue.
+    Transport(String),
+    /// Definitive HTTP/API rejection; not worth an identical retry.
+    Http(String),
+    /// Missing credentials or invalid configuration.
+    Unavailable(String),
+}
+
+impl CurlError {
+    /// True when the failure is a transient transport fault that a
+    /// human-driven retry could plausibly clear.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, CurlError::Transport(_))
+    }
+
+    /// The human-readable message (without the class prefix).
+    pub fn message(&self) -> &str {
+        match self {
+            CurlError::Transport(m) | CurlError::Http(m) | CurlError::Unavailable(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for CurlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl From<CurlError> for io::Error {
+    fn from(e: CurlError) -> Self {
+        io::Error::other(e.message().to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallResult {
     pub content: String,
@@ -77,18 +128,14 @@ pub struct ProgressSinks<'a> {
     pub content: &'a mut dyn Write,
 }
 
-pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<CallResult> {
-    let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
-        io::Error::new(io::ErrorKind::NotFound, format!("{API_KEY_ENV} is not set"))
-    })?;
+pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> Result<CallResult, CurlError> {
+    let api_key = std::env::var(API_KEY_ENV)
+        .map_err(|_| CurlError::Unavailable(format!("{API_KEY_ENV} is not set")))?;
     if api_key.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{API_KEY_ENV} is empty"),
-        ));
+        return Err(CurlError::Unavailable(format!("{API_KEY_ENV} is empty")));
     }
 
-    let url = resolve_chat_completions_url()?;
+    let url = resolve_chat_completions_url().map_err(|e| CurlError::Unavailable(e.to_string()))?;
     let body = request.to_json_string();
 
     let mut child = Command::new("curl")
@@ -110,7 +157,7 @@ pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| io::Error::other(format!("failed to spawn curl: {e}")))?;
+        .map_err(|e| CurlError::Transport(format!("failed to spawn curl: {e}")))?;
 
     drop(api_key);
 
@@ -118,8 +165,12 @@ pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<
         .stdin
         .take()
         .expect("stdin was piped when spawning curl");
-    stdin.write_all(body.as_bytes())?;
-    stdin.flush()?;
+    stdin
+        .write_all(body.as_bytes())
+        .map_err(|e| CurlError::Transport(format!("failed to send request body: {e}")))?;
+    stdin
+        .flush()
+        .map_err(|e| CurlError::Transport(format!("failed to flush request body: {e}")))?;
     drop(stdin);
 
     let stdout = child
@@ -135,32 +186,37 @@ pub fn call(request: &ChatRequest, sinks: &mut ProgressSinks<'_>) -> io::Result<
     let mut stderr_buf = String::new();
     let _ = stderr.read_to_string(&mut stderr_buf);
 
-    let status = child.wait()?;
+    let status = child
+        .wait()
+        .map_err(|e| CurlError::Transport(format!("failed to wait for curl: {e}")))?;
     if !status.success() {
-        return Err(io::Error::other(format_curl_failure(
-            status,
-            &raw_body,
-            stderr_buf.trim(),
-        )));
+        return Err(classify_curl_failure(status, &raw_body, stderr_buf.trim()));
     }
     Ok(assembly)
 }
 
-/// Prefer the OpenAI-style `error.message` from the response body;
-/// fall back to curl's stderr / exit status.
-fn format_curl_failure(status: std::process::ExitStatus, body: &[u8], stderr: &str) -> String {
+/// Classify a non-zero curl exit as either a definitive API rejection
+/// (the body carries an OpenAI-style `error.message`) or a transient
+/// transport fault.
+fn classify_curl_failure(status: std::process::ExitStatus, body: &[u8], stderr: &str) -> CurlError {
     let body_text = String::from_utf8_lossy(body);
     if let Some(message) = extract_api_error_message(&body_text) {
-        return format!("API request failed: {message}");
+        return CurlError::Http(format!("API request failed: {message}"));
     }
-    let body_text = body_text.trim();
-    if !body_text.is_empty() {
-        return format!("curl exited with {status}: {body_text}");
-    }
-    if !stderr.is_empty() {
-        return format!("curl exited with {status}: {stderr}");
-    }
-    format!("curl exited with {status}")
+    let body_trimmed = body_text.trim();
+    let detail = if !body_trimmed.is_empty() {
+        body_trimmed.to_string()
+    } else if !stderr.is_empty() {
+        stderr.to_string()
+    } else {
+        String::new()
+    };
+    let message = if detail.is_empty() {
+        format!("curl exited with {status}")
+    } else {
+        format!("curl exited with {status}: {detail}")
+    };
+    CurlError::Transport(message)
 }
 
 /// Pull `error.message` from an OpenAI-compatible error JSON body.
@@ -184,14 +240,16 @@ fn extract_api_error_message(body: &str) -> Option<String> {
 fn decode_sse_stream<R: Read>(
     reader: R,
     sinks: &mut ProgressSinks<'_>,
-) -> io::Result<(CallResult, Vec<u8>)> {
+) -> Result<(CallResult, Vec<u8>), CurlError> {
     let mut br = BufReader::new(reader);
     let mut decoder = SseDecoder::new();
     let mut assembly = Assembly::default();
     let mut raw_body = Vec::new();
 
     loop {
-        let filled = br.fill_buf()?;
+        let filled = br
+            .fill_buf()
+            .map_err(|e| CurlError::Transport(format!("failed to read response: {e}")))?;
         if filled.is_empty() {
             break;
         }
@@ -202,12 +260,12 @@ fn decode_sse_stream<R: Read>(
 
         while let Some(event) = decoder
             .next_event()
-            .map_err(|e| io::Error::other(format!("sse decode: {e}")))?
+            .map_err(|e| CurlError::Transport(format!("sse decode: {e}")))?
         {
             match event {
                 SseEvent::Message { data } => {
                     let payload = decode_stream_payload(&data)
-                        .map_err(|e| io::Error::other(format!("stream payload: {e}")))?;
+                        .map_err(|e| CurlError::Transport(format!("stream payload: {e}")))?;
                     match payload {
                         StreamPayload::Chunk(chunk) => assembly.absorb_chunk(chunk, sinks),
                         StreamPayload::Done => return Ok((assembly.finish(), raw_body)),
@@ -303,7 +361,9 @@ impl Assembly {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_completions_url, extract_api_error_message, format_curl_failure};
+    use super::{
+        CurlError, chat_completions_url, classify_curl_failure, extract_api_error_message,
+    };
 
     #[test]
     fn default_base_url_appends_chat_completions() {
@@ -349,11 +409,26 @@ mod tests {
     }
 
     #[test]
-    fn format_curl_failure_prefers_api_message() {
+    fn api_error_body_is_classified_as_http() {
         use std::os::unix::process::ExitStatusExt;
         let status = std::process::ExitStatus::from_raw(22 << 8);
         let body = br#"{"error":{"message":"The model `x` does not exist."}}"#;
-        let msg = format_curl_failure(status, body, "The requested URL returned error: 404");
-        assert_eq!(msg, "API request failed: The model `x` does not exist.");
+        let err = classify_curl_failure(status, body, "The requested URL returned error: 404");
+        assert_eq!(
+            err,
+            CurlError::Http("API request failed: The model `x` does not exist.".to_string())
+        );
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn bare_curl_exit_is_classified_as_transport() {
+        use std::os::unix::process::ExitStatusExt;
+        // curl exit 16 (connection reset) with no API error body.
+        let status = std::process::ExitStatus::from_raw(16 << 8);
+        let err = classify_curl_failure(status, b"", "curl: (16) Error in the HTTP2 framing layer");
+        assert!(matches!(err, CurlError::Transport(_)));
+        assert!(err.is_retryable());
+        assert!(err.message().contains("(16)"));
     }
 }

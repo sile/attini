@@ -38,9 +38,9 @@ handles each one:
 
 At the end of the scan, the `parked` calls are written to `pending.json` and
 the invocation suspends with `awaiting_approval`. Multiple approval-requiring
-calls in one turn are all parked and all saved; `--approve` then approves
-them together. ("Why does the model sometimes ask for several commands?" is a
-separate concern from the gap below.)
+calls in one turn are all parked and all saved; `attini approve` then
+approves them together. ("Why does the model sometimes ask for several
+commands?" is a separate concern from the gap below.)
 
 ## The stranded read-only gap
 

@@ -350,13 +350,15 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
 // `attini approve` command
 // -------------------------------------------------------------------
 
-/// Resume a stopped session: approve its pending tool call(s) if it has
-/// any, otherwise continue with a fixed continuation message.
+/// Resume a stopped session. Three cases, one human act — "yes, go on":
 ///
-/// The two cases are the same human act — "yes, go on" — so they share
-/// one command. When the session stopped at a pending tool call, that
-/// call is approved and executed; when it stopped at `max_turns` (no
-/// pending call), a fixed message is appended and the turn continues.
+/// - the session has a pending tool call: it is approved and executed;
+/// - the previous invocation ended in a transport failure before any
+///   assistant output (e.g. connection reset): the identical request is
+///   re-issued;
+/// - the session stopped at `max_turns`: a fixed continuation message is
+///   appended and the turn continues.
+///
 /// `--grant` only applies to the pending-call case and is ignored when
 /// there is nothing to approve.
 ///
