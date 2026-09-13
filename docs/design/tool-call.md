@@ -68,7 +68,7 @@ call.
 
 ## `repair_orphaned_tool_calls`
 
-On resume (a fresh prompt, or `--approve`), the driver reconciles the
+On resume (a fresh prompt, or `attini approve`), the driver reconciles the
 assistant turns against the tool results that actually exist. Any assistant
 `tool_call` without a matching `tool` result is given a synthesized result
 that marks it cancelled (`reason: unanswered_tool_call_repair`,

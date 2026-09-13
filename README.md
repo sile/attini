@@ -85,7 +85,6 @@ export DEEPSEEK_API_KEY=sk-...
 attini tell [--system-prompt TEXT] [--max-tokens N] [--temperature N] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace]
-attini resume [-s NAME]
 ```
 
 `--stdin` reads standard input (until EOF) and appends it to the prompt as a
@@ -122,12 +121,34 @@ produced or replayed, and `temperature` is always effective.
 attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
 
-Approving a session's pending tool call(s) is a **dedicated subcommand**, not a
-`--approve` flag on `tell`. The reason is typo safety: `tell` keeps an optional
-positional `<PROMPT>`, so a mistyped flag like `attini tell --approv` is
-silently absorbed as the prompt and starts an unintended model turn. `approve`
-has no positional, so `attini approve --approv` fails cleanly as an unknown
-flag. (`attini agent --approve` was removed, not deprecated.)
+`approve` resumes a **stopped** session, which is the same human act — "yes, go
+on" — whether the stop was a pending tool call or hitting the turn cap:
+
+- **Pending tool call** (the loop suspended for approval): the call is approved
+  and executed, then the turn continues.
+- **No pending call** (the loop hit `DEFAULT_MAX_TURNS`): a fixed continuation
+  message is appended and the turn continues, so the session — its context and
+  the model's understanding — carries over.
+
+The message printed when the turn cap is reached names `approve` directly, so
+the two paths stay connected:
+
+```
+tell loop exceeded max_turns=20; to continue this session run:
+  `attini approve -s main` (or give a new instruction with `attini tell -s main "..."`)
+```
+
+If you actually want to change direction, use `attini tell` with a new prompt
+instead. The exit code stays the generic `1`; attini does not assign a distinct
+code to "hit the turn cap". If machine-readable distinction is ever needed, it
+should be carried by a structured message rather than more exit codes.
+
+Approving is a **dedicated subcommand**, not a `--approve` flag on `tell`. The
+reason is typo safety: `tell` keeps an optional positional `<PROMPT>`, so a
+mistyped flag like `attini tell --approv` is silently absorbed as the prompt and
+starts an unintended model turn. `approve` has no positional, so `attini approve
+--approv` fails cleanly as an unknown flag. (`attini agent --approve` was
+removed, not deprecated.)
 
 `--grant SCOPE` folds a persistent auto-approve rule into the approval, so you
 do not have to copy-paste the `attini grant ...` suggestion afterward:
@@ -145,31 +166,6 @@ that cannot be *formed* — the pending call is not a command, its argv yields n
 prefix, or several commands are pending — is rejected up front. The argv-prefix
 is truncated the same way as the printed suggestion (first two elements, e.g.
 `cargo test`), so the two never disagree.
-
-### Continuing (`attini resume`)
-
-```sh
-attini resume [-s NAME]
-```
-
-A `tell` invocation runs at most `DEFAULT_MAX_TURNS` (20) model turns. If it
-runs out, it stops with an **error** (exit code 1) rather than a success — the
-model did not finish the task — and the message names both follow-ups:
-
-```
-tell loop exceeded max_turns=20; to continue this session run:
-  `attini resume -s main` (or give a new instruction with `attini tell -s main "..."`)
-```
-
-`attini resume` appends a fixed continuation message (no new instruction) and
-runs another `tell` invocation, so the session — its context and the model's
-understanding — carries over. If you actually want to change direction, use
-`attini tell` with a new prompt instead. Like `approve`, `resume` has no
-positional, so a stray token is a usage error rather than a silent instruction.
-
-The exit code stays the generic `1`; attini does not assign a distinct code to
-"hit the turn cap". If machine-readable distinction is ever needed, it should be
-carried by a structured message rather than more exit codes.
 
 When an `attini tell` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):

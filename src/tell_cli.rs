@@ -251,20 +251,18 @@ pub struct RateLimit {
 pub enum Continuation {
     /// A fresh user prompt for this invocation.
     Prompt(String),
-    /// Resume by approving the pending tool call recorded in the
-    /// session's `pending.json`.
+    /// Resume a stopped session: approve the pending tool call in the
+    /// session's `pending.json` if there is one, otherwise continue with
+    /// a fixed continuation message ([`RESUME_PROMPT`]).
     Approve,
-    /// Continue a session that stopped because it hit `max_turns`.
-    /// Appends a fixed user message (no new instruction) and runs
-    /// another `tell` invocation. See [`RESUME_PROMPT`].
-    Resume,
 }
 
-/// Fixed user message appended by [`Continuation::Resume`] (`attini
-/// resume`). It deliberately carries no new instruction: `resume` is
-/// for "keep going", while a new instruction goes through `attini
-/// tell`. The model already has its own last turn in context, so a
-/// bare continuation is enough to pick the work back up.
+/// Fixed user message appended when `attini approve` is run on a session
+/// that has no pending tool call (i.e. it stopped at `max_turns`). It
+/// deliberately carries no new instruction: approving a stop means "keep
+/// going", while a new instruction goes through `attini tell`. The model
+/// already has its own last turn in context, so a bare continuation is
+/// enough to pick the work back up.
 pub const RESUME_PROMPT: &str = "Continue from where you left off.";
 
 /// Terminal outcome of one `tell_cli::run` invocation.
@@ -441,12 +439,15 @@ fn drive(
     cont: Continuation,
     counters: &mut Counters,
 ) -> io::Result<Driven> {
-    // `Resume` is a `Prompt` carrying a fixed continuation message: it
-    // shares every downstream behavior (auto-compaction, orphan repair,
-    // appending a user record) and differs only in where the text comes
-    // from. Normalise here so the rest of `drive` stays single-path.
+    // `Approve` resumes a stopped session: if the session has a pending
+    // tool call, that call is approved and executed; if it has none (the
+    // session stopped at `max_turns`), it degrades to a fixed
+    // continuation message — the same behavior as a `Prompt`. Normalise
+    // the no-pending case here so the rest of `drive` stays single-path.
     let cont = match cont {
-        Continuation::Resume => Continuation::Prompt(RESUME_PROMPT.to_string()),
+        Continuation::Approve if session.load_pending()?.is_none() => {
+            Continuation::Prompt(RESUME_PROMPT.to_string())
+        }
         other => other,
     };
 
@@ -475,8 +476,6 @@ fn drive(
     }
 
     match cont {
-        // `Resume` was normalised to `Prompt` at the top of `drive`.
-        Continuation::Resume => unreachable!("Resume is normalised to Prompt before here"),
         Continuation::Prompt(text) => {
             session.append(&SessionRecord::User {
                 ts: now_unix_millis(),
@@ -722,14 +721,14 @@ fn drive(
 }
 
 /// Build the error message shown when `tell` runs out of turns. Names
-/// both follow-ups: [`Continuation::Resume`] (`attini resume`) to keep
-/// going, and `attini tell` to give a new instruction instead. Exit
-/// code stays the generic 1 (a `tell` loop that used all its turns is
-/// a runtime failure, not a success).
+/// both follow-ups: `attini approve` to keep going, and `attini tell`
+/// to give a new instruction instead. Exit code stays the generic 1 (a
+/// `tell` loop that used all its turns is a runtime failure, not a
+/// success).
 fn max_turns_error(session_name: &str, max_turns: usize) -> String {
     format!(
         "tell loop exceeded max_turns={max_turns}; to continue this session run: \
-         `attini resume -s {session_name}` (or give a new instruction with \
+         `attini approve -s {session_name}` (or give a new instruction with \
          `attini tell -s {session_name} \"...\"`)"
     )
 }
@@ -1486,6 +1485,11 @@ fn grant_prefix(argv: &[String]) -> Option<Vec<String>> {
 /// prefix, `--grant` is rejected before any approval is recorded.
 /// `--grant oneshot` (and no grant at all) never persist anything and
 /// therefore never depend on the pending set.
+///
+/// `attini approve` on a session with no pending call (it stopped at
+/// `max_turns`) falls back to a plain continuation, in which case there is
+/// nothing to grant: `--grant` is silently ignored there rather than
+/// errored, since the human's intent was simply "keep going".
 fn plan_grant(request: GrantRequest, pendings: &[Pending]) -> io::Result<Option<Vec<String>>> {
     let argv = match request {
         GrantRequest::None | GrantRequest::Oneshot => return Ok(None),
@@ -3023,11 +3027,11 @@ mod tests {
     // -------------------------------------------------------------
 
     #[test]
-    fn max_turns_error_points_at_resume_and_tell() {
+    fn max_turns_error_points_at_approve_and_tell() {
         let msg = max_turns_error("work", 20);
         assert!(msg.contains("max_turns=20"));
         // The continuation path names the session explicitly.
-        assert!(msg.contains("attini resume -s work"));
+        assert!(msg.contains("attini approve -s work"));
         // And redirects new instructions to `tell`.
         assert!(msg.contains("attini tell -s work"));
     }
