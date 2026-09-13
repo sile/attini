@@ -1,19 +1,19 @@
-//! Top-level session inspection subcommands (show / metrics / analyze).
+//! Top-level session inspection subcommands (status / analyze).
 //! Session data lives under `.attini/<NAME>/`; attini
 //! keeps no abstraction over it, so reading `conversation.jsonl` is done
 //! directly on the filesystem.
 
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
 
 use crate::session::{
-    CommandFamilyStats, ConversationAnalysis, ConversationSummary, LockStatus, ProgramStats,
-    ReadTargetStats, RecordKindBytes, SessionPaths, SummaryBytes, TokenUsageAggregate,
-    ToolResultStats, analyze_conversation, inspect_lock, read_pending_summary, scan_conversation,
-    session_paths, session_root,
+    CommandFamilyStats, ConversationAnalysis, ConversationSummary, LockStatus, PendingSummary,
+    ProgramStats, ReadTargetStats, RecordKindBytes, SessionPaths, SummaryBytes,
+    TokenUsageAggregate, ToolResultStats, analyze_conversation, inspect_lock, read_pending_summary,
+    scan_conversation, session_paths,
 };
 use crate::tell_cli;
 
@@ -26,7 +26,10 @@ fn format_lock_status(status: LockStatus) -> String {
     }
 }
 
-pub fn run_show(name: &str) -> io::Result<()> {
+/// Read-only overview of a session: current state (lock, pending
+/// calls, summary) plus aggregate metrics. The successor to the old
+/// `show` + `metrics` pair.
+pub fn run_status(name: &str, json: bool) -> io::Result<()> {
     let paths = session_paths(name)?;
     if !paths.dir.try_exists()? {
         return Err(io::Error::new(
@@ -37,6 +40,22 @@ pub fn run_show(name: &str) -> io::Result<()> {
     let lock = inspect_lock(&paths.lock);
     let summary = scan_conversation(&paths.conversation)?;
     let pending = read_pending_summary(&paths.pending)?;
+    let metrics = collect_session_metrics(name)?;
+
+    if json {
+        println!(
+            "{}",
+            Json(&StatusJson {
+                name,
+                paths: &paths,
+                lock,
+                summary: &summary,
+                pending: pending.as_deref(),
+                metrics: &metrics,
+            })
+        );
+        return Ok(());
+    }
 
     println!("session: {name}");
     println!("  dir: {}", paths.dir.display());
@@ -55,6 +74,7 @@ pub fn run_show(name: &str) -> io::Result<()> {
         }
         None => println!("  pending: (none)"),
     }
+    print_session_metrics_human_tail(&metrics);
     Ok(())
 }
 
@@ -193,74 +213,6 @@ fn render_prior_ask_context(entries: &[crate::session::AskEntry]) -> Option<Stri
         out.push_str(&format!("A: {answer}"));
     }
     Some(out)
-}
-
-// -------------------------------------------------------------------
-// attini metrics
-// -------------------------------------------------------------------
-
-pub enum MetricsScope<'a> {
-    /// Single session by name.
-    Single(&'a str),
-    /// All sessions under `.attini/` in the current directory.
-    All,
-}
-
-pub fn run_metrics(scope: MetricsScope<'_>, json: bool) -> io::Result<()> {
-    match scope {
-        MetricsScope::Single(name) => {
-            let m = collect_session_metrics(name)?;
-            if json {
-                println!("{}", Json(&SessionMetricsJson(&m)));
-            } else {
-                print_session_metrics_human(&m);
-            }
-        }
-        MetricsScope::All => {
-            let names = list_sessions()?;
-            let mut per_session: Vec<PerSessionMetrics> = Vec::new();
-            for name in names {
-                match collect_session_metrics(&name) {
-                    Ok(m) => per_session.push(m),
-                    Err(e) => {
-                        eprintln!("attini: skipping session {name:?}: {e}");
-                    }
-                }
-            }
-            if json {
-                let total = compute_totals(&per_session);
-                println!("{}", Json(&AllMetricsJson(&per_session, &total)));
-            } else {
-                print_all_metrics_human(&per_session);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Enumerate session names under `.attini/` in the current directory.
-/// Names are returned sorted so the output is stable.
-fn list_sessions() -> io::Result<Vec<String>> {
-    let root = session_root();
-    let entries = match fs::read_dir(&root) {
-        Ok(r) => r,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    let mut names: Vec<String> = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        if let Ok(name) = entry.file_name().into_string()
-            && session_paths(&name).is_ok()
-        {
-            names.push(name);
-        }
-    }
-    names.sort();
-    Ok(names)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -492,17 +444,11 @@ fn avg_duration_ms(m: &PerSessionMetrics) -> u64 {
     m.metrics.duration_ms_total / starts
 }
 
-fn print_session_metrics_human(m: &PerSessionMetrics) {
-    let s = &m.summary;
+/// Metrics portion of `attini status`. Skips `session` / `invocations`
+/// / `approvals`, which `print_summary` already emitted, so the human
+/// output has no duplicated lines.
+fn print_session_metrics_human_tail(m: &PerSessionMetrics) {
     let mx = &m.metrics;
-    println!("session: {}", m.session_name);
-    println!(
-        "  invocations: {} (completed={}, awaiting_approval={}, error={})",
-        s.invocation_starts,
-        s.invocation_ends_completed,
-        s.invocation_ends_awaiting_approval,
-        s.invocation_ends_error,
-    );
     println!("  turns: {}", mx.turns);
     println!("  tool_calls: {} total", mx.tool_calls.total());
     println!(
@@ -515,11 +461,7 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
         mx.tool_calls.unknown,
     );
     println!("    errors={}", mx.tool_errors);
-    println!(
-        "  approvals: approve={} reject={} (auto_approve={} auto_deny={})",
-        s.approvals_approve, s.approvals_reject, s.approvals_auto_approve, s.approvals_auto_deny,
-    );
-    println!("  tokens:");
+    println!("  tokens (billed):");
     println!(
         "    prompt_billed={}  (cache_hit={} / miss={})",
         mx.prompt_tokens_billed_total,
@@ -536,131 +478,6 @@ fn print_session_metrics_human(m: &PerSessionMetrics) {
         mx.duration_ms_total,
         avg_duration_ms(m),
     );
-}
-
-fn print_all_metrics_human(sessions: &[PerSessionMetrics]) {
-    let headers = [
-        "NAME",
-        "INVOC",
-        "TURNS",
-        "TOOL_CALLS",
-        "ERRS",
-        "APPROVE/REJECT",
-        "PROMPT_TOK",
-        "COMPACT (attempt/fail)",
-        "DURATION_MS",
-    ];
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    for m in sessions {
-        let s = &m.summary;
-        let mx = &m.metrics;
-        rows.push(vec![
-            m.session_name.clone(),
-            s.invocation_starts.to_string(),
-            mx.turns.to_string(),
-            mx.tool_calls.total().to_string(),
-            mx.tool_errors.to_string(),
-            format!("{}/{}", s.approvals_approve, s.approvals_reject),
-            mx.prompt_tokens_billed_total.to_string(),
-            format!("{}/{}", mx.compaction_attempts, mx.compaction_failures),
-            mx.duration_ms_total.to_string(),
-        ]);
-    }
-    let total = compute_totals(sessions);
-    let total_row = vec![
-        String::new(),
-        total.invocation_starts.to_string(),
-        total.turns.to_string(),
-        total.tool_calls_total.to_string(),
-        total.tool_errors.to_string(),
-        format!("{}/{}", total.approvals_approve, total.approvals_reject),
-        total.prompt_tokens_billed_total.to_string(),
-        format!(
-            "{}/{}",
-            total.compaction_attempts, total.compaction_failures
-        ),
-        total.duration_ms_total.to_string(),
-    ];
-
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for r in rows.iter().chain(std::iter::once(&total_row)) {
-        for (i, cell) in r.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
-        }
-    }
-
-    let render = |cells: &[String]| -> String {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{:width$}", c, width = widths[i]))
-            .collect::<Vec<_>>()
-            .join("  ")
-    };
-
-    let header_row: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
-    println!("{}", render(&header_row));
-    for r in &rows {
-        println!("{}", render(r));
-    }
-    let sep_len: usize = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
-    println!(
-        "--- total ({} sessions) {}",
-        sessions.len(),
-        "-".repeat(sep_len.saturating_sub(20 + sessions.len().to_string().len()))
-    );
-    println!("{}", render(&total_row));
-}
-
-#[derive(Debug, Clone, Default)]
-struct TotalsAggregate {
-    sessions_counted: u64,
-    invocation_starts: u64,
-    turns: u64,
-    tool_calls_total: u64,
-    tool_errors: u64,
-    approvals_approve: u64,
-    approvals_reject: u64,
-    prompt_tokens_billed_total: u64,
-    duration_ms_total: u64,
-    compaction_attempts: u64,
-    compaction_failures: u64,
-}
-
-fn compute_totals(sessions: &[PerSessionMetrics]) -> TotalsAggregate {
-    let mut t = TotalsAggregate {
-        sessions_counted: sessions.len() as u64,
-        ..Default::default()
-    };
-    for m in sessions {
-        t.invocation_starts = t
-            .invocation_starts
-            .saturating_add(m.summary.invocation_starts);
-        t.turns = t.turns.saturating_add(m.metrics.turns);
-        t.tool_calls_total = t
-            .tool_calls_total
-            .saturating_add(m.metrics.tool_calls.total());
-        t.tool_errors = t.tool_errors.saturating_add(m.metrics.tool_errors);
-        t.approvals_approve = t
-            .approvals_approve
-            .saturating_add(m.summary.approvals_approve);
-        t.approvals_reject = t
-            .approvals_reject
-            .saturating_add(m.summary.approvals_reject);
-        t.prompt_tokens_billed_total = t
-            .prompt_tokens_billed_total
-            .saturating_add(m.metrics.prompt_tokens_billed_total);
-        t.duration_ms_total = t
-            .duration_ms_total
-            .saturating_add(m.metrics.duration_ms_total);
-        t.compaction_attempts = t
-            .compaction_attempts
-            .saturating_add(m.metrics.compaction_attempts);
-        t.compaction_failures = t
-            .compaction_failures
-            .saturating_add(m.metrics.compaction_failures);
-    }
-    t
 }
 
 pub fn run_analyze(name: &str, json: bool) -> io::Result<()> {
@@ -1124,6 +941,170 @@ impl DisplayJson for TokenUsageAggregate {
 
 // ---- JSON emitters ------------------------------------------------
 
+/// `--json` renderer for `attini status`. Combines the current-state
+/// overview (lock / summary / pending) with the aggregate metrics in
+/// a single object.
+struct StatusJson<'a> {
+    name: &'a str,
+    paths: &'a SessionPaths,
+    lock: LockStatus,
+    summary: &'a ConversationSummary,
+    pending: Option<&'a [PendingSummary]>,
+    metrics: &'a PerSessionMetrics,
+}
+
+impl DisplayJson for StatusJson<'_> {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("session", self.name)?;
+            f.member("dir", self.paths.dir.to_string_lossy().as_ref())?;
+            f.member("lock", lock_status_str(self.lock))?;
+            f.member("summary", SummaryJson(self.summary))?;
+            match self.pending {
+                Some(ps) => {
+                    let items: Vec<PendingJson<'_>> = ps.iter().map(PendingJson).collect();
+                    f.member("pending", items.as_slice())?;
+                }
+                None => f.member("pending", Option::<PendingJson<'_>>::None)?,
+            }
+            f.member("metrics", SessionMetricsJson(self.metrics))
+        })
+    }
+}
+
+fn lock_status_str(status: LockStatus) -> &'static str {
+    match status {
+        LockStatus::None => "none",
+        LockStatus::Corrupted => "broken",
+        LockStatus::PidDead => "stale",
+        LockStatus::PidAlive(_) => "held",
+    }
+}
+
+struct SummaryJson<'a>(&'a ConversationSummary);
+
+impl DisplayJson for SummaryJson<'_> {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        let s = self.0;
+        f.object(|f| {
+            f.member("records", s.total_records)?;
+            f.member(
+                "invocations",
+                &InvocationsJson {
+                    starts: s.invocation_starts,
+                    completed: s.invocation_ends_completed,
+                    awaiting_approval: s.invocation_ends_awaiting_approval,
+                    error: s.invocation_ends_error,
+                },
+            )?;
+            f.member(
+                "messages",
+                &MessagesJson {
+                    user: s.user_messages,
+                    assistant: s.assistant_messages,
+                    tool: s.tool_messages,
+                    assistant_tool_calls_total: s.assistant_tool_calls_total,
+                },
+            )?;
+            f.member(
+                "approvals",
+                &ApprovalsJson {
+                    approve: s.approvals_approve,
+                    reject: s.approvals_reject,
+                    auto_approve: s.approvals_auto_approve,
+                    auto_deny: s.approvals_auto_deny,
+                },
+            )?;
+            f.member("summaries", s.summaries)?;
+            f.member(
+                "token_usage",
+                &LastTokenUsageJson {
+                    prompt: s.last_prompt_tokens,
+                    cache_hit: s.last_prompt_cache_hit_tokens,
+                    cache_miss: s.last_prompt_cache_miss_tokens,
+                },
+            )?;
+            f.member(
+                "last_record",
+                &LastRecordJson {
+                    ts: s.last_ts,
+                    kind: s.last_kind.as_deref(),
+                },
+            )
+        })
+    }
+}
+
+struct MessagesJson {
+    user: u64,
+    assistant: u64,
+    tool: u64,
+    assistant_tool_calls_total: u64,
+}
+impl DisplayJson for MessagesJson {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("user", self.user)?;
+            f.member("assistant", self.assistant)?;
+            f.member("tool", self.tool)?;
+            f.member(
+                "assistant_tool_calls_total",
+                self.assistant_tool_calls_total,
+            )
+        })
+    }
+}
+
+struct LastTokenUsageJson {
+    prompt: Option<u64>,
+    cache_hit: Option<u64>,
+    cache_miss: Option<u64>,
+}
+impl DisplayJson for LastTokenUsageJson {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("last_prompt", self.prompt)?;
+            f.member("cache_hit", self.cache_hit)?;
+            f.member("cache_miss", self.cache_miss)
+        })
+    }
+}
+
+struct LastRecordJson<'a> {
+    ts: Option<u64>,
+    kind: Option<&'a str>,
+}
+impl DisplayJson for LastRecordJson<'_> {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        f.object(|f| {
+            f.member("ts", self.ts)?;
+            f.member("kind", self.kind)
+        })
+    }
+}
+
+struct PendingJson<'a>(&'a PendingSummary);
+
+impl DisplayJson for PendingJson<'_> {
+    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
+        let p = self.0;
+        f.object(|f| {
+            f.member("call_id", p.call_id.as_str())?;
+            f.member("tool_kind", pending_tool_kind_str(p.tool_kind))?;
+            f.member("function_name", p.function_name.as_str())?;
+            f.member("ts", p.ts)?;
+            f.member("preview", p.preview.as_str())
+        })
+    }
+}
+
+fn pending_tool_kind_str(kind: crate::session::PendingToolKind) -> &'static str {
+    match kind {
+        crate::session::PendingToolKind::Patch => "patch",
+        crate::session::PendingToolKind::Command => "command",
+    }
+}
+
 struct SessionMetricsJson<'a>(&'a PerSessionMetrics);
 
 impl DisplayJson for SessionMetricsJson<'_> {
@@ -1174,77 +1155,6 @@ impl DisplayJson for SessionMetricsJson<'_> {
                 &DurationJson {
                     total: mx.duration_ms_total,
                     avg_per_invocation: avg_duration_ms(m),
-                },
-            )
-        })
-    }
-}
-
-struct AllMetricsJson<'a>(&'a [PerSessionMetrics], &'a TotalsAggregate);
-
-impl DisplayJson for AllMetricsJson<'_> {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        let sessions = self.0;
-        let total = self.1;
-        f.object(|f| {
-            f.member(
-                "sessions",
-                sessions
-                    .iter()
-                    .map(SessionMetricsJson)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )?;
-            f.member("total", TotalsJson(total))
-        })
-    }
-}
-
-struct TotalsJson<'a>(&'a TotalsAggregate);
-
-impl DisplayJson for TotalsJson<'_> {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        let t = self.0;
-        f.object(|f| {
-            f.member("sessions_counted", t.sessions_counted)?;
-            f.member(
-                "invocations",
-                &TotalInvocationsJson {
-                    starts: t.invocation_starts,
-                },
-            )?;
-            f.member("turns", t.turns)?;
-            f.member(
-                "tool_calls",
-                &TotalToolCallsJson {
-                    total: t.tool_calls_total,
-                    errors: t.tool_errors,
-                },
-            )?;
-            f.member(
-                "approvals",
-                &TotalApprovalsJson {
-                    approve: t.approvals_approve,
-                    reject: t.approvals_reject,
-                },
-            )?;
-            f.member(
-                "tokens",
-                &TotalTokensJson {
-                    prompt_billed_total: t.prompt_tokens_billed_total,
-                },
-            )?;
-            f.member(
-                "compaction",
-                &CompactionJson {
-                    attempts: t.compaction_attempts,
-                    failures: t.compaction_failures,
-                },
-            )?;
-            f.member(
-                "duration_ms",
-                &TotalDurationJson {
-                    total: t.duration_ms_total,
                 },
             )
         })
@@ -1353,62 +1263,10 @@ impl DisplayJson for DurationJson {
     }
 }
 
-struct TotalInvocationsJson {
-    starts: u64,
-}
-impl DisplayJson for TotalInvocationsJson {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| f.member("starts", self.starts))
-    }
-}
-
-struct TotalToolCallsJson {
-    total: u64,
-    errors: u64,
-}
-impl DisplayJson for TotalToolCallsJson {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| {
-            f.member("total", self.total)?;
-            f.member("errors", self.errors)
-        })
-    }
-}
-
-struct TotalApprovalsJson {
-    approve: u64,
-    reject: u64,
-}
-impl DisplayJson for TotalApprovalsJson {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| {
-            f.member("approve", self.approve)?;
-            f.member("reject", self.reject)
-        })
-    }
-}
-
-struct TotalTokensJson {
-    prompt_billed_total: u64,
-}
-impl DisplayJson for TotalTokensJson {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| f.member("prompt_billed_total", self.prompt_billed_total))
-    }
-}
-
-struct TotalDurationJson {
-    total: u64,
-}
-impl DisplayJson for TotalDurationJson {
-    fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
-        f.object(|f| f.member("total", self.total))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write as _;
 
     #[test]
@@ -1553,66 +1411,6 @@ mod tests {
             unknown: 9,
         };
         assert_eq!(counts.total(), 24);
-    }
-
-    #[test]
-    fn compute_totals_saturates_over_multi_session_input() {
-        let m1 = PerSessionMetrics {
-            session_name: "a".to_string(),
-            summary: ConversationSummary {
-                invocation_starts: 2,
-                approvals_approve: 3,
-                approvals_reject: 1,
-                ..Default::default()
-            },
-            metrics: MetricsAggregate {
-                turns: 5,
-                tool_calls: ToolCallCounts {
-                    list: 1,
-                    read: 1,
-                    ..Default::default()
-                },
-                tool_errors: 2,
-                duration_ms_total: 1000,
-                prompt_tokens_billed_total: 5000,
-                compaction_attempts: 4,
-                compaction_failures: 1,
-                ..Default::default()
-            },
-        };
-        let m2 = PerSessionMetrics {
-            session_name: "b".to_string(),
-            summary: ConversationSummary {
-                invocation_starts: 1,
-                approvals_approve: 1,
-                ..Default::default()
-            },
-            metrics: MetricsAggregate {
-                turns: 3,
-                tool_calls: ToolCallCounts {
-                    command: 4,
-                    ..Default::default()
-                },
-                tool_errors: 0,
-                duration_ms_total: 500,
-                prompt_tokens_billed_total: 1000,
-                compaction_attempts: 2,
-                compaction_failures: 2,
-                ..Default::default()
-            },
-        };
-        let t = compute_totals(&[m1, m2]);
-        assert_eq!(t.sessions_counted, 2);
-        assert_eq!(t.invocation_starts, 3);
-        assert_eq!(t.turns, 8);
-        assert_eq!(t.tool_calls_total, 6);
-        assert_eq!(t.tool_errors, 2);
-        assert_eq!(t.approvals_approve, 4);
-        assert_eq!(t.approvals_reject, 1);
-        assert_eq!(t.prompt_tokens_billed_total, 6000);
-        assert_eq!(t.duration_ms_total, 1500);
-        assert_eq!(t.compaction_attempts, 6);
-        assert_eq!(t.compaction_failures, 3);
     }
 
     #[test]

@@ -178,11 +178,7 @@ fn run() -> Result<RunOutcome, RunError> {
             return Ok(RunOutcome::Ok);
         }
     }
-    for outcome in [
-        try_run_show(&mut args)?,
-        try_run_metrics(&mut args)?,
-        try_run_analyze(&mut args)?,
-    ] {
+    for outcome in [try_run_status(&mut args)?, try_run_analyze(&mut args)?] {
         match outcome {
             CommandOutcome::NotHandled => {}
             CommandOutcome::Done => return Ok(RunOutcome::Ok),
@@ -554,9 +550,9 @@ fn parse_session_tool_call_max(raw: &str) -> Result<Option<usize>, RunError> {
     Ok(Some(n))
 }
 
-fn try_run_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("show")
-        .doc("Show a summary of one session (invocations, message counts, pending)")
+fn try_run_status(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("status")
+        .doc("Show one session's current state (lock, summary, pending) and aggregate metrics.")
         .take(args)
         .is_present()
     {
@@ -570,49 +566,14 @@ fn try_run_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
-    if args.metadata().help_mode {
-        return Ok(CommandOutcome::Help);
-    }
-    session_cmd::run_show(&name).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(CommandOutcome::Done)
-}
-
-fn try_run_metrics(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("metrics")
-        .doc(
-            "Aggregate metrics from session records. \
-             Use -s NAME for a single session, --all for every session under .attini/.",
-        )
-        .take(args)
-        .is_present()
-    {
-        return Ok(CommandOutcome::NotHandled);
-    }
-    let session_name: String = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session name; directory is .attini/<NAME>/")
-        .default("main")
-        .env(SESSION_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let all = noargs::flag("all")
-        .doc("Aggregate across every session under .attini/ (ignores -s)")
-        .take(args)
-        .is_present();
     let json = noargs::flag("json")
-        .doc("Emit the aggregate as a JSON object instead of a human-readable table")
+        .doc("Emit the whole overview as a JSON object")
         .take(args)
         .is_present();
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
     }
-    let scope = if all {
-        session_cmd::MetricsScope::All
-    } else {
-        session_cmd::MetricsScope::Single(&session_name)
-    };
-    session_cmd::run_metrics(scope, json).map_err(|e| RunError::Runtime(e.to_string()))?;
+    session_cmd::run_status(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 

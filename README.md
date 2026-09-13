@@ -38,7 +38,7 @@ than letting the agent infer or guess:
   extra context at runtime.
 - **State changes are surfaced.** `patch` shows a preview (file list + a
   diff) and waits for approval on any non-tracked write; the model's
-  in-flight intent is observable via `attini ask` / `attini show`; and a
+  in-flight intent is observable via `attini ask` / `attini status`; and a
   one-line status is printed to stderr so you always know which session/model
   is advancing. Diagnostic output never pollutes stdout.
 - **No silent side effects.** The workspace boundary is enforced on every read
@@ -202,8 +202,7 @@ A few read-only helpers remain, for cases where parsing the log by hand is
 tedious. None of them acquire the session `LOCK` or write to the conversation log:
 
 ```sh
-attini show    -s NAME            # invocation/approval/message counts + pending calls
-attini metrics [-s NAME | --all] [--json]
+attini status  -s NAME [--json]   # lock + summary + pending calls + aggregate metrics
 attini analyze -s NAME [--json]   # record-kind histogram, bytes by tool/command family
 attini ask     -s NAME [QUESTION] # ask the model to summarise the current state
 ```
