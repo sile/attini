@@ -619,7 +619,7 @@ fn lock_conflict_error(name: &str, lock_path: &Path, holder_pid: Option<i32>) ->
         format!(
             "session {name:?} is locked{pid_hint}: {path}\n\
              If no attini process is actually holding it, remove the LOCK manually: \
-             `rm {path}` (or `attini unlock {name}`).",
+             `rm {path}`.",
             path = lock_path.display(),
         ),
     )

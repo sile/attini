@@ -182,7 +182,6 @@ fn run() -> Result<RunOutcome, RunError> {
         try_run_show(&mut args)?,
         try_run_metrics(&mut args)?,
         try_run_analyze(&mut args)?,
-        try_run_unlock(&mut args)?,
         try_run_prune(&mut args)?,
         try_run_grant(&mut args)?,
         try_run_grant_read(&mut args)?,
@@ -578,33 +577,6 @@ fn try_run_show(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         return Ok(CommandOutcome::Help);
     }
     session_cmd::run_show(&name).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(CommandOutcome::Done)
-}
-
-fn try_run_unlock(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("unlock")
-        .doc("Remove the LOCK file. Refuses if the holder PID is alive unless --force is set")
-        .take(args)
-        .is_present()
-    {
-        return Ok(CommandOutcome::NotHandled);
-    }
-    let force = noargs::flag("force")
-        .doc("Remove the LOCK even if the holder PID appears alive (PID reuse escape hatch)")
-        .take(args)
-        .is_present();
-    let name: String = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session name; directory is .attini/<NAME>/")
-        .default("main")
-        .env(SESSION_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    if args.metadata().help_mode {
-        return Ok(CommandOutcome::Help);
-    }
-    session_cmd::run_unlock(&name, force).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 

@@ -1,5 +1,5 @@
 //! Top-level session inspection subcommands (show / metrics / analyze /
-//! unlock / prune). Session data lives under `.attini/<NAME>/`; attini
+//! prune). Session data lives under `.attini/<NAME>/`; attini
 //! keeps no abstraction over it, so listing/removing sessions and reading
 //! `conversation.jsonl` are done directly on the filesystem.
 
@@ -1548,25 +1548,6 @@ fn rewrite_from_offset(path: &Path, offset: u64) -> io::Result<()> {
         out.sync_all()?;
     }
     fs::rename(&tmp, path)
-}
-
-pub fn run_unlock(name: &str, force: bool) -> io::Result<()> {
-    let paths = session_paths(name)?;
-    match inspect_lock(&paths.lock) {
-        LockStatus::None => {
-            eprintln!("session {name:?}: no LOCK to remove");
-            Ok(())
-        }
-        LockStatus::PidAlive(pid) if !force => Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("session {name:?} LOCK is held by live pid {pid}; pass --force to override"),
-        )),
-        LockStatus::PidAlive(_) | LockStatus::PidDead | LockStatus::Corrupted => {
-            fs::remove_file(&paths.lock)?;
-            eprintln!("removed {}", paths.lock.display());
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]

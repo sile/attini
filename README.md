@@ -206,7 +206,6 @@ attini show    -s NAME            # invocation/approval/message counts + pending
 attini metrics [-s NAME | --all] [--json]
 attini analyze -s NAME [--json]   # record-kind histogram, bytes by tool/command family
 attini ask     -s NAME [QUESTION] # ask the model to summarise the current state
-attini unlock  -s NAME [--force]  # remove a stale LOCK
 attini prune   -s NAME [-y]       # drop records before the last summary
 ```
 
