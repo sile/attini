@@ -255,7 +255,6 @@ struct TokenAggregate {
 
 #[derive(Debug, Clone)]
 struct PerSessionMetrics {
-    session_name: String,
     summary: ConversationSummary,
     metrics: MetricsAggregate,
 }
@@ -297,7 +296,6 @@ fn collect_session_metrics(name: &str) -> io::Result<PerSessionMetrics> {
     }
 
     Ok(PerSessionMetrics {
-        session_name: name.to_string(),
         summary,
         metrics: merged,
     })
@@ -944,6 +942,11 @@ impl DisplayJson for TokenUsageAggregate {
 /// `--json` renderer for `attini status`. Combines the current-state
 /// overview (lock / summary / pending) with the aggregate metrics in
 /// a single object.
+///
+/// Facts that the summary already carries (invocations, approvals) are
+/// emitted once here and not repeated under `metrics`. `summary`
+/// holds the raw count of the log; `metrics` holds what is computed
+/// from it (turns, tool calls, totals, compaction, duration).
 struct StatusJson<'a> {
     name: &'a str,
     paths: &'a SessionPaths,
@@ -1055,6 +1058,8 @@ impl DisplayJson for MessagesJson {
     }
 }
 
+/// The *last* turn's token usage (not a total). Contrast with
+/// `TokensJson` under `metrics.tokens_total`, which is cumulative.
 struct LastTokenUsageJson {
     prompt: Option<u64>,
     cache_hit: Option<u64>,
@@ -1110,32 +1115,16 @@ struct SessionMetricsJson<'a>(&'a PerSessionMetrics);
 impl DisplayJson for SessionMetricsJson<'_> {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         let m = self.0;
-        let s = &m.summary;
         let mx = &m.metrics;
+        // NOTE: `invocations` and `approvals` are deliberately omitted here;
+        // they are emitted once, under `summary`, by `StatusJson`. This keeps
+        // the JSON free of the same fact stored under two names, matching the
+        // human output (`print_session_metrics_human_tail`).
         f.object(|f| {
-            f.member("session", &m.session_name)?;
-            f.member(
-                "invocations",
-                &InvocationsJson {
-                    starts: s.invocation_starts,
-                    completed: s.invocation_ends_completed,
-                    awaiting_approval: s.invocation_ends_awaiting_approval,
-                    error: s.invocation_ends_error,
-                },
-            )?;
             f.member("turns", mx.turns)?;
             f.member("tool_calls", ToolCallsJson(&mx.tool_calls, mx.tool_errors))?;
             f.member(
-                "approvals",
-                &ApprovalsJson {
-                    approve: s.approvals_approve,
-                    reject: s.approvals_reject,
-                    auto_approve: s.approvals_auto_approve,
-                    auto_deny: s.approvals_auto_deny,
-                },
-            )?;
-            f.member(
-                "tokens",
+                "tokens_total",
                 &TokensJson {
                     prompt_billed_total: mx.prompt_tokens_billed_total,
                     completion_total: mx.completion_tokens_total,
@@ -1233,6 +1222,8 @@ impl DisplayJson for ApprovalsJson {
     }
 }
 
+/// Cumulative token totals across every invocation. Contrast with
+/// `SummaryJson.token_usage`, which is the *last* turn's usage only.
 struct TokensJson {
     prompt_billed_total: u64,
     completion_total: u64,
