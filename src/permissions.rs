@@ -184,12 +184,6 @@ fn parse_rule(value: nojson::RawJsonValue<'_, '_>) -> Result<Rule, String> {
     if argv_prefix.iter().any(|s| s.is_empty()) {
         return Err("argv_prefix contains an empty element".to_string());
     }
-    let readonly = optional_bool(value, "readonly")
-        .map_err(|e| format!("readonly: {e}"))?
-        .unwrap_or(false);
-    let network = optional_bool(value, "network")
-        .map_err(|e| format!("network: {e}"))?
-        .unwrap_or(true);
     let decision = match optional_string(value, "decision").map_err(|e| format!("decision: {e}"))? {
         None => None,
         Some(s) => match s.as_str() {
@@ -204,8 +198,6 @@ fn parse_rule(value: nojson::RawJsonValue<'_, '_>) -> Result<Rule, String> {
     };
     Ok(Rule {
         argv_prefix,
-        readonly,
-        network,
         decision,
     })
 }
@@ -246,16 +238,6 @@ fn optional_string(
         .map_err(|e| e.to_string())
 }
 
-fn optional_bool(value: nojson::RawJsonValue<'_, '_>, key: &str) -> Result<Option<bool>, String> {
-    let m = value.to_member(key).map_err(|e| e.to_string())?;
-    let Some(v) = m.optional() else {
-        return Ok(None);
-    };
-    v.try_into()
-        .map(Some)
-        .map_err(|e: nojson::JsonParseError| e.to_string())
-}
-
 // -------------------------------------------------------------------
 // Writable schema representation
 // -------------------------------------------------------------------
@@ -270,17 +252,13 @@ struct Permissions {
 }
 
 /// A raw command-prefix rule entry preserved for round-trip through
-/// `grant`. We deliberately keep unknown attribute-only decisions
-/// (`readonly` / `network` without a `decision` field) as a
-/// conflict signal to `grant`, so this struct mirrors the on-disk
-/// fields verbatim rather than folding into `sansio::Rule` (which is
-/// the runtime evaluator's view and would drop attribute-only rows).
+/// `grant`. A row without a `decision` field is kept as-is so `grant`
+/// can surface it as a conflict rather than silently rewriting it,
+/// but it is otherwise ignored (it never matches at evaluation time).
 #[derive(Debug, Clone)]
 struct CommandPrefixEntry {
     argv_prefix: Vec<String>,
     decision: Option<String>,
-    readonly: Option<bool>,
-    network: Option<bool>,
 }
 
 impl DisplayJson for CommandPrefixEntry {
@@ -289,12 +267,6 @@ impl DisplayJson for CommandPrefixEntry {
             f.member("argv_prefix", &self.argv_prefix)?;
             if let Some(d) = &self.decision {
                 f.member("decision", d)?;
-            }
-            if let Some(r) = self.readonly {
-                f.member("readonly", r)?;
-            }
-            if let Some(n) = self.network {
-                f.member("network", n)?;
             }
             Ok(())
         })
@@ -392,15 +364,9 @@ fn read_command_prefix_entry(
         .map_err(|e| GrantError::ParseError(path_hint(), format!("argv_prefix: {e}")))?;
     let decision =
         optional_string(value, "decision").map_err(|e| GrantError::ParseError(path_hint(), e))?;
-    let readonly =
-        optional_bool(value, "readonly").map_err(|e| GrantError::ParseError(path_hint(), e))?;
-    let network =
-        optional_bool(value, "network").map_err(|e| GrantError::ParseError(path_hint(), e))?;
     Ok(CommandPrefixEntry {
         argv_prefix,
         decision,
-        readonly,
-        network,
     })
 }
 
@@ -506,8 +472,6 @@ pub fn grant(scope: GrantScope<'_>, argv_prefix: &[String]) -> Result<GrantOutco
     permissions.command_prefixes.push(CommandPrefixEntry {
         argv_prefix,
         decision: Some("approve".to_string()),
-        readonly: None,
-        network: None,
     });
     write_permissions_file(&target, &permissions)?;
     Ok(GrantOutcome::Appended(target))

@@ -232,10 +232,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .doc("Optional system prompt prepended to the conversation")
         .take(args)
         .present_and_then(|o| o.value().parse())?;
-    let local_only = noargs::flag("local-only")
-        .doc("Local-only mode: auto-run commands matched by a `network: false` rule; leave others for approval")
-        .take(args)
-        .is_present();
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
@@ -331,11 +327,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
     };
     let cont = Continuation::Prompt(p);
 
-    let mode = if local_only {
-        attini::sansio::permissions::Mode::LocalOnly
-    } else {
-        attini::sansio::permissions::Mode::Default
-    };
     let authorization = attini::sansio::permissions::Authorization::PerTool;
 
     let workspace_root = std::env::current_dir()
@@ -347,7 +338,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         workspace_root,
         system_prompt: system,
         max_turns: DEFAULT_MAX_TURNS,
-        mode,
         turn_tool_call_limit,
         tool_call_rate,
         session_tool_call_max,
@@ -436,7 +426,6 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         workspace_root,
         system_prompt: None,
         max_turns: DEFAULT_MAX_TURNS,
-        mode: attini::sansio::permissions::Mode::Default,
         turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
             .parse()
             .map_err(|e| RunError::Runtime(format!("bad default turn limit: {e}")))?,

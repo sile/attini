@@ -82,6 +82,22 @@ can distinguish "not implemented yet" from "intentionally not there".
   session without touching it. There is no whitelisted "semi-approval" state
   to toggle into.
 
+### 7. `--local-only` mode and rule attributes (`readonly` / `network`)
+
+- **What:** a startup flag `--local-only` that switched the evaluator into a
+  mode where commands matched by a `network: false` (attribute-only) rule
+  were auto-approved, and the `readonly` / `network` rule attributes that
+  existed only to feed that mode.
+- **Status:** removed. The `Mode` enum, `evaluate`'s `mode` argument, and the
+  `Rule.readonly` / `Rule.network` fields are gone.
+- **Why not:** it added a second approval axis (a per-invocation "how much
+  should run unattended" knob) on top of the per-rule `decision`. Managing
+  it meant the human had to reason about modes *and* rules, and attribute-only
+  rules that carry no `decision` were a confusing middle state. Approval is
+  now a single, flat thing: a rule either says `approve`, `deny`, or is absent
+  (which falls through to a pending approval). Rules carry no attributes that
+  silently change behavior under some mode.
+
 ## The common thread
 
 All are the same shape: **implicit, convention-based context or delegation
@@ -98,7 +114,7 @@ The README's design philosophy bullets describe *principles* (context is
 requested, state changes surfaced, no silent side effects). This note is a
 *concrete list of removals and non-goals*. It answers a different question:
 "if you look for feature X, is it gone because it was bad, or just not built
-yet?" The answer for these six is "bad, deliberately".
+yet?" The answer for these seven is "bad, deliberately".
 
 ## How to revive
 

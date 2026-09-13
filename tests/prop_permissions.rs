@@ -1,7 +1,7 @@
 //! Property-based tests for `attini::sansio::permissions::evaluate`
 //! focusing on the argv-prefix matching contract.
 
-use attini::sansio::permissions::{Authorization, Judgment, Mode, Rule, RuleDecision, evaluate};
+use attini::sansio::permissions::{Authorization, Judgment, Rule, RuleDecision, evaluate};
 
 const ITERATIONS: usize = 512;
 const SEED_ENV: &str = "ATTINI_PBT_SEED";
@@ -19,8 +19,6 @@ fn sample_argv(ctx: &mut noprop::TestCaseContext, min: usize, max: usize) -> Vec
 fn approve_rule(argv_prefix: Vec<String>) -> Rule {
     Rule {
         argv_prefix,
-        readonly: false,
-        network: true,
         decision: Some(RuleDecision::Approve),
     }
 }
@@ -34,7 +32,7 @@ fn rule_shorter_than_argv_with_matching_head_auto_approves() -> noprop::RunResul
         let mut argv = prefix.clone();
         argv.extend(extra_tail);
         let rule = approve_rule(prefix.clone());
-        match evaluate(Mode::Default, &[rule], &[], &argv, &Authorization::PerTool) {
+        match evaluate(&[rule], &[], &argv, &Authorization::PerTool) {
             Judgment::AutoApprove(d) => {
                 assert_eq!(d.argv_prefix, prefix);
                 Ok(())
@@ -57,7 +55,7 @@ fn rule_longer_than_argv_never_matches() -> noprop::RunResult {
         prefix.extend(extra);
         let rule = approve_rule(prefix);
         assert!(matches!(
-            evaluate(Mode::Default, &[rule], &[], &argv, &Authorization::PerTool),
+            evaluate(&[rule], &[], &argv, &Authorization::PerTool),
             Judgment::Pending
         ));
         Ok(())
@@ -79,7 +77,7 @@ fn any_element_mismatch_prevents_match() -> noprop::RunResult {
         argv[flip_at] = format!("X_{}", argv[flip_at]);
         let rule = approve_rule(prefix);
         assert!(matches!(
-            evaluate(Mode::Default, &[rule], &[], &argv, &Authorization::PerTool),
+            evaluate(&[rule], &[], &argv, &Authorization::PerTool),
             Judgment::Pending
         ));
         Ok(())

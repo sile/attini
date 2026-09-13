@@ -15,7 +15,7 @@ use crate::sansio::agent::{
     ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
-use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, Mode, evaluate};
+use crate::sansio::permissions::{Authorization, AutoDecision, Judgment, evaluate};
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, ChatMessageWithTs, InvocationEndReason, MetricsSnapshotBody,
     Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody, now_unix_millis,
@@ -193,7 +193,6 @@ pub struct TellConfig {
     pub workspace_root: PathBuf,
     pub system_prompt: Option<String>,
     pub max_turns: usize,
-    pub mode: Mode,
     /// Maximum tool calls admitted in a single model turn. Extras in
     /// the same response get a synthetic error result and the loop
     /// advances to the next turn.
@@ -662,7 +661,6 @@ fn drive(
                     if let CommandDispatch::Awaiting(pending) = dispatch_command(
                         tc,
                         executor,
-                        cfg.mode,
                         &rules,
                         &cfg.authorization,
                         session,
@@ -1313,7 +1311,6 @@ enum CommandDispatch {
 fn dispatch_command(
     tc: &ToolCall,
     executor: &ToolExecutor,
-    mode: Mode,
     rules: &LoadedRules,
     authorization: &Authorization,
     session: &mut Session,
@@ -1333,13 +1330,7 @@ fn dispatch_command(
             return Ok(CommandDispatch::Continue);
         }
     };
-    let judgment = evaluate(
-        mode,
-        &rules.session,
-        &rules.workspace,
-        &inv.argv,
-        authorization,
-    );
+    let judgment = evaluate(&rules.session, &rules.workspace, &inv.argv, authorization);
     let display = shell_escape_argv(&inv.argv);
     match judgment {
         Judgment::AutoApprove(dec) => {
@@ -2539,7 +2530,6 @@ mod tests {
             workspace_root: PathBuf::new(),
             system_prompt: None,
             max_turns: 0,
-            mode: Mode::Default,
             turn_tool_call_limit: turn_limit,
             tool_call_rate: rate,
             session_tool_call_max: session_max,

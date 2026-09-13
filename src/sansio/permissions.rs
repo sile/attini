@@ -2,7 +2,7 @@
 //!
 //! Rules are argv-prefix matchers (a rule matches when its
 //! `argv_prefix` equals the first N elements of the tool call's
-//! `argv`). Mode-aware evaluation returns [`Judgment::AutoApprove`],
+//! `argv`). Evaluation returns [`Judgment::AutoApprove`],
 //! [`Judgment::AutoDeny`], or [`Judgment::Pending`]. No I/O — file
 //! loading and session record writing live in the impl-layer
 //! `crate::permissions` and `crate::tell_cli`.
@@ -10,12 +10,6 @@
 //! Evaluation order: deny rules (session then workspace) always win,
 //! then the first matching approve rule, then the pending fallback
 //! for an unmatched command.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Default,
-    LocalOnly,
-}
 
 /// How side-effecting tool calls are authorized in this invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,13 +29,9 @@ pub enum RuleDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub argv_prefix: Vec<String>,
-    /// Default `false` (conservative: assume the command may write).
-    pub readonly: bool,
-    /// Default `true` (conservative: assume the command may use the
-    /// network).
-    pub network: bool,
-    /// `None` for attribute-only rules that only affect mode-based
-    /// judgments.
+    /// `None` for attribute-only rules that carry no decision; such
+    /// rules never match (they are kept only to preserve unknown rows
+    /// on round-trip through `grant`).
     pub decision: Option<RuleDecision>,
 }
 
@@ -49,8 +39,6 @@ impl Rule {
     pub fn new_grant_approve(argv_prefix: Vec<String>) -> Self {
         Self {
             argv_prefix,
-            readonly: false,
-            network: true,
             decision: Some(RuleDecision::Approve),
         }
     }
@@ -110,13 +98,12 @@ impl AutoReason {
 /// matching deny wins over everything. Otherwise the first matching
 /// approve rule wins, then the fallback.
 pub fn evaluate(
-    mode: Mode,
     session_rules: &[Rule],
     workspace_rules: &[Rule],
     argv: &[String],
     _authorization: &Authorization,
 ) -> Judgment {
-    // Deny always wins across every mode and scope.
+    // Deny always wins across every scope.
     for (scope, rules) in [
         (RuleScope::Session, session_rules),
         (RuleScope::Workspace, workspace_rules),
@@ -140,7 +127,7 @@ pub fn evaluate(
             if !rule_matches(rule, argv) {
                 continue;
             }
-            match judge_matched(mode, rule, scope) {
+            match judge_matched(rule, scope) {
                 JudgeOutcome::Decided(judgment) => return judgment,
                 JudgeOutcome::KeepLooking => continue,
             }
@@ -168,33 +155,18 @@ fn rule_matches(rule: &Rule, argv: &[String]) -> bool {
         .all(|(a, b)| a == b)
 }
 
-/// Judge a single matching rule in `mode`. A matched approve rule
-/// decides; an attribute-only rule (no decision) defers to mode
-/// handling. A `Pending`-ish outcome is never returned here.
-fn judge_matched(mode: Mode, rule: &Rule, scope: RuleScope) -> JudgeOutcome {
-    match mode {
-        Mode::Default => match rule.decision {
-            Some(RuleDecision::Approve) => {
-                JudgeOutcome::Decided(Judgment::AutoApprove(AutoDecision {
-                    scope,
-                    argv_prefix: rule.argv_prefix.clone(),
-                    reason: AutoReason::RuleApprove,
-                }))
-            }
-            None => JudgeOutcome::KeepLooking,
-            Some(RuleDecision::Deny) => unreachable!("deny handled before the rule pass"),
-        },
-        Mode::LocalOnly => {
-            if rule.decision == Some(RuleDecision::Approve) || !rule.network {
-                JudgeOutcome::Decided(Judgment::AutoApprove(AutoDecision {
-                    scope,
-                    argv_prefix: rule.argv_prefix.clone(),
-                    reason: AutoReason::RuleApprove,
-                }))
-            } else {
-                JudgeOutcome::KeepLooking
-            }
-        }
+/// Judge a single matching rule. A matched approve rule decides; an
+/// attribute-only rule (no decision) keeps looking. A `Pending`-ish
+/// outcome is never returned here.
+fn judge_matched(rule: &Rule, scope: RuleScope) -> JudgeOutcome {
+    match rule.decision {
+        Some(RuleDecision::Approve) => JudgeOutcome::Decided(Judgment::AutoApprove(AutoDecision {
+            scope,
+            argv_prefix: rule.argv_prefix.clone(),
+            reason: AutoReason::RuleApprove,
+        })),
+        None => JudgeOutcome::KeepLooking,
+        Some(RuleDecision::Deny) => unreachable!("deny handled before the rule pass"),
     }
 }
 
@@ -209,8 +181,6 @@ mod tests {
     fn rule(decision: Option<RuleDecision>, prefix: &[&str]) -> Rule {
         Rule {
             argv_prefix: argv(prefix),
-            readonly: false,
-            network: true,
             decision,
         }
     }
@@ -219,7 +189,6 @@ mod tests {
     fn evaluate_default_approve_rule_matches() {
         let r = rule(Some(RuleDecision::Approve), &["cargo", "test"]);
         match evaluate(
-            Mode::Default,
             &[r],
             &[],
             &argv(&["cargo", "test", "--workspace"]),
@@ -231,74 +200,25 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_default_attribute_only_rule_pends() {
+    fn evaluate_attribute_only_rule_pends() {
         let r = rule(None, &["ls"]);
         assert!(matches!(
-            evaluate(
-                Mode::Default,
-                &[r],
-                &[],
-                &argv(&["ls", "-la"]),
-                &Authorization::PerTool
-            ),
+            evaluate(&[r], &[], &argv(&["ls", "-la"]), &Authorization::PerTool),
             Judgment::Pending
         ));
     }
 
     #[test]
-    fn evaluate_deny_wins_across_modes() {
+    fn evaluate_deny_wins_across_scopes() {
         let r = rule(Some(RuleDecision::Deny), &["rm", "-rf"]);
-        for mode in [Mode::Default, Mode::LocalOnly] {
-            assert!(matches!(
-                evaluate(
-                    mode,
-                    std::slice::from_ref(&r),
-                    &[],
-                    &argv(&["rm", "-rf", "tmp"]),
-                    &Authorization::PerTool
-                ),
-                Judgment::AutoDeny(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn evaluate_local_only_network_false_auto_approves() {
-        let r = Rule {
-            argv_prefix: argv(&["cargo", "build"]),
-            readonly: false,
-            network: false,
-            decision: None,
-        };
         assert!(matches!(
             evaluate(
-                Mode::LocalOnly,
-                &[r],
+                std::slice::from_ref(&r),
                 &[],
-                &argv(&["cargo", "build", "--release"]),
+                &argv(&["rm", "-rf", "tmp"]),
                 &Authorization::PerTool
             ),
-            Judgment::AutoApprove(_)
-        ));
-    }
-
-    #[test]
-    fn evaluate_local_only_network_true_pends() {
-        let r = Rule {
-            argv_prefix: argv(&["curl"]),
-            readonly: true,
-            network: true,
-            decision: None,
-        };
-        assert!(matches!(
-            evaluate(
-                Mode::LocalOnly,
-                &[r],
-                &[],
-                &argv(&["curl", "example.com"]),
-                &Authorization::PerTool
-            ),
-            Judgment::Pending
+            Judgment::AutoDeny(_)
         ));
     }
 
@@ -308,7 +228,6 @@ mod tests {
         let sess = rule(Some(RuleDecision::Approve), &["cargo", "test"]);
         // Deny is checked across both scopes before any approve rule.
         match evaluate(
-            Mode::Default,
             &[sess],
             &[ws],
             &argv(&["cargo", "test"]),
@@ -324,7 +243,6 @@ mod tests {
         let r = rule(Some(RuleDecision::Approve), &["cargo", "test", "--all"]);
         assert!(matches!(
             evaluate(
-                Mode::Default,
                 &[r],
                 &[],
                 &argv(&["cargo", "test"]),
@@ -339,7 +257,6 @@ mod tests {
         let r = rule(Some(RuleDecision::Approve), &["cargo", "test"]);
         assert!(matches!(
             evaluate(
-                Mode::Default,
                 &[r],
                 &[],
                 &argv(&["cargo", "check"]),
@@ -353,13 +270,7 @@ mod tests {
     fn evaluate_empty_argv_prefix_never_matches() {
         let r = rule(Some(RuleDecision::Approve), &[]);
         assert!(matches!(
-            evaluate(
-                Mode::Default,
-                &[r],
-                &[],
-                &argv(&["ls"]),
-                &Authorization::PerTool
-            ),
+            evaluate(&[r], &[], &argv(&["ls"]), &Authorization::PerTool),
             Judgment::Pending
         ));
     }
@@ -369,7 +280,6 @@ mod tests {
         let cargo_test_rule = rule(Some(RuleDecision::Approve), &["cargo", "test"]);
         assert!(matches!(
             evaluate(
-                Mode::Default,
                 &[cargo_test_rule],
                 &[],
                 &argv(&["bash", "-c", "ls | head"]),
@@ -383,7 +293,6 @@ mod tests {
     fn evaluate_bash_dash_c_with_matching_rule_auto_approves() {
         let bash_c_rule = rule(Some(RuleDecision::Approve), &["bash", "-c"]);
         match evaluate(
-            Mode::Default,
             &[bash_c_rule],
             &[],
             &argv(&["bash", "-c", "ls | head"]),
