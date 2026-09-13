@@ -2,7 +2,8 @@
 
 **Status:** Deferred. Not implemented. Records the case for replacing the `--approve` flag
 with a dedicated subcommand, and for adding a `--grant SCOPE` sugar to reduce grant
-friction.
+friction. The motivation has been verified live and the semantics below are settled; only
+implementation remains.
 
 ## The observation
 
@@ -15,15 +16,30 @@ attini agent --approve
 
 Two problems:
 
-1. **Typos are silent.** `--approve` is easy to mistype (`--aprove`, `--approve=` ,
-   `--approve ` with a stray space/arg). With the current `noargs` setup, a mistyped flag
-   is not a hard error — it is simply not recognized, so the invocation falls back to the
-   fresh-prompt path (`PROMPT is required unless --approve is given` or, worse, treats the
-   leftover token as a prompt). The human thinks they approved; nothing was approved.
+1. **Typos fall through to the prompt.** `--approve` is easy to mistype (`--aprove`,
+   `--approve=`). With the current `noargs` setup a mistyped flag is not a hard error:
+   because `agent` has an *optional positional* `<PROMPT>`, the unknown token is absorbed
+   as the prompt instead of being rejected. Verified live:
+
+   ```
+   $ attini agent -s approv-check --approv
+   [agent] model=deepseek-flash session=approv-check ctx=0
+   ... the model runs a full investigation turn, treating "--approv" as the prompt ...
+   ```
+
+   So the typo does not merely fall back to *nothing* — it silently starts a **new model
+   turn with the typo as the prompt**, spending tokens and running tools the human never
+   asked for. (A second token surfaces only later, as an `unexpected argument` error:
+   `attini agent -s s --approv hello` rejects `hello`, because `--approv` was consumed as
+   the prompt first.) This is the strongest argument for the change: the confusing path
+   only exists because `agent` must keep an optional `<PROMPT>`, and `--approve` rides
+   along on that command.
 2. **It is conceptually a command, not a modifier.** "Approve the pending call" is a
    self-contained action on a session, in the same family as `attini session show` /
    `attini ask`. Modelling it as a subcommand gives it its own `--help`, its own
    name in the top-level command list, and shell-completion/tab-completion ergonomics.
+   Decisively: an `approve` subcommand has **no positional**, so `attini approve --approv`
+   is a clean unknown-flag error — the fall-through in (1) cannot happen there.
 
 ## Proposed shape
 
@@ -41,10 +57,15 @@ attini approve [-s NAME]        # approve the session's pending tool call(s)
 
 ### Interaction with `agent`
 
-- `attini agent --approve` would be removed (or kept as a deprecated alias for one
-  release). The `Continuation::Approve` path in `src/agent_cli.rs` stays — the new
-  subcommand just constructs it, exactly as `--approve` does today (see
+- **`attini agent --approve` is removed, not deprecated.** Keeping it would leave the
+  fall-through in (1) reachable through the flag the change is meant to retire, so the
+  two would contradict each other. The `Continuation::Approve` path in `src/agent_cli.rs`
+  stays — the new subcommand just constructs it, exactly as `--approve` does today (see
   `try_run_agent` in `src/main.rs`).
+- `agent` keeps its optional `<PROMPT>` (it is the normal "advance with a new prompt"
+  path), so `attini agent --approv` still becomes a weird prompt. That is fine: once
+  `--approve` is gone, no one expecting to approve reaches it, so the leftover token is
+  just a mistyped prompt, not a mistaken approval.
 - `--approve` currently forbids combining with `--skill` and forbids a prompt.
   A dedicated command makes those rules structural instead of validated: `approve` has
   no `--skill` and no positional, so there is nothing to reject.
@@ -80,25 +101,39 @@ where `SCOPE` is one of:
 | `session` | approve and append the argv-prefix rule to the session `permissions.json` | `approve` + `attini session grant <prefix>` |
 | `workspace` | approve and append to the workspace `permissions.json` | `approve` + `attini session grant <prefix> --workspace` |
 
-Details to settle:
+Settled semantics:
 
-- **Which prefix gets granted.** Reuse the same truncation `emit_suggested_rule` uses
-  (first two argv elements, e.g. `cargo test`) so `--grant session` does not bake in
-  every flag. The human should see the exact prefix that will be written.
+- **`approve` and `grant` are independent (option B).** Approving is a one-shot action
+  on the current pending call; granting is a persistent state change. They are kept
+  separate so each has a single, clear outcome. The grant runs *after* the approve; it
+  is best-effort.
+- **Grant failure is a warning, not a rollback.** If the grant cannot be written —
+  `AlreadyGranted`, `ExistingDenyConflict`, `ExistingAttributeOnlyConflict`, or any I/O
+  error — the approval still stands and the command still runs. The failure is reported
+  as a one-line warning to stderr afterward. The human asked to approve; that succeeded;
+  the convenience grant is a bonus that may or may not apply.
+- **A grant that cannot be formed is an error.** If the pending call is not a `command`,
+  or the argv cannot be truncated to a prefix at all, `--grant` is rejected up front
+  (before approving) rather than silently degrading to a plain approve. Silent no-ops
+  are against attini's philosophy.
 - **Applies to commands only.** Patches have no argv-prefix; a patch approval cannot be
   auto-granted this way (it is git-tracked-only auto-approve, or `--plan=on` to gate all
-  patches). `--grant` on a pending patch should be an error, not a silent no-op.
-- **Multiple pending calls.** `pending.json` is an array and `--approve` approves all of
-  them. If several commands are pending, "which argv-prefix to grant?" is ambiguous —
-  either grant each pending command's prefix, or require exactly one pending command
-  when `--grant` is non-`oneshot`.
+  patches). Introducing a patch scope is a separate, future idea — see the memo
+  `docs/deferred/patch-grant-scope.md`.
+- **Which prefix gets granted.** Reuse the same truncation `emit_suggested_rule` uses
+  (first two argv elements, e.g. `cargo test`) so `--grant session` does not bake in
+  every flag. The human should see the exact prefix that will be written, exactly as the
+  existing suggestion does today (verified live: `ls -la .` suggests `attini session
+  grant ls -la`). Because the prefix comes from the same helper as the suggestion, the
+  two can never disagree.
+- **Multiple pending calls.** `pending.json` is an array and approve handles all of them.
+  For `--grant`, if more than one command is pending, `--grant` is an error (ambiguous
+  which prefix to persist); `--grant oneshot` is unaffected because it persists nothing.
+  This keeps `--grant` a deliberate, single-target action.
 - **Reuse the existing machinery.** `permissions::grant(scope, argv_prefix)` and
   `GrantScope::{Session, Workspace}` already exist (`src/permissions.rs`); the command
   just calls them after a successful approve, inheriting the existing
   `AlreadyGranted` / `ExistingDenyConflict` / `ExistingAttributeOnlyConflict` handling.
-- **Semantics of "approve then grant".** The approval is this-call; the grant is
-  future-calls. They should be independent: if the grant fails (deny conflict), the
-  approval should still stand, and the error should be reported after the call ran.
 
 ## Why it is only *deferred*
 
@@ -118,16 +153,18 @@ Details to settle:
 1. `src/main.rs`: add `try_run_approve` (parse `-s/--session`, `--grant <SCOPE>`, reject
    unknown scopes), dispatch it before/alongside `agent`. Build `Continuation::Approve`
    and call `agent_cli::run` exactly as `try_run_agent` does today.
-2. `src/agent_cli.rs`: after the `Continuation::Approve` branch completes, if a grant was
-   requested, read the approved command's argv from the pending record and call
-   `permissions::grant`.
-3. Decide `--approve` fate: remove it, or keep a thin deprecated alias that prints a
-   pointer to `attini approve`.
+2. `src/main.rs`: remove the `--approve` flag from `try_run_agent` (and its prompt /
+   `--skill` validation, which becomes unnecessary).
+3. `src/agent_cli.rs`: after the `Continuation::Approve` branch completes, if a grant was
+   requested, read the approved command's argv from the pending record, run it through
+   the same truncation `emit_suggested_rule` uses, and call `permissions::grant`. Report
+   a grant failure as a warning and keep the approval.
 4. Update `README.md` (usage lines, the approve paragraph, the grant paragraph) and the
    `emit_suggested_rule` output to mention the shorter `attini approve --grant session`.
-5. Tests: unknown-subcommand typo fails; `--grant oneshot` persists nothing;
-   `--grant session` appends the truncated prefix; `--grant` on a pending patch errors;
-   multi-pending behavior matches the chosen policy.
+5. Tests: `attini approve --approv` fails as an unknown flag (no positional to absorb it);
+   `--grant oneshot` persists nothing; `--grant session` appends the truncated prefix;
+   `--grant` on a pending patch errors up front; `--grant` with multiple pending commands
+   errors; a grant conflict warns but the approved command still ran.
 
 ## Alternative: keep the flag, add the sugar
 
