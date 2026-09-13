@@ -255,7 +255,18 @@ pub enum Continuation {
     /// Resume by approving the pending tool call recorded in the
     /// session's `pending.json`.
     Approve,
+    /// Continue a session that stopped because it hit `max_turns`.
+    /// Appends a fixed user message (no new instruction) and runs
+    /// another `tell` invocation. See [`RESUME_PROMPT`].
+    Resume,
 }
+
+/// Fixed user message appended by [`Continuation::Resume`] (`attini
+/// resume`). It deliberately carries no new instruction: `resume` is
+/// for "keep going", while a new instruction goes through `attini
+/// tell`. The model already has its own last turn in context, so a
+/// bare continuation is enough to pick the work back up.
+pub const RESUME_PROMPT: &str = "Continue from where you left off.";
 
 /// Terminal outcome of one `tell_cli::run` invocation.
 #[derive(Debug)]
@@ -431,6 +442,15 @@ fn drive(
     cont: Continuation,
     counters: &mut Counters,
 ) -> io::Result<Driven> {
+    // `Resume` is a `Prompt` carrying a fixed continuation message: it
+    // shares every downstream behavior (auto-compaction, orphan repair,
+    // appending a user record) and differs only in where the text comes
+    // from. Normalise here so the rest of `drive` stays single-path.
+    let cont = match cont {
+        Continuation::Resume => Continuation::Prompt(RESUME_PROMPT.to_string()),
+        other => other,
+    };
+
     if matches!(cont, Continuation::Prompt(_)) {
         try_auto_compact(session, &cfg.model, counters, cfg.max_tokens)?;
     }
@@ -456,6 +476,8 @@ fn drive(
     }
 
     match cont {
+        // `Resume` was normalised to `Prompt` at the top of `drive`.
+        Continuation::Resume => unreachable!("Resume is normalised to Prompt before here"),
         Continuation::Prompt(text) => {
             session.append(&SessionRecord::User {
                 ts: now_unix_millis(),
@@ -694,10 +716,23 @@ fn drive(
         }
     }
 
-    Err(io::Error::other(format!(
-        "tell loop exceeded max_turns={}",
-        cfg.max_turns
+    Err(io::Error::other(max_turns_error(
+        &cfg.session_name,
+        cfg.max_turns,
     )))
+}
+
+/// Build the error message shown when `tell` runs out of turns. Names
+/// both follow-ups: [`Continuation::Resume`] (`attini resume`) to keep
+/// going, and `attini tell` to give a new instruction instead. Exit
+/// code stays the generic 1 (a `tell` loop that used all its turns is
+/// a runtime failure, not a success).
+fn max_turns_error(session_name: &str, max_turns: usize) -> String {
+    format!(
+        "tell loop exceeded max_turns={max_turns}; to continue this session run: \
+         `attini resume -s {session_name}` (or give a new instruction with \
+         `attini tell -s {session_name} \"...\"`)"
+    )
 }
 
 fn canonicalise_extra_read_roots(
@@ -2982,6 +3017,25 @@ mod tests {
         assert!(line.contains("ctx=1000"));
         assert!(line.contains("model=m"));
         assert!(line.contains("session=s"));
+    }
+
+    // -------------------------------------------------------------
+    // max_turns_error / RESUME_PROMPT
+    // -------------------------------------------------------------
+
+    #[test]
+    fn max_turns_error_points_at_resume_and_tell() {
+        let msg = max_turns_error("work", 20);
+        assert!(msg.contains("max_turns=20"));
+        // The continuation path names the session explicitly.
+        assert!(msg.contains("attini resume -s work"));
+        // And redirects new instructions to `tell`.
+        assert!(msg.contains("attini tell -s work"));
+    }
+
+    #[test]
+    fn resume_prompt_is_non_empty() {
+        assert!(!RESUME_PROMPT.trim().is_empty());
     }
 
     // -------------------------------------------------------------
