@@ -1,4 +1,4 @@
-//! Sync single-turn agent loop for `attini agent`.
+//! Sync single-turn agent loop for `attini tell`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
@@ -29,7 +29,7 @@ pub const EXIT_AWAITING_APPROVAL: u8 = 10;
 
 pub const DEFAULT_MAX_TURNS: usize = 20;
 
-/// Counters collected during one invocation of `agent_cli::run` for
+/// Counters collected during one invocation of `tell_cli::run` for
 /// later persistence into `MetricsSnapshotBody::entries`. Shared by
 /// mutable reference between `run()` and `drive()` so both the Ok
 /// and Err outcomes flush the same accumulated values.
@@ -185,7 +185,7 @@ pub const RETAINED_TAIL_MAX_CHARS: usize = 250_000;
 /// [`RETAINED_TAIL_MAX_CHARS`] for consistency.
 pub const RECORDS_TOTAL_MAX_CHARS: usize = 250_000;
 
-pub struct AgentConfig {
+pub struct TellConfig {
     pub session_name: String,
     pub model: String,
     /// Maximum completion tokens per model call. `None` uses the
@@ -196,7 +196,7 @@ pub struct AgentConfig {
     pub max_turns: usize,
     pub mode: Mode,
     /// Extra workspace-external read-only path prefixes granted via
-    /// `attini agent --read-path`. Combined with the persistent
+    /// `attini tell --read-path`. Combined with the persistent
     /// entries from `permissions.json.extra_read_paths` on startup.
     pub extra_read_paths_cli: Vec<PathBuf>,
     /// CLI `--reference` file paths to inject into the system prompt.
@@ -279,14 +279,14 @@ pub enum Continuation {
     Approve,
 }
 
-/// Terminal outcome of one `agent_cli::run` invocation.
+/// Terminal outcome of one `tell_cli::run` invocation.
 #[derive(Debug)]
-pub enum RunOutcome {
+pub enum TellOutcome {
     /// Normal exit with the process exit code.
     Exit(ExitCode),
 }
 
-pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
+pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
     // Apply a requested plan-mode change now so the persisted state is
     // updated before the model runs, and so the status line reflects
@@ -335,7 +335,7 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
         let ctx_tokens = session.latest_prompt_tokens().ok().flatten().unwrap_or(0);
         eprintln!(
             "{}",
-            render_agent_status_line(&cfg.model, &cfg.session_name, ctx_tokens, session.plan_mode)
+            render_tell_status_line(&cfg.model, &cfg.session_name, ctx_tokens, session.plan_mode)
         );
     }
 
@@ -365,10 +365,10 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
     match outcome {
-        Ok(_) => Ok(RunOutcome::Exit(ExitCode::from(exit_code))),
+        Ok(_) => Ok(TellOutcome::Exit(ExitCode::from(exit_code))),
         Err(e) => {
             eprintln!("attini: {e}");
-            Ok(RunOutcome::Exit(ExitCode::from(EXIT_ERROR)))
+            Ok(TellOutcome::Exit(ExitCode::from(EXIT_ERROR)))
         }
     }
 }
@@ -378,7 +378,7 @@ pub fn run(cfg: AgentConfig, cont: Continuation) -> io::Result<RunOutcome> {
 /// touching stdout. `ctx=` is the current conversation size (the last
 /// recorded `prompt_tokens`) handed in by the caller; it is not the
 /// cumulative billed total.
-fn render_agent_status_line(
+fn render_tell_status_line(
     model: &str,
     session_name: &str,
     ctx_tokens: u64,
@@ -386,7 +386,7 @@ fn render_agent_status_line(
 ) -> String {
     let plan = if plan_mode { " plan=on" } else { "" };
     format!(
-        "[agent] model={} session={} ctx={}{}",
+        "[tell] model={} session={} ctx={}{}",
         model, session_name, ctx_tokens, plan,
     )
 }
@@ -395,7 +395,7 @@ enum Driven {
     Completed,
     AwaitingApproval,
     /// Invocation-scope tool-call backstop tripped
-    /// ([`AgentConfig::session_tool_call_max`]).
+    /// ([`TellConfig::session_tool_call_max`]).
     SessionToolCallExhausted,
 }
 
@@ -422,7 +422,7 @@ enum GateDecision {
 }
 
 impl ToolCallGate {
-    fn new(cfg: &AgentConfig) -> Self {
+    fn new(cfg: &TellConfig) -> Self {
         Self {
             turn_limit: cfg.turn_tool_call_limit,
             rate: cfg.tool_call_rate,
@@ -470,7 +470,7 @@ impl ToolCallGate {
 fn drive(
     session: &mut Session,
     executor: &ToolExecutor,
-    cfg: &AgentConfig,
+    cfg: &TellConfig,
     cont: Continuation,
     counters: &mut Counters,
 ) -> io::Result<Driven> {
@@ -739,7 +739,7 @@ fn drive(
     }
 
     Err(io::Error::other(format!(
-        "agent loop exceeded max_turns={}",
+        "tell loop exceeded max_turns={}",
         cfg.max_turns
     )))
 }
@@ -769,7 +769,7 @@ fn canonicalise_extra_read_roots(
 }
 
 /// Files larger than this are not inlined into the system prompt by
-/// `attini agent --reference`; they are granted as extra read roots
+/// `attini tell --reference`; they are granted as extra read roots
 /// and referenced by absolute path instead.
 pub const REFERENCE_MAX_BYTES: usize = 32 * 1024;
 
@@ -817,7 +817,7 @@ fn resolve_references(
     Ok(out)
 }
 
-fn build_initial_messages(session: &Session, cfg: &AgentConfig) -> io::Result<Vec<ChatMessage>> {
+fn build_initial_messages(session: &Session, cfg: &TellConfig) -> io::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
     let summaries = session.load_summaries()?;
     let total = summaries.len();
@@ -928,7 +928,7 @@ fn render_tool_batching_note() -> String {
 }
 
 /// Resolve and load a CLI-selected skill path. Called at the start of
-/// a fresh `attini agent --skill <PATH>` invocation. Any failure
+/// a fresh `attini tell --skill <PATH>` invocation. Any failure
 /// (missing / too large / bad UTF-8) is surfaced as a startup
 /// `io::Error` so the user sees the reason immediately, rather than
 /// the model getting a mysterious empty system message.
@@ -1649,7 +1649,7 @@ fn plan_grant(request: GrantRequest, pendings: &[Pending]) -> io::Result<Option<
 /// Best-effort persistence of the resolved grant, run after every pending
 /// call has been approved. The approval already stands, so any failure is
 /// reported as a one-line warning rather than rolling the approval back.
-fn apply_grant(cfg: &AgentConfig, argv_prefix: &[String]) {
+fn apply_grant(cfg: &TellConfig, argv_prefix: &[String]) {
     let scope = match cfg.grant_request {
         GrantRequest::Session => permissions::GrantScope::Session(&cfg.session_name),
         GrantRequest::Workspace => permissions::GrantScope::Workspace,
@@ -2679,8 +2679,8 @@ mod tests {
         turn_limit: usize,
         rate: Option<RateLimit>,
         session_max: Option<usize>,
-    ) -> AgentConfig {
-        AgentConfig {
+    ) -> TellConfig {
+        TellConfig {
             session_name: String::new(),
             model: String::new(),
             max_tokens: None,
@@ -2938,7 +2938,7 @@ mod tests {
 
     #[test]
     fn abbreviate_args_strips_newlines_and_truncates() {
-        let long = "{\"path\":\"src/agent_cli.rs\",\n\"pattern\":\"".repeat(40);
+        let long = "{\"path\":\"src/tell_cli.rs\",\n\"pattern\":\"".repeat(40);
         let out = abbreviate_args(&long);
         assert!(!out.contains('\n'));
         assert!(out.chars().count() <= 91); // 90 + ellipsis
@@ -3187,21 +3187,21 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // render_agent_status_line
+    // render_tell_status_line
     // -------------------------------------------------------------
 
     #[test]
     fn status_line_render_includes_session_and_ctx() {
-        let line = render_agent_status_line("deepseek-v4-flash", "main", 20736, false);
+        let line = render_tell_status_line("deepseek-v4-flash", "main", 20736, false);
         assert_eq!(
             line,
-            "[agent] model=deepseek-v4-flash session=main ctx=20736"
+            "[tell] model=deepseek-v4-flash session=main ctx=20736"
         );
     }
 
     #[test]
     fn status_line_uses_passed_ctx_as_current_size() {
-        let line = render_agent_status_line("m", "s", 1000, false);
+        let line = render_tell_status_line("m", "s", 1000, false);
         assert!(line.contains("ctx=1000"));
         assert!(line.contains("model=m"));
         assert!(line.contains("session=s"));
@@ -3209,7 +3209,7 @@ mod tests {
 
     #[test]
     fn status_line_appends_plan_marker_when_on() {
-        let line = render_agent_status_line("m", "s", 1000, true);
+        let line = render_tell_status_line("m", "s", 1000, true);
         assert!(line.contains("plan=on"));
         assert!(line.ends_with("plan=on"));
     }

@@ -54,7 +54,7 @@ is closed by construction rather than answered.
 - `--thinking-effort` / `-E` and the session file
   `.attini/<NAME>/thinking_effort` (`src/main.rs`, `src/session.rs`).
 - The `thinking=` token in the status line and the `thinking:` line in
-  `session show` (`src/agent_cli.rs`, `src/session_cmd.rs`).
+  `session show` (`src/tell_cli.rs`, `src/session_cmd.rs`).
 - `--show-reasoning` and the `reasoning` progress sink (`src/main.rs`,
   `src/curl.rs`). With thinking off there are no reasoning deltas to show.
 - `reasoning_content` on `ChatMessage::Assistant`, the `reasoning` field on the

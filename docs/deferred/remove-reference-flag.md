@@ -15,7 +15,7 @@ removed?
 
 ## What `--reference` actually does today
 
-Defined in `src/agent_cli.rs` (`resolve_references`, `REFERENCE_MAX_BYTES`, `ResolvedReference`),
+Defined in `src/tell_cli.rs` (`resolve_references`, `REFERENCE_MAX_BYTES`, `ResolvedReference`),
 wired from `src/main.rs` (`-r`, repeatable). Behavior:
 
 - File ≤ 32 KiB: its body is inlined verbatim into a `# Reference files` system block.
@@ -63,7 +63,7 @@ A few things argue for caution before deleting:
 ## If revived (deletion plan)
 
 1. Confirm usage is effectively nil (no external scripts/docs depend on `-r`).
-2. Delete in `src/agent_cli.rs`: `ResolvedReference`, `resolve_references`,
+2. Delete in `src/tell_cli.rs`: `ResolvedReference`, `resolve_references`,
    `REFERENCE_MAX_BYTES`, the `reference_paths` field, the `# Reference files` block in
    `build_initial_messages`, the `resolve_references_*` tests.
 3. Delete in `src/main.rs`: the `--reference`/`-r` option loop and the `reference_paths`

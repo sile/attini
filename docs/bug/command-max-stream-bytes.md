@@ -28,7 +28,7 @@ The doc comment asserts three behaviours that do not exist:
    process-group kill anywhere. `run_streamed` / `run_command_sync` never
    send signals; a hung or firehose command runs to completion.
 2. **"marks the tool result as `truncated`"** — `command_result_json`
-   (`src/agent_cli.rs`) emits only `exit_code`, `termination_reason`,
+   (`src/tell_cli.rs`) emits only `exit_code`, `termination_reason`,
    `duration_ms`, `stdout`, `stderr`. There is no `truncated` member.
 3. **The cap is actually applied** — it is not. The accumulation path
    (`child_output::pump`) does `accumulated.extend_from_slice(&chunk[..n])`

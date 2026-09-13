@@ -26,12 +26,12 @@ can distinguish "not implemented yet" from "intentionally not there".
 
 ### 2. Subagent / delegation
 
-- **What:** a `subagent_run` tool that spawned a child `attini agent` in a
+- **What:** a `subagent_run` tool that spawned a child `attini tell` in a
   separate session and blocked until it finished.
 - **Status:** removed entirely (`ec12bc5`).
 - **Why not:** it was synchronous and serial (no concurrency), its only real
   value was context isolation, and that value is already achieved with a
-  separate `attini agent -s 別名` session or `attini ask -s 別名`. The tool
+  separate `attini tell -s 別名` session or `attini ask -s 別名`. The tool
   only added complexity and an extra approval surface.
 
 ### 3. AGENTS.md / agent instruction files

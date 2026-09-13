@@ -19,13 +19,13 @@ the path is known up front and awkward when it is discovered mid-task.
   `extra_read_roots`. A path outside all roots returns
   `ToolExecutionError::OutsideWorkspace`, surfaced to the model as a plain tool error.
   There is no approval hook.
-- `extra_read_roots` is built **once** in `run()` (`src/agent_cli.rs:290`) from:
+- `extra_read_roots` is built **once** in `run()` (`src/tell_cli.rs:290`) from:
   1. persistent `extra_read_paths` in `permissions.json`,
   2. CLI `--read-path` (`extra_read_paths_cli`),
   3. oversized `--reference` files (those not inlined).
   `canonicalise_extra_read_roots` dedupes and canonicalises. The `ToolExecutor` is then
-  constructed once (`src/agent_cli.rs:291`) and never mutated for the rest of the session.
-- Read-only dispatch (`ToolKind::ReadOnly`, `src/agent_cli.rs:644`) executes **inline**:
+  constructed once (`src/tell_cli.rs:291`) and never mutated for the rest of the session.
+- Read-only dispatch (`ToolKind::ReadOnly`, `src/tell_cli.rs:644`) executes **inline**:
   `run_read_only` → `append_tool`. It has no `Awaiting(...)` variant and never pushes to
   `parked`. Contrast with `ToolKind::Patch` / `ToolKind::Command`, which can return
   `Awaiting(pending)`, which gets pushed to `parked`, saved via `save_pending`, and

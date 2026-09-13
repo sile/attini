@@ -9,13 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nojson::{DisplayJson, Json, JsonFormatter, RawJson};
 
-use crate::agent_cli;
 use crate::session::{
     CommandFamilyStats, ConversationAnalysis, ConversationSummary, LockStatus, ProgramStats,
     ReadTargetStats, RecordKindBytes, Session, SessionPaths, SummaryBytes, TokenUsageAggregate,
     ToolResultStats, analyze_conversation, inspect_lock, read_pending_summary, scan_conversation,
     session_paths, session_root,
 };
+use crate::tell_cli;
 
 pub fn run_list() -> io::Result<()> {
     let root = session_root();
@@ -232,7 +232,7 @@ pub fn run_ask(
     }
     let prior_text = render_prior_ask_context(&state.entries);
     let text =
-        agent_cli::run_ask_summary(records, model, question, prior_text.as_deref(), max_tokens)?;
+        tell_cli::run_ask_summary(records, model, question, prior_text.as_deref(), max_tokens)?;
     println!("{text}");
     state.entries.push(crate::session::AskEntry {
         ts: crate::session::now_unix_millis(),
@@ -1673,7 +1673,7 @@ pub fn run_compact(session_name: &str, model: &str, max_tokens: Option<u64>) -> 
         ));
     }
     let mut session = Session::open(session_name)?;
-    let result = agent_cli::compact_conversation(&mut session, model, max_tokens);
+    let result = tell_cli::compact_conversation(&mut session, model, max_tokens);
     // Close explicitly so LOCK unlink errors are surfaced, but drop
     // ordering already covers the happy path.
     let _ = session.close();

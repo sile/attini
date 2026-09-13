@@ -23,7 +23,7 @@ auto-approved. These need a human decision before they run.
 
 ## Dispatch order and the `suspending` flag
 
-The driver (`src/agent_cli.rs`) iterates the turn's `tool_calls` in order and
+The driver (`src/tell_cli.rs`) iterates the turn's `tool_calls` in order and
 handles each one:
 
 - **Approval-requiring call.** It cannot execute now, so it is built into a

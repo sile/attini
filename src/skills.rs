@@ -2,13 +2,13 @@
 //! (SKILL.md) from a user-supplied path with byte-cap enforcement and
 //! UTF-8 validation.
 //!
-//! Skills are selected explicitly via `attini agent --skill <PATH>`.
+//! Skills are selected explicitly via `attini tell --skill <PATH>`.
 //! There is no filesystem discovery, no "Available skills" listing, and
 //! no model-driven `skill_load` tool. Context enters only because the
 //! human asked for it, at invocation start — mirroring attini's
 //! explicit / controllable philosophy.
 //!
-//! `crate::agent_cli` resolves `--skill <PATH>` (relative paths against
+//! `crate::tell_cli` resolves `--skill <PATH>` (relative paths against
 //! the workspace root) and calls [`load_from_path`] at the start of a
 //! fresh invocation.
 

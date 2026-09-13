@@ -1,5 +1,5 @@
 //! Filesystem-backed session storage for the CLI agent
-//! (`attini agent`).
+//! (`attini tell`).
 //!
 //! Each session lives under `.attini/{SESSION_NAME}/` relative to
 //! the current working directory:
@@ -817,7 +817,7 @@ pub enum InvocationEndReason {
     /// Something errored before completion.
     Error,
     /// The invocation-scope tool-call backstop
-    /// (`AgentConfig::session_tool_call_max`) tripped and the loop
+    /// (`TellConfig::session_tool_call_max`) tripped and the loop
     /// stopped without a final assistant message.
     SessionToolCallExhausted,
 }

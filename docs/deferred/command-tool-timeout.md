@@ -13,7 +13,7 @@ prompt, `cargo build` blocked on a registry) stalls the entire session turn
 indefinitely.
 
 The only escape today is the human pressing Ctrl+C, which requires a human to be
-watching. If the agent is run unattended (a long `attini agent` batch), a single hung
+watching. If the agent is run unattended (a long `attini tell` batch), a single hung
 `command` call loses the whole turn and can leave the session wedged in a running
 state.
 
@@ -129,7 +129,7 @@ commands.
 
 ### Where the cap flows in the code
 
-- The cap flows into `run_command_sync` (agent_cli.rs), which today calls
+- The cap flows into `run_command_sync` (tell_cli.rs), which today calls
   `run_streamed(&mut cmd)`; pass `timeout` there.
 - The subagent path (`subagent.rs` → `run_streaming_stdout`) is a separate, optional
   follow-up — a hung subagent also stalls the parent.
@@ -138,7 +138,7 @@ commands.
 
 - Add a watchdog thread + process-group creation in `child_output.rs`, and thread a
   `timeout` through `run_streamed` / `run_streaming_stdout`.
-- Re-add a config knob (env var + CLI flag) and plumb it from `agent` / `tui` / `chat`
+- Re-add a config knob (env var + CLI flag) and plumb it from `tell` / `tui` / `chat`
   entry points into `run_command_sync`.
 - Wire `termination_reason: "timeout"` (new atomic flag) and update the JSON + schema /
   description.
@@ -155,7 +155,7 @@ commands.
 - Be careful with flaky signal timing in CI; use a generous grace vs. the kill assert
   and avoid over-asserting on wall-clock boundaries.
 
-**Medium complexity.** Confined mostly to `child_output.rs` + `agent_cli.rs` + a config
+**Medium complexity.** Confined mostly to `child_output.rs` + `tell_cli.rs` + a config
 knob. It does **not** touch the Sans I/O core or the approval state machine — the
 timeout is a runtime property of shell-side execution, not a core state change.
 

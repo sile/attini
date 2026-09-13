@@ -78,10 +78,10 @@ export DEEPSEEK_API_KEY=sk-...
 # export DEEPSEEK_API_KEY=local
 ```
 
-### Agent CLI (`attini agent`)
+### Tell CLI (`attini tell`)
 
 ```sh
-attini agent [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
+attini tell [--reference PATH ...] [--skill PATH] [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
@@ -99,7 +99,7 @@ EOF (Ctrl+D); Ctrl+C cancels. It caps input at 1 MiB and warns when stdin is
 empty. It is meant for *data*, not background context — use `--reference PATH`
 for that.
 
-Extra positional tokens are now rejected as a usage error (`attini agent hello
+Extra positional tokens are now rejected as a usage error (`attini tell hello
 world` fails instead of silently dropping `world`), so multi-word prompts must
 be quoted or passed via `--stdin`.
 
@@ -139,8 +139,8 @@ attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
 
 Approving a session's pending tool call(s) is a **dedicated subcommand**, not a
-`--approve` flag on `agent`. The reason is typo safety: `agent` keeps an optional
-positional `<PROMPT>`, so a mistyped flag like `attini agent --approv` is
+`--approve` flag on `tell`. The reason is typo safety: `tell` keeps an optional
+positional `<PROMPT>`, so a mistyped flag like `attini tell --approv` is
 silently absorbed as the prompt and starts an unintended model turn. `approve`
 has no positional, so `attini approve --approv` fails cleanly as an unknown
 flag. (`attini agent --approve` was removed, not deprecated.)
@@ -162,11 +162,11 @@ prefix, or several commands are pending — is rejected up front. The argv-prefi
 is truncated the same way as the printed suggestion (first two elements, e.g.
 `cargo test`), so the two never disagree.
 
-When an `attini agent` invocation starts, a one-line diagnostic is printed to
+When an `attini tell` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 
 ```
-[agent] model=deepseek-flash session=main ctx=20736
+[tell] model=deepseek-flash session=main ctx=20736
 ```
 
 `model=`/`session=` show which session/model is about to advance, `ctx=` is
@@ -216,7 +216,7 @@ call, and (when a `QUESTION` is supplied) a direct answer to that question. Reco
 since the last compaction summary are used by default; `--all` uses the whole
 conversation and `--limit N` keeps only the most recent N records.
 `--max-tokens N` caps the summariser response size. It is purely
-observational — adjust the course by running `attini agent -s NAME "<new
+observational — adjust the course by running `attini tell -s NAME "<new
 instruction>"` (or a fresh session) and letting the model revise its approach
 naturally.
 
@@ -242,4 +242,4 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_MODEL_NAME` | Default model name when `--model` is omitted. Precedence: CLI flag, then this env var, then the built-in default. |
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
 | `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). |
-| `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line end-of-invocation status that `attini agent` prints to stderr. Unset (or any other value) keeps it on. |
+| `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line status that `attini tell` prints to stderr at invocation start. Unset (or any other value) keeps it on. |

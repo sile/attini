@@ -16,7 +16,7 @@ invocations into dedicated tools is worth it.
 | Category | Bytes | Records | Notes |
 |---|---|---|---|
 | assistant.reasoning | 4.29 MB | 1469 | **The model's chain-of-thought. Re-sent to the model on every restart.** |
-| tool: read | 2.93 MB | 744 | Full file contents. `src/agent_cli.rs` alone is re-read 272 times (1.04 MB). |
+| tool: read | 2.93 MB | 744 | Full file contents. `src/tell_cli.rs` alone is re-read 272 times (1.04 MB). |
 | tool: command | 1.97 MB | 579 | `cargo test` is 1.40 MB across 69 calls. |
 | tool: search | 0.70 MB | 811 | Search results. |
 | token_usage | 0.34 MB | 1873 | |
@@ -47,7 +47,7 @@ This is the single largest source of bloat, and removing it is a pure win:
 ## Root cause 2: repeated full-file `read`s
 
 `read` accounts for 2.93 MB. The model re-reads the same sources repeatedly
-with overlapping ranges; `src/agent_cli.rs` was read 272 times (1.04 MB,
+with overlapping ranges; `src/tell_cli.rs` was read 272 times (1.04 MB,
 max a single read of 119 KB). There is no file-content caching across turns in
 the tool layer; every `read` returns the full requested file/range.
 
@@ -179,7 +179,7 @@ A/B verification:
 
 * After C, confirm the log still has `reasoning` (for display) but the outgoing
   API request body's assistant messages no longer carry `reasoning_content`.
-* Measure the new `ask`/`agent` request size against the same history to see
+* Measure the new `ask`/`tell` request size against the same history to see
   the reduction.
 * After adding `.cargo/config.toml` with `[term] quiet = true`, observe a fresh
   `cargo test` tool result to confirm the per-test boilerplate is gone and only

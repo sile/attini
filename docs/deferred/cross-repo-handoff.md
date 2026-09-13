@@ -4,7 +4,7 @@
 
 ## Problem
 
-`attini agent` runs with a single workspace per session. Work that spans multiple git repos must be carried out by separate sessions, and the context produced in repo A is not available to repo B automatically. The gap is *context handoff across repos*.
+`attini tell` runs with a single workspace per session. Work that spans multiple git repos must be carried out by separate sessions, and the context produced in repo A is not available to repo B automatically. The gap is *context handoff across repos*.
 
 ## What it solves
 
@@ -16,7 +16,7 @@ These are already possible with current features:
 
 1. **Manual copy.** The human carries the summary from repo A's session and pastes it into repo B's prompt.
 
-2. **Scratchpad relay.** repo A's model writes `scratchpad/relay.md` using the existing `patch` tool. The human starts repo B with `attini agent --read-path=<repoA>/<session>/scratchpad/`. repo B reads it with the `read` tool. **No new code.**
+2. **Scratchpad relay.** repo A's model writes `scratchpad/relay.md` using the existing `patch` tool. The human starts repo B with `attini tell --read-path=<repoA>/<session>/scratchpad/`. repo B reads it with the `read` tool. **No new code.**
 
 ## Proposed design (if revived)
 

@@ -1,8 +1,8 @@
 use std::io::{IsTerminal, Read};
 use std::process::ExitCode;
 
-use attini::agent_cli::{self, AgentConfig, Continuation, DEFAULT_MAX_TURNS, RateLimit};
 use attini::session_cmd;
+use attini::tell_cli::{self, Continuation, DEFAULT_MAX_TURNS, RateLimit, TellConfig};
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_RUNTIME: u8 = 1;
@@ -28,7 +28,7 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 
 // String forms of the tool-call cap defaults, exposed here because
 // noargs' `default()` needs a `&'static str`. Kept in sync with the
-// numeric constants in `attini::agent_cli` by
+// numeric constants in `attini::tell_cli` by
 // `default_string_constants_stay_in_sync`.
 const DEFAULT_TURN_TOOL_CALL_LIMIT_STR: &str = "20";
 const DEFAULT_TOOL_CALL_RATE_STR: &str = "60/60";
@@ -162,7 +162,7 @@ fn run() -> Result<RunOutcome, RunError> {
     }
     noargs::HELP_FLAG.take_help(&mut args);
 
-    match try_run_agent(&mut args)? {
+    match try_run_tell(&mut args)? {
         CommandOutcome::NotHandled => {}
         CommandOutcome::Done => return Ok(RunOutcome::Ok),
         CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
@@ -213,9 +213,9 @@ fn run() -> Result<RunOutcome, RunError> {
     Ok(RunOutcome::Ok)
 }
 
-fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("agent")
-        .doc("Run one turn of the sync CLI agent against a persistent session")
+fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("tell")
+        .doc("Tell the agent what to do; it runs one turn against a persistent session")
         .take(args)
         .is_present()
     {
@@ -376,7 +376,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         return Ok(CommandOutcome::Help);
     }
     // Validate that no unexpected arguments remain before running the agent.
-    // Without this, `attini agent hello world` silently dropped `world`.
+    // Without this, `attini tell hello world` silently dropped `world`.
     check_unconsumed_args(args)?;
 
     let tool_call_rate = parse_tool_call_rate(&tool_call_rate_raw)?;
@@ -409,7 +409,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
 
     let workspace_root = std::env::current_dir()
         .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
-    let cfg = AgentConfig {
+    let cfg = TellConfig {
         session_name,
         model,
         max_tokens,
@@ -426,10 +426,10 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
         authorization,
         plan_override,
         temperature,
-        grant_request: agent_cli::GrantRequest::None,
+        grant_request: tell_cli::GrantRequest::None,
     };
-    match agent_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
-        agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
+    match tell_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
+        tell_cli::TellOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
     }
 }
 
@@ -440,7 +440,7 @@ fn try_run_agent(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError>
 /// Approve a session's pending tool call(s).
 ///
 /// This is a dedicated subcommand rather than a `--approve` flag on
-/// `agent`: `agent` keeps an optional positional `<PROMPT>`, so a
+/// `tell`: `tell` keeps an optional positional `<PROMPT>`, so a
 /// mistyped flag (`--approv`) is silently absorbed as the prompt and
 /// starts an unintended model turn. A subcommand has no positional, so
 /// an unknown flag fails cleanly. See `docs/deferred/approve-command.md`.
@@ -469,7 +469,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .then(|o| o.value().parse())?;
     // --grant <SCOPE>: fold a persistent auto-approve rule into the
     // approval, replacing the separate `attini session grant` invocation.
-    let grant: agent_cli::GrantRequest = match noargs::opt("grant")
+    let grant: tell_cli::GrantRequest = match noargs::opt("grant")
         .ty("SCOPE")
         .doc(
             "Also persist an auto-approve rule for the approved command: \
@@ -481,16 +481,16 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .present_and_then(|o| o.value().parse::<String>())?
     {
         Some(s) => match s.as_str() {
-            "oneshot" => agent_cli::GrantRequest::Oneshot,
-            "session" => agent_cli::GrantRequest::Session,
-            "workspace" => agent_cli::GrantRequest::Workspace,
+            "oneshot" => tell_cli::GrantRequest::Oneshot,
+            "session" => tell_cli::GrantRequest::Session,
+            "workspace" => tell_cli::GrantRequest::Workspace,
             other => {
                 return Err(RunError::Runtime(format!(
                     "--grant must be 'oneshot', 'session', or 'workspace', got '{other}'"
                 )));
             }
         },
-        None => agent_cli::GrantRequest::None,
+        None => tell_cli::GrantRequest::None,
     };
 
     if args.metadata().help_mode {
@@ -502,7 +502,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
 
     let workspace_root = std::env::current_dir()
         .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
-    let cfg = AgentConfig {
+    let cfg = TellConfig {
         session_name,
         model,
         max_tokens: None,
@@ -523,10 +523,8 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         temperature: None,
         grant_request: grant,
     };
-    match agent_cli::run(cfg, Continuation::Approve)
-        .map_err(|e| RunError::Runtime(e.to_string()))?
-    {
-        agent_cli::RunOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
+    match tell_cli::run(cfg, Continuation::Approve).map_err(|e| RunError::Runtime(e.to_string()))? {
+        tell_cli::TellOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
     }
 }
 
@@ -644,7 +642,7 @@ fn parse_session_tool_call_max(raw: &str) -> Result<Option<usize>, RunError> {
 
 fn try_run_session(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
     if !noargs::cmd("session")
-        .doc("Inspect and manage attini agent sessions under .attini/")
+        .doc("Inspect and manage attini tell sessions under .attini/")
         .take(args)
         .is_present()
     {
@@ -1068,7 +1066,7 @@ fn try_run_session_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use attini::agent_cli::{
+    use attini::tell_cli::{
         DEFAULT_SESSION_TOOL_CALL_MAX, DEFAULT_TOOL_CALL_RATE_CALLS,
         DEFAULT_TOOL_CALL_RATE_WINDOW_SECS, DEFAULT_TURN_TOOL_CALL_LIMIT,
     };
@@ -1077,7 +1075,7 @@ mod tests {
     fn default_string_constants_stay_in_sync() {
         // The `.default()` argument of noargs::opt requires a
         // `&'static str`, so the CLI mirrors the numeric defaults in
-        // `agent_cli` with these string constants. This test guards
+        // `tell_cli` with these string constants. This test guards
         // against them silently drifting apart.
         assert_eq!(
             DEFAULT_TURN_TOOL_CALL_LIMIT_STR,
@@ -1160,14 +1158,14 @@ mod tests {
 
     #[test]
     fn unconsumed_args_catch_extra_positions() {
-        // `attini agent hello world` used to silently drop `world`; the
+        // `attini tell hello world` used to silently drop `world`; the
         // leftover check must now reject it as a usage error.
         let mut args = noargs::RawArgs::new(
-            ["attini", "agent", "hello", "world"]
+            ["attini", "tell", "hello", "world"]
                 .iter()
                 .map(|s| s.to_string()),
         );
-        noargs::cmd("agent").take(&mut args);
+        noargs::cmd("tell").take(&mut args);
         noargs::arg("[PROMPT]").take(&mut args);
         assert!(check_unconsumed_args(&args).is_err());
     }
@@ -1175,8 +1173,8 @@ mod tests {
     #[test]
     fn unconsumed_args_ok_when_all_consumed() {
         let mut args =
-            noargs::RawArgs::new(["attini", "agent", "hello"].iter().map(|s| s.to_string()));
-        noargs::cmd("agent").take(&mut args);
+            noargs::RawArgs::new(["attini", "tell", "hello"].iter().map(|s| s.to_string()));
+        noargs::cmd("tell").take(&mut args);
         noargs::arg("[PROMPT]").take(&mut args);
         assert!(check_unconsumed_args(&args).is_ok());
     }

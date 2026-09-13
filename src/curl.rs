@@ -1,4 +1,4 @@
-//! Sync HTTP transport for `attini agent` via a `curl` subprocess.
+//! Sync HTTP transport for `attini tell` via a `curl` subprocess.
 //!
 //! Endpoint and credentials:
 //! - `DEEPSEEK_API_KEY` (required)

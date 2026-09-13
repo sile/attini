@@ -5,7 +5,7 @@
 //! `argv`). Mode-aware evaluation returns [`Judgment::AutoApprove`],
 //! [`Judgment::AutoDeny`], or [`Judgment::Pending`]. No I/O — file
 //! loading and session record writing live in the impl-layer
-//! `crate::permissions` and `crate::agent_cli`.
+//! `crate::permissions` and `crate::tell_cli`.
 //!
 //! Evaluation order: deny rules (session then workspace) always win,
 //! then the first matching approve rule, then the pending fallback

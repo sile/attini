@@ -7,7 +7,7 @@ for the implemented measurement half.
 
 ## Deferred half: `-S analyze-conversation` skill
 
-A `SKILL.md` (loaded via the existing explicit `attini agent -S PATH`)
+A `SKILL.md` (loaded via the existing explicit `attini tell -S PATH`)
 instructing the model how to:
 
 - Run `attini session analyze <NAME>` (and pass `--json` if machine parsing
@@ -32,5 +32,5 @@ ergonomic, not a correctness gap.
 ## How to revive
 
 Add the `analyze-conversation` skill (a `SKILL.md` loaded via the existing
-explicit `attini agent -S PATH`). It only needs to chain `session analyze`
+explicit `attini tell -S PATH`). It only needs to chain `session analyze`
 output with model judgment.

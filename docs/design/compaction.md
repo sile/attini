@@ -19,7 +19,7 @@ Two independent pieces work together:
 
 ## Trigger: when compaction runs
 
-`try_auto_compact` (`src/agent_cli.rs`) judges the need to compact from two
+`try_auto_compact` (`src/tell_cli.rs`) judges the need to compact from two
 independent signals via the pure helper
 `should_auto_compact(latest, total_chars)`:
 
@@ -52,7 +52,7 @@ only when the token signal is not already met.
 
 ## Cutoff: what is folded into the summary
 
-`compaction_cutoff` (`src/agent_cli.rs`) chooses the oldest record to keep.
+`compaction_cutoff` (`src/tell_cli.rs`) chooses the oldest record to keep.
 It walks from a safe boundary near the tail toward the start, folding more
 into the summary while the **whole retained tail** exceeds the budget:
 

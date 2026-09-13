@@ -12,7 +12,7 @@ But that motivation is a symptom. The deeper need is **"I want to be able to try
 
 1. **"Don't dirty the log"** — if you can roll back to before a turn, dirtying the log is no longer a reason to avoid writing. The write can be undone.
 
-2. **"Ask without stopping a running session"** — attini sessions are short-lived and non-autonomous; stopping and restarting is trivial (Ctrl+C / a fresh `attini agent`). The concurrency benefit is negligible. This motivation does not justify a special read-only path on its own.
+2. **"Ask without stopping a running session"** — attini sessions are short-lived and non-autonomous; stopping and restarting is trivial (Ctrl+C / a fresh `attini tell`). The concurrency benefit is negligible. This motivation does not justify a special read-only path on its own.
 
 So the real gap is not "how do I ask without writing" but "how do I safely try things." `ask` is fine as a cheap read-only summariser, but it is not the fundamental fix.
 
@@ -30,7 +30,7 @@ Every record in `conversation.jsonl` already has a `ts` (millis). Options:
 
 ### Surface the checkpoint at agent startup
 
-When `attini agent` opens a session, print (or record in `session show`) the checkpoint at the tail — e.g. `checkpoint: seq=12341` or the `ts` of the last record. The human can then say "reset to seq=12341" if the following turns go wrong. This is the "output an identifier at startup, roll back to it" idea in its direct form.
+When `attini tell` opens a session, print (or record in `session show`) the checkpoint at the tail — e.g. `checkpoint: seq=12341` or the `ts` of the last record. The human can then say "reset to seq=12341" if the following turns go wrong. This is the "output an identifier at startup, roll back to it" idea in its direct form.
 
 ### Rollback (reset)
 
