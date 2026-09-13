@@ -70,6 +70,19 @@ can distinguish "not implemented yet" from "intentionally not there".
   honest: there is no longer a special flag that silently lands text in the
   system prompt.
 
+### 6. Plan mode (`--plan=on|off`)
+
+- **What:** a persistent per-session flag that made every patch — including
+  edits on git-tracked files that would otherwise be auto-applied — require
+  explicit human approval.
+- **Status:** removed.
+- **Why not:** attini already gates the consequential writes; a separate mode
+  added a second, redundant notion of "how much approval" a session needs and
+  a persistent state file to keep in sync. The human is the final gate by
+  default, and `attini ask` is the read-only way to inspect or query a
+  session without touching it. There is no whitelisted "semi-approval" state
+  to toggle into.
+
 ## The common thread
 
 All are the same shape: **implicit, convention-based context or delegation
@@ -86,7 +99,7 @@ The README's design philosophy bullets describe *principles* (context is
 requested, state changes surfaced, no silent side effects). This note is a
 *concrete list of removals and non-goals*. It answers a different question:
 "if you look for feature X, is it gone because it was bad, or just not built
-yet?" The answer for these four is "bad, deliberately".
+yet?" The answer for these six is "bad, deliberately".
 
 ## How to revive
 

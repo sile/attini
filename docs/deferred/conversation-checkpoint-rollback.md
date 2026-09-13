@@ -39,7 +39,8 @@ Truncate `conversation.jsonl` to before the checkpoint and clean up suffix-depen
 - `pending.json` dropped if its `ts` > checkpoint.
 - `ask.json` entries with `ts` > checkpoint dropped (or the whole file reset).
 - Derived counters (metrics) recomputed or reset.
-- `plan_mode` is a session property, not conversation state — unaffected.
+- Session-level settings (e.g. `ask.json` state) are separate from conversation
+  state and are not part of a checkpoint/rollback.
 - **Compaction edge case:** if the checkpoint is before the latest `Summary.cutoff_ts`, that Summary must be removed *and* its underlying real records restored — but they are already replaced. Either (i) refuse rollback into a summarised range, or (ii) archive the pre-summary records long-term.
 - **Lock safety:** refuse to truncate while another process holds the `LOCK`.
 
@@ -74,7 +75,7 @@ The safer default, more like `git checkout` than `git reset`: create a **new ses
 
 **Deferred.** The idea is compelling and consistent with attini's philosophy, but it is non-trivial. `ask` already covers the narrow read-only case, and a manual snapshot/restore is a workable fallback. Revisit if:
 
-- a future long-running / `--plan` mode makes "I generated a lot of work I dislike" a frequent pain, or
+- a future long-running mode makes "I generated a lot of work I dislike" a frequent pain, or
 - the manual snapshot/restore workflow is demonstrated to be too error-prone, or
 - `ask` / read-only summarisation keeps being used as a workaround for the "don't dirty the log" fear (a signal that people want to safely experiment).
 

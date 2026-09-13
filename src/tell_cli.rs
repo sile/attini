@@ -214,11 +214,6 @@ pub struct TellConfig {
     /// [`Authorization::ApprovedPlan`]; every other entry point uses
     /// the default `PerTool`.
     pub authorization: Authorization,
-    /// When `Some`, the requested plan-mode state to set (and persist)
-    /// for this session at the start of the invocation: `Some(true)`
-    /// for `--plan=on`, `Some(false)` for `--plan=off`. `None` leaves
-    /// the session's current persisted plan-mode state unchanged.
-    pub plan_override: Option<bool>,
     /// Sampling temperature for model calls. `None` uses the request
     /// default (`Some(0.0)`, deterministic code editing); `Some(t)`
     /// overrides it.
@@ -276,13 +271,6 @@ pub enum TellOutcome {
 
 pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
-    // Apply a requested plan-mode change now so the persisted state is
-    // updated before the model runs, and so the status line reflects
-    // the post-change value. When `--plan` is omitted the session's
-    // current persisted state is left untouched.
-    if let Some(on) = cfg.plan_override {
-        session.set_plan_mode(on)?;
-    }
     // Combine persistent extra_read_paths (from permissions.json) with
     // CLI --read-path overrides for this invocation, canonicalise
     // each, and hand the resulting Vec to the ToolExecutor. Any path
@@ -316,7 +304,7 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
         let ctx_tokens = session.latest_prompt_tokens().ok().flatten().unwrap_or(0);
         eprintln!(
             "{}",
-            render_tell_status_line(&cfg.model, &cfg.session_name, ctx_tokens, session.plan_mode)
+            render_tell_status_line(&cfg.model, &cfg.session_name, ctx_tokens)
         );
     }
 
@@ -359,16 +347,10 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
 /// touching stdout. `ctx=` is the current conversation size (the last
 /// recorded `prompt_tokens`) handed in by the caller; it is not the
 /// cumulative billed total.
-fn render_tell_status_line(
-    model: &str,
-    session_name: &str,
-    ctx_tokens: u64,
-    plan_mode: bool,
-) -> String {
-    let plan = if plan_mode { " plan=on" } else { "" };
+fn render_tell_status_line(model: &str, session_name: &str, ctx_tokens: u64) -> String {
     format!(
-        "[tell] model={} session={} ctx={}{}",
-        model, session_name, ctx_tokens, plan,
+        "[tell] model={} session={} ctx={}",
+        model, session_name, ctx_tokens,
     )
 }
 
@@ -772,29 +754,10 @@ fn build_initial_messages(session: &Session, cfg: &TellConfig) -> io::Result<Vec
         &cfg.session_name,
     )));
     messages.push(ChatMessage::System(render_tool_batching_note()));
-    if session.plan_mode {
-        messages.push(ChatMessage::System(render_plan_mode_note()));
-    }
     for record in session.load_records_since_last_summary()? {
         messages.push(record.message);
     }
     Ok(messages)
-}
-
-/// Tell the model that plan mode is active: every patch — including
-/// edits on git-tracked files, which would normally be auto-applied —
-/// must be explicitly approved by the human before it touches the
-/// workspace. The model should not batch edits assuming they will be
-/// auto-applied; it should still propose them normally and expect an
-/// approval prompt.
-fn render_plan_mode_note() -> String {
-    "# Plan mode\n\n\
-     Plan mode is active. Every patch — including edits on git-tracked \
-     files, which would otherwise be auto-applied — requires explicit human \
-     approval before it touches the workspace. Propose patches as normal, \
-     but do not assume any edit is auto-approved. If a patch is rejected, \
-     revise it per the human's feedback.\n"
-        .to_string()
 }
 
 /// Tell the model it may keep working notes under the session's
@@ -1816,7 +1779,7 @@ fn dispatch_patch_unapproved(
             return Ok(PatchDispatch::Continue);
         }
     };
-    if preview.auto_approve && !session.plan_mode {
+    if preview.auto_approve {
         if !dry_run {
             match executor.apply_patch(&inv, &preview_content) {
                 Ok(paths) => {
@@ -1837,18 +1800,14 @@ fn dispatch_patch_unapproved(
         }
         Ok(PatchDispatch::Continue)
     } else {
-        let mut preview_text = render_patch_preview_text(&preview, &inv);
-        let plan_marker = if session.plan_mode { " (plan)" } else { "" };
-        if session.plan_mode {
-            preview_text = format!("(plan) {preview_text}");
-        }
-        eprintln!("[patch] approval required{plan_marker}");
+        let preview_text = render_patch_preview_text(&preview, &inv);
+        eprintln!("[patch] approval required");
         eprintln!("{preview_text}");
         // Re-state the approval request after the (possibly long) diff so the
         // decision prompt lands at the bottom of the terminal, next to the
         // summary the human needs, instead of being pushed off-screen by the
         // diff body.
-        eprintln!("{}", render_patch_approval_footer(&preview, plan_marker));
+        eprintln!("{}", render_patch_approval_footer(&preview));
         Ok(PatchDispatch::Awaiting(build_pending(
             tc,
             PendingToolKind::Patch,
@@ -1859,9 +1818,9 @@ fn dispatch_patch_unapproved(
 
 /// One-line approval restatement shown after the diff body, so the human can
 /// decide without scrolling back up past the diff.
-fn render_patch_approval_footer(p: &PatchPreview, plan_marker: &str) -> String {
+fn render_patch_approval_footer(p: &PatchPreview) -> String {
     format!(
-        "[patch] approval required{plan_marker}: {} edit(s) across {} file(s), +{} / -{} lines",
+        "[patch] approval required: {} edit(s) across {} file(s), +{} / -{} lines",
         p.edit_count,
         p.target_paths.len(),
         p.added_lines,
@@ -2591,7 +2550,6 @@ mod tests {
             tool_call_rate: rate,
             session_tool_call_max: session_max,
             authorization: Authorization::PerTool,
-            plan_override: None,
             temperature: None,
             grant_request: GrantRequest::None,
         }
@@ -3027,7 +2985,7 @@ mod tests {
 
     #[test]
     fn status_line_render_includes_session_and_ctx() {
-        let line = render_tell_status_line("deepseek-v4-flash", "main", 20736, false);
+        let line = render_tell_status_line("deepseek-v4-flash", "main", 20736);
         assert_eq!(
             line,
             "[tell] model=deepseek-v4-flash session=main ctx=20736"
@@ -3036,30 +2994,10 @@ mod tests {
 
     #[test]
     fn status_line_uses_passed_ctx_as_current_size() {
-        let line = render_tell_status_line("m", "s", 1000, false);
+        let line = render_tell_status_line("m", "s", 1000);
         assert!(line.contains("ctx=1000"));
         assert!(line.contains("model=m"));
         assert!(line.contains("session=s"));
-    }
-
-    #[test]
-    fn status_line_appends_plan_marker_when_on() {
-        let line = render_tell_status_line("m", "s", 1000, true);
-        assert!(line.contains("plan=on"));
-        assert!(line.ends_with("plan=on"));
-    }
-
-    // -------------------------------------------------------------
-    // render_plan_mode_note
-    // -------------------------------------------------------------
-
-    #[test]
-    fn plan_mode_note_tells_model_every_patch_needs_approval() {
-        let note = render_plan_mode_note();
-        assert!(note.contains("Plan mode is active"));
-        assert!(note.contains("git-tracked"));
-        assert!(note.contains("explicit human approval"));
-        assert!(note.contains("do not assume any edit is auto-approved"));
     }
 
     // -------------------------------------------------------------
@@ -3230,15 +3168,10 @@ mod tests {
             edit_count: 2,
             auto_approve: false,
         };
-        let plain = render_patch_approval_footer(&preview, "");
+        let plain = render_patch_approval_footer(&preview);
         assert_eq!(
             plain,
             "[patch] approval required: 2 edit(s) across 2 file(s), +3 / -1 lines"
-        );
-        let plan = render_patch_approval_footer(&preview, " (plan)");
-        assert!(
-            plan.starts_with("[patch] approval required (plan): "),
-            "{plan}"
         );
     }
 

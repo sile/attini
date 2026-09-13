@@ -82,8 +82,8 @@ dispatch order.
 Rather than reorder dispatch (which risks breaking the assistant→tool
 pairing), attini nudges the model with a system-prompt note,
 `render_tool_batching_note`, injected once in `build_initial_messages`
-alongside the scratchpad and plan-mode notes. The header is
-`# Tool call batching` and the gist is:
+alongside the scratchpad note. The header is `# Tool call batching` and the
+gist is:
 
 - If a turn contains an approval-requiring call (`command`, or a non-auto
   `patch`), put it **last or alone** in the turn.

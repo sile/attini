@@ -12,8 +12,7 @@ argv, so today they cannot be granted this way:
 
 - a patch is auto-approved only when it is an `Update` to a **git-tracked** path
   (reversible, so no prompt), and
-- everything else (new files, non-tracked paths) always needs approval, or is
-gated wholesale by `--plan=on`.
+- everything else (new files, non-tracked paths) always needs approval.
 
 There is no middle ground of the form "let this model keep patching files under
 `src/` without asking." A `--grant` analogue for patches would add one.
@@ -37,9 +36,6 @@ There is no middle ground of the form "let this model keep patching files under
 
 - Decide the grant shape: a path prefix, an exact path, or a glob (avoid globs
   if a pure prefix suffices).
-- Reconcile with `--plan=on` (which gates *all* patches) so the two do not
-  contradict — likely `--plan=on` always wins, a path grant is the finer-grained
-  opt-in beneath it.
 - Reuse the same approve-then-grant independence rules from
   `docs/deferred/approve-command.md`: the grant is best-effort and its failure is
   a warning, not a rollback.

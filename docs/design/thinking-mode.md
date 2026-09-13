@@ -18,7 +18,7 @@ by itself, across several internal turns. That is strong when **the human does
 not intervene**.
 
 attini's design is the opposite: the human is the final gate (patch preview +
-approval, plan mode, workspace boundary). Because the human approves, corrects,
+approval, workspace boundary). Because the human approves, corrects,
 or redirects each meaningful step, a long private exploration is mostly
 **wasted** — the moment the human says "no, do it this way" the model discards
 the CoT it just spent time and tokens producing. Worse, thinking tends to

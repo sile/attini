@@ -82,7 +82,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Tell CLI (`attini tell`)
 
 ```sh
-attini tell [--read-path PATH ...] [--max-tokens N] [--temperature N] [--plan=on|off] [--stdin] "<PROMPT>"
+attini tell [--read-path PATH ...] [--max-tokens N] [--temperature N] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace]
 ```
@@ -103,14 +103,6 @@ run. When omitted the model's own default is used.
 `--temperature N` / `-t N` sets the sampling temperature for model calls.
 Default is 0 (deterministic), which DeepSeek recommends for coding/math. It
 can also be set via `ATTINI_TEMPERATURE`.
-
-`--plan=on` / `--plan=off` turns plan mode on or off **persistently** for the
-session. In plan mode every patch — including edits on git-tracked files, which
-would otherwise be auto-applied — requires explicit human approval before it
-touches the workspace. Commands are unchanged (deny rules still hard-reject),
-and `attini approve` still works. The flag persists in
-`.attini/<SESSION>/plan_mode` and is reflected in `attini session show`; omitting
-it leaves the session's current plan-mode state unchanged.
 
 DeepSeek thinking mode is always **disabled**: attini sends
 `{"thinking":{"type":"disabled"}}` on every request and offers no way to
@@ -156,11 +148,10 @@ stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 [tell] model=deepseek-flash session=main ctx=20736
 ```
 
-`model=`/`session=` show which session/model is about to advance, `ctx=` is
+`model=`/`session=` show which session/model is about to advance, and `ctx=` is
 the **current** conversation size (the last recorded `prompt_tokens`, not the
-cumulative billed total), and `plan=on` appears when plan mode is active — so
-you can see how close the session is to compaction before it runs.
-`ATTINI_STATUS_LINE=0` disables the line.
+cumulative billed total) — so you can see how close the session is to
+compaction before it runs. `ATTINI_STATUS_LINE=0` disables the line.
 
 ### Model selection
 

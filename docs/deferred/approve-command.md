@@ -118,9 +118,9 @@ Settled semantics:
   (before approving) rather than silently degrading to a plain approve. Silent no-ops
   are against attini's philosophy.
 - **Applies to commands only.** Patches have no argv-prefix; a patch approval cannot be
-  auto-granted this way (it is git-tracked-only auto-approve, or `--plan=on` to gate all
-  patches). Introducing a patch scope is a separate, future idea — see the memo
-  `docs/deferred/patch-grant-scope.md`.
+  auto-granted this way (patches are git-tracked-`Update`-only auto-approve, and
+  everything else always needs approval). Introducing a patch scope is a separate,
+  future idea — see the memo `docs/deferred/patch-grant-scope.md`.
 - **Which prefix gets granted.** Reuse the same truncation `emit_suggested_rule` uses
   (first two argv elements, e.g. `cargo test`) so `--grant session` does not bake in
   every flag. The human should see the exact prefix that will be written, exactly as the
