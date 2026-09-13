@@ -16,7 +16,7 @@ These are already possible with current features:
 
 1. **Manual copy.** The human carries the summary from repo A's session and pastes it into repo B's prompt.
 
-2. **Scratchpad relay.** repo A's model writes `scratchpad/relay.md` using the existing `patch` tool. The human pre-grants read access in repo B with `attini session grant-read <repoA>/<session>/scratchpad/`, then repo B reads it with the `read` tool. **No new code.**
+2. **Scratchpad relay.** repo A's model writes `scratchpad/relay.md` using the existing `patch` tool. The human pre-grants read access in repo B with `attini grant-read <repoA>/<session>/scratchpad/`, then repo B reads it with the `read` tool. **No new code.**
 
 ## Proposed design (if revived)
 

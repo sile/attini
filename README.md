@@ -36,9 +36,9 @@ than letting the agent infer or guess:
   context: nothing is added to the system prompt unless you put it there — the
   prompt itself, or `--stdin` for pasted data. No tool lets the model pull in
   extra context at runtime.
-- **State changes are surfaced.** `patch` shows a preview (SHA-256 hashes + a
-  diff summary) and waits for approval on any non-tracked write; the model's
-  in-flight intent is observable via `attini ask` / `session show`; and a
+- **State changes are surfaced.** `patch` shows a preview (file list + a
+  diff) and waits for approval on any non-tracked write; the model's
+  in-flight intent is observable via `attini ask` / `attini show`; and a
   one-line status is printed to stderr so you always know which session/model
   is advancing. Diagnostic output never pollutes stdout.
 - **No silent side effects.** The workspace boundary is enforced on every read
@@ -130,7 +130,7 @@ has no positional, so `attini approve --approv` fails cleanly as an unknown
 flag. (`attini agent --approve` was removed, not deprecated.)
 
 `--grant SCOPE` folds a persistent auto-approve rule into the approval, so you
-do not have to copy-paste the `attini session grant ...` suggestion afterward:
+do not have to copy-paste the `attini grant ...` suggestion afterward:
 
 | `SCOPE` | Effect |
 |---|---|
@@ -183,6 +183,40 @@ the **current** conversation size (the last recorded `prompt_tokens`, not the
 cumulative billed total) — so you can see how close the session is to
 compaction before it runs. `ATTINI_STATUS_LINE=0` disables the line.
 
+### Inspecting sessions
+
+attini keeps no abstraction over session data. A session is a directory under
+`.attini/<NAME>/` holding `conversation.jsonl` (append-only JSONL), `pending.json`
+(when a turn stopped for approval), `ask.json`, a `scratchpad/`, and a `LOCK`.
+You can list, read, or delete sessions with ordinary shell tools:
+
+```sh
+ls .attini/                       # list sessions
+cat .attini/main/conversation.jsonl   # the raw record log
+tail -f .attini/main/conversation.jsonl
+rm -rf .attini/main/              # delete a session (also clears its scratchpad)
+```
+
+A few read-only helpers remain, for cases where parsing the log by hand is
+tedious. None of them acquire the session `LOCK` or write to the conversation log:
+
+```sh
+attini show    -s NAME            # invocation/approval/message counts + pending calls
+attini metrics [-s NAME | --all] [--json]
+attini analyze -s NAME [--json]   # record-kind histogram, bytes by tool/command family
+attini ask     -s NAME [QUESTION] # ask the model to summarise the current state
+attini unlock  -s NAME [--force]  # remove a stale LOCK
+attini prune   -s NAME [-y]       # drop records before the last summary
+```
+
+Permissions live in plain `permissions.json` files and are edited by hand (or
+appended by `attini grant` / `attini grant-read`):
+
+```sh
+attini grant      [-s NAME] [--workspace] <ARG0> [ARG]...   # auto-approve argv-prefix
+attini grant-read [-s NAME] [--workspace] <PATH>            # workspace-external read root
+```
+
 ### Model selection
 
 - Default model: `deepseek-flash` (override with `--model`)
@@ -213,8 +247,8 @@ not tracked by git and never appear in `git diff`. Because they are non-tracked,
 `patch` writes there are still shown for approval (they are not auto-applied).
 
 **Lifecycle:** scratchpad files are not auto-cleaned during a session — there is no
-time- or size-based cleanup. They persist for the life of the session and are
-removed only when the session is deleted with `attini session rm <NAME>`.
+time- or size-based cleanup. They persist until you delete the session directory
+yourself (`rm -rf .attini/<NAME>/`).
 
 ## Current ask (read-only)
 

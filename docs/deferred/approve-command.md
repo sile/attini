@@ -36,7 +36,7 @@ Two problems:
    only exists because `agent` must keep an optional `<PROMPT>`, and `--approve` rides
    along on that command.
 2. **It is conceptually a command, not a modifier.** "Approve the pending call" is a
-   self-contained action on a session, in the same family as `attini session show` /
+   self-contained action on a session, in the same family as `attini show` /
    `attini ask`. Modelling it as a subcommand gives it its own `--help`, its own
    name in the top-level command list, and shell-completion/tab-completion ergonomics.
    Decisively: an `approve` subcommand has **no positional**, so `attini approve --approv`
@@ -78,14 +78,14 @@ attini approve [-s NAME]        # approve the session's pending tool call(s)
 ## Second idea: one-shot `--grant SCOPE` on approve
 
 Today, avoiding a future approval means finding the argv-prefix and running a *separate*
-`attini session grant ...` invocation. The agent even prints a suggestion for it
+`attini grant ...` invocation. The agent even prints a suggestion for it
 (`emit_suggested_rule` in `src/tell_cli.rs`):
 
 ```
 [command] approval required: cargo test
 suggested rule (persist separately after approve):
-  attini session grant cargo test                # session-local
-  attini session grant cargo test --workspace    # workspace-wide
+  attini grant cargo test                # session-local
+  attini grant cargo test --workspace    # workspace-wide
 ```
 
 That is two commands and a copy-paste. Fold the grant into the approval:
@@ -99,8 +99,8 @@ where `SCOPE` is one of:
 | `SCOPE` | Meaning | Equivalent to |
 |---|---|---|
 | `oneshot` | approve this call only, persist nothing | default (current `--approve`) |
-| `session` | approve and append the argv-prefix rule to the session `permissions.json` | `approve` + `attini session grant <prefix>` |
-| `workspace` | approve and append to the workspace `permissions.json` | `approve` + `attini session grant <prefix> --workspace` |
+| `session` | approve and append the argv-prefix rule to the session `permissions.json` | `approve` + `attini grant <prefix>` |
+| `workspace` | approve and append to the workspace `permissions.json` | `approve` + `attini grant <prefix> --workspace` |
 
 Settled semantics:
 
@@ -124,7 +124,7 @@ Settled semantics:
 - **Which prefix gets granted.** Reuse the same truncation `emit_suggested_rule` uses
   (first two argv elements, e.g. `cargo test`) so `--grant session` does not bake in
   every flag. The human should see the exact prefix that will be written, exactly as the
-  existing suggestion does today (verified live: `ls -la .` suggests `attini session
+  existing suggestion does today (verified live: `ls -la .` suggests `attini
   grant ls -la`). Because the prefix comes from the same helper as the suggestion, the
   two can never disagree.
 - **Multiple pending calls.** `pending.json` is an array and approve handles all of them.
@@ -144,7 +144,7 @@ Settled semantics:
 2. **`--grant` has unresolved corners** (multi-pending ambiguity, patch vs. command,
    approving-all while granting-one). Each is solvable, but the design should be settled
    deliberately rather than smuggled in.
-3. **No observed pain yet.** The current `--approve` + printed `attini session grant ...`
+3. **No observed pain yet.** The current `--approve` + printed `attini grant ...`
    suggestion works; the friction is an ergonomic annoyance, not a bug. Per attini's
    philosophy (add surface only when the need is demonstrated), this can wait until the
    two-command shuffle is actually felt.
@@ -171,5 +171,5 @@ Settled semantics:
 
 If a new top-level command feels like too much surface, the minimal half is to keep
 `attini agent --approve` and only add `--grant SCOPE` to it. That removes the
-copy-paste of the `attini session grant` suggestion while leaving the typo-safety and
+copy-paste of the `attini grant` suggestion while leaving the typo-safety and
 conceptual-cleanliness arguments unaddressed.

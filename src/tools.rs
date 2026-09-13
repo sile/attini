@@ -29,7 +29,7 @@ pub struct ToolExecutor {
     /// primary boundary. Patch tool uses only this field.
     root: PathBuf,
     /// Additional read-only roots granted via `permissions.json`
-    /// (appended by `attini session grant-read`). Read-only tools
+    /// (appended by `attini grant-read`). Read-only tools
     /// accept paths that canonicalise into any of these roots. Patch
     /// tool ignores this field entirely (write access to these paths
     /// is out of scope).

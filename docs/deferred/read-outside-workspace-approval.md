@@ -9,7 +9,7 @@ Read-only tools (`read` / `list` / `search`) can only touch paths under the work
 root or under a root granted **before the invocation starts**. If the model wants to look
 at something outside the workspace *now*, there is no way for it to ask and have the
 human approve that specific read. The human must already know the path and pre-grant it
-with `attini session grant-read`. That is fine when the path is known up front and
+with `attini grant-read`. That is fine when the path is known up front and
 awkward when it is discovered mid-task.
 
 ## Current mechanics (grounding)

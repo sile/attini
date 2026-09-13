@@ -88,12 +88,11 @@ the model during compaction.
   only on a fresh `Continuation::Prompt` (never on `--approve`).
 - It fires on the first turn of a resumed session only; after compaction the
   summary replaces the huge history so a second pass sees a small total.
-- `attini session compact` is the manual counterpart, using the same
-  summariser path.
+- Compaction is automatic only; there is no manual `compact` subcommand
+  (it was removed — a running session that needs a smaller history can just
+  be pruned with `attini prune`).
 
 ## Related
 
 - `docs/bug/conversation-log-bloat.md` — the investigation that motivated the
   bounded prose summariser and the retained-tail cap.
-- `docs/deferred/deepseek-reasoning-resend.md` — why `reasoning_content`
-  resend is kept as a watch item.

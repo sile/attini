@@ -22,7 +22,7 @@ meaning is buried in the middle of a long line. It is also hard to review: a who
 change shows up as one line in `git diff`, so a review cannot see *which* rule changed.
 
 The intent is the opposite: **the human should edit this file easily**, rather than
-route every small change through a CLI subcommand (`attini session grant` /
+route every small change through a CLI subcommand (`attini grant` /
 `grant-read` / `approve --grant`). The file is the source of truth; the commands are a
 convenience.
 

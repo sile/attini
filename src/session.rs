@@ -335,12 +335,12 @@ pub fn session_paths(name: &str) -> io::Result<SessionPaths> {
 }
 
 // -------------------------------------------------------------------
-// Read-only inspection helpers for the `attini session` subcommand
+// Read-only inspection helpers for the top-level `attini show` /
+// `attini metrics` / `attini analyze` subcommands
 // -------------------------------------------------------------------
 
 /// Aggregate counters over one `conversation.jsonl`. Used by both
-/// `attini session list` (total_records + last_ts) and
-/// `attini session show` (per-kind breakdown).
+/// `attini show` (per-kind breakdown).
 #[derive(Debug, Clone, Default)]
 pub struct ConversationSummary {
     pub total_records: u64,
@@ -586,7 +586,7 @@ fn lock_conflict_error(name: &str, lock_path: &Path, holder_pid: Option<i32>) ->
         format!(
             "session {name:?} is locked{pid_hint}: {path}\n\
              If no attini process is actually holding it, remove the LOCK manually: \
-             `rm {path}` (or `attini session unlock {name}` once that command lands).",
+             `rm {path}` (or `attini unlock {name}`).",
             path = lock_path.display(),
         ),
     )
@@ -1151,7 +1151,7 @@ pub struct TokenUsageAggregate {
     pub latest: Option<u64>,
 }
 
-/// Whole-file analysis of a conversation log for `attini session
+/// Whole-file analysis of a conversation log for `attini
 /// analyze`. Produced by [`analyze_conversation`]; renderers decide
 /// how many rows to display (human vs `--json`).
 #[derive(Debug, Clone, Default)]

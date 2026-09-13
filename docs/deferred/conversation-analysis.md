@@ -1,6 +1,6 @@
 # Interpretation guidance for conversation analysis
 
-**Status:** Deferred. The deterministic `attini session analyze` subcommand
+**Status:** Deferred. The deterministic `attini analyze` subcommand
 (measurement half) is implemented and committed; interpretation guidance
 is the remaining, unbuilt half. See `docs/design/conversation-analysis.md`
 for the implemented measurement half.
@@ -15,7 +15,7 @@ for the implemented measurement half.
 A short instruction block (typed into the prompt, since `--skill` is gone)
 instructing the model how to:
 
-- Run `attini session analyze <NAME>` (and pass `--json` if machine parsing
+- Run `attini analyze <NAME>` (and pass `--json` if machine parsing
   helps).
 - Read the histogram and identify which record kind / tool result dominates.
 - Explain the finding in one or two sentences (e.g. "`cargo test` is 1.40 MB
@@ -38,4 +38,4 @@ is ergonomic, not a correctness gap.
 
 Write the interpretation instructions and pass them in the prompt when you
 want an analysis (there is no skill flag anymore). It only needs to chain
-`session analyze` output with model judgment.
+`attini analyze` output with model judgment.

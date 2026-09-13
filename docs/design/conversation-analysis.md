@@ -1,6 +1,6 @@
 # Conversation analysis tooling
 
-**Status:** Implemented (measurement half). The deterministic `attini session
+**Status:** Implemented (measurement half). The deterministic `attini
 analyze` subcommand is implemented and committed; the interpretation skill is
 still deferred. This document records the design of the implemented half and
 points at the deferred remaining half.
@@ -38,7 +38,7 @@ kinds dominate, which tool results are largest, which files are read
 repeatedly, which external commands produce the most output, and how much of
 the assistant payload is `reasoning` vs `content`.
 
-## Implemented: `attini session analyze <NAME>`
+## Implemented: `attini analyze <NAME>`
 
 A deterministic Rust subcommand that reads `conversation.jsonl` (no LOCK
 required, read-only) and prints:

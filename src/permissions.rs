@@ -1,7 +1,7 @@
 //! Filesystem-facing side of the permission system: load rules and
 //! extra read paths from `.attini/{NAME}/permissions.json`
 //! (session-local) and `.attini/permissions.json` (workspace-wide),
-//! and implement `attini session grant` / `attini session grant-read`.
+//! and implement `attini grant` / `attini grant-read`.
 //!
 //! The on-disk schema evolved from a legacy top-level array of rule
 //! objects (`[{prefix, decision, ...}]`) to a top-level object

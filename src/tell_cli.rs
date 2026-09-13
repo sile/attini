@@ -49,8 +49,7 @@ pub struct Counters {
     /// Number of times `try_auto_compact` invoked `compact_conversation`.
     /// (Total number of times it fired past the threshold; counted as 1
     /// whether it ends in an internal skip, a summariser success, or any
-    /// of the various `Err` outcomes.) Manual `attini session compact`
-    /// does not hold `Counters`, so it is not recorded here.
+    /// of the various `Err` outcomes.)
     pub compaction_attempts: u64,
     /// Number of times `compact_conversation` returned `Err`.
     /// (Aggregates `Err` arising from `load_records_since_last_summary`,
@@ -225,7 +224,7 @@ pub struct TellConfig {
 /// `Oneshot` is the default: approve the pending call and persist
 /// nothing. `Session` / `Workspace` additionally append the approved
 /// command's argv-prefix as an auto-approve rule, mirroring
-/// `attini session grant <prefix> [--workspace]`.
+/// `attini grant <prefix> [--workspace]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantRequest {
     /// No grant was requested (`--grant` omitted, or not an approve run).
@@ -278,7 +277,7 @@ pub enum TellOutcome {
 pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
     // Canonicalise the persistent extra_read_paths (from
-    // permissions.json, appended by `attini session grant-read`) and
+    // permissions.json, appended by `attini grant-read`) and
     // hand the resulting Vec to the ToolExecutor. Any path that fails
     // to canonicalise is warned + skipped so a single bad entry does
     // not disable the whole grant list.
@@ -913,9 +912,9 @@ fn try_auto_compact(
 /// `assistant -> tool` pair is split, sends the older records to
 /// the summarizer, and appends a `SessionRecord::Summary`.
 ///
-/// Exposed to `session_cmd` for the manual `attini session compact`
-/// subcommand. Callers are expected to have already checked that
-/// the session is idle (no LOCK holder, no `pending.json`).
+/// Called by the auto-compaction path (`try_auto_compact`). Callers are
+/// expected to have already checked that the session is idle (no LOCK
+/// holder, no `pending.json`).
 pub fn compact_conversation(
     session: &mut Session,
     model: &str,
@@ -1448,7 +1447,7 @@ fn append_auto_approval(
     })
 }
 
-/// Suggest the two `attini session grant` invocations that would
+/// Suggest the two `attini grant` invocations that would
 /// pre-approve the argv-prefix of the pending command. `argv` is
 /// truncated to at most two elements (typical pattern: `program
 /// subcommand`) so the rule stays a general prefix rather than
@@ -1459,8 +1458,8 @@ fn emit_suggested_rule(argv: &[String]) {
     };
     let prefix_display = shell_escape_argv(&prefix);
     eprintln!("suggested rule (persist separately after approve):");
-    eprintln!("  attini session grant {prefix_display}                # session-local");
-    eprintln!("  attini session grant {prefix_display} --workspace    # workspace-wide");
+    eprintln!("  attini grant {prefix_display}                # session-local");
+    eprintln!("  attini grant {prefix_display} --workspace    # workspace-wide");
     eprintln!(
         "  attini approve --grant session                       # the same, folded into approve"
     );
