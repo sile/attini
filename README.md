@@ -53,11 +53,55 @@ than letting the agent infer or guess:
   rejecting multiple edits to the same path in one `patch`.
 - **The model's own space is gated too.** The model can work freely in its own
   scratchpad, but every write there still passes through approval.
+- **Tools amplify understanding; they do not replace it.** The agent already
+  reads, searches, edits, and runs commands — tools make those faster and
+  safer, but they never hand the agent a capability it does not understand.
+  attini has no `plan` tool that plans for the model, no `skill_load` that
+  injects context mid-run, and no `subagent` that delegates the thinking away.
+  When it can already do the work, attini tunes the environment itself (for
+  example quieting the default `cargo` output) rather than inventing a magic
+  tool.
 
 This is why, for instance, there is no automatic skill or instruction-file
 discovery (no `~/.attini/skills`, no `.attini/skills`, no `AGENTS.md` scan) —
 context should enter a session only because the human asked for it, in the
-prompt.
+prompt. See [Intentionally not supported](#intentionally-not-supported) for the
+concrete list of removed and never-added features.
+
+## Intentionally not supported
+
+attini has grown by *removing* whole classes of convenience features rather
+than retaining them. That removal is policy, not an accident or unfinished
+work. The list below answers "if you look for feature X, is it gone because it
+was bad, or just not built yet?" — for these, deliberately:
+
+- **Memory / automatic context persistence.** The three-tier `memories.md`
+  loading was removed. If you need persistent context, put it in the prompt.
+- **Subagent / delegation.** `subagent_run` was removed: it was synchronous and
+  serial, and its only real value (context isolation) is already available by
+  running a separate session yourself.
+- **`AGENTS.md` / agent instruction files.** Not implemented, and intentionally
+  not planned — implicit discovery by file-name convention is exactly what
+  attini avoids.
+- **Auto skill load / implicit skill discovery.** No `skill_load` tool, no
+  scanning of `~/.attini/skills` or `.attini/skills`. Context enters only
+  because you asked for it.
+- **`--skill` / `--reference` flags.** Removed. The only thing they added over
+  a plain prompt was landing text in the system prompt — not a guarantee the
+  model obeys (there is none, by LLM nature). Paste via `--stdin` instead.
+- **Plan mode (`--plan=on|off`).** Removed. attini already gates consequential
+  writes; a separate mode added a second, redundant notion of "how much
+  approval" and a state file to keep in sync. Use `attini ask` to inspect a
+  session read-only.
+- **`--local-only` mode and rule attributes (`readonly` / `network`).**
+  Removed, along with the `Mode` axis. Approval is a single, flat thing: a rule
+  is allow or deny, or absent (which falls through to a pending approval).
+
+The common thread: implicit, convention-based context or delegation that
+attini cannot see or control. attini's answer to each is "be explicit" — put
+it in the prompt, or run the other session yourself. "Unsupported" here means
+"ask for it explicitly and it works as asked", not "the feature is missing and
+should be added".
 
 ## Requirements
 

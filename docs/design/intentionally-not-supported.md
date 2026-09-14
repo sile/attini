@@ -1,6 +1,8 @@
 # Intentionally not supported
 
-**Status:** Deferred. Discussion note. Not yet asserted anywhere as policy.
+**Status:** Implemented. Asserted publicly in the README's
+[Intentionally not supported](../../README.md#intentionally-not-supported)
+section; this document is the extended rationale.
 
 ## Why this note exists
 
@@ -124,6 +126,6 @@ justifiable as an *amplifier* of what the model already does, not a
 replacement for it. If such a mechanism is ever seriously proposed, this
 document is the place to argue against it from recorded reasons.
 
-This note is deferred because the removal commits already made the decision;
-the remaining question is whether to ever *assert* the list publicly (for
-example in the README) and in what form.
+This list is now asserted publicly in the README. The removal commits already
+made the decision; this document records the reasoning behind each entry so a
+future proposal to re-add one has something concrete to argue against.
