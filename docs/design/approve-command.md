@@ -8,11 +8,11 @@ still worth reading before anyone proposes re-adding `--approve`.
 
 The standalone `attini grant` / `attini grant-read` subcommands described below were later
 **removed**: with the JSONL format, rules are plain lines edited by hand, and the only
-write path is `attini approve --grant`. `--grant` covers both **commands** (persists an
-args-prefix) and **reads** (persists a canonical path); the pending call's kind decides
-what is written and `SCOPE` only decides the lifetime. The read side is described in
-`docs/deferred/grant-read-scope.md`. Patches still have no scope
-(`docs/deferred/patch-grant-scope.md`).
+write path is `attini approve --grant`. `--grant` covers **commands** (persists an
+args-prefix), **reads** (persists a path), and **patches** (persists a `write` path); the
+pending call's kind decides what is written and `SCOPE` only decides the lifetime. The
+read side is described in `docs/deferred/grant-read-scope.md`, the patch side in
+`docs/design/patch-grant-scope.md`.
 
 ## The observation
 
@@ -125,10 +125,11 @@ Settled semantics:
   or the argv cannot be truncated to a prefix at all, `--grant` is rejected up front
   (before approving) rather than silently degrading to a plain approve. Silent no-ops
   are against attini's philosophy.
-- **Applies to commands only.** Patches have no argv-prefix; a patch approval cannot be
-  auto-granted this way (patches are git-tracked-`Update`-only auto-approve, and
-  everything else always needs approval). Introducing a patch scope is a separate,
-  future idea — see the memo `docs/deferred/patch-grant-scope.md`.
+- **Applies to commands, reads, and patches.** The persisted shape is decided by the
+  pending call's kind (argv prefix, read path, or `write` path). A patch pending arises
+  from an `Add`/non-tracked edit that reached a prompt; a hard `UntrackedTarget` error is
+  not a pending and is lifted by hand-editing a `write` rule instead. See
+  `docs/design/patch-grant-scope.md`.
 - **Which prefix gets granted.** Reuse the same truncation `emit_suggested_rule` uses
   (first two argv elements, e.g. `cargo test`) so `--grant session` does not bake in
   every flag. The human should see the exact prefix that will be written, exactly as the

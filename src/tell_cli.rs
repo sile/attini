@@ -1767,6 +1767,7 @@ fn grant_prefix(argv: &[String]) -> Option<Vec<String>> {
 enum GrantIntent {
     Command(Vec<String>),
     Read(String),
+    Write(String),
 }
 
 /// Validate and resolve the `attini approve --grant` request against the
@@ -1834,9 +1835,33 @@ fn plan_grant(
                 )),
             }
         }
-        PendingToolKind::Patch => Err(io::Error::other(
-            "--grant applies to commands and reads only; there is no scope for a patch".to_string(),
-        )),
+        PendingToolKind::Patch => {
+            let inv = PatchInvocation::parse(&pending.arguments_json).map_err(|e| {
+                io::Error::other(format!("--grant: could not read the pending patch: {e:?}"))
+            })?;
+            // A patch may target several paths; a single `--grant`
+            // can only persist one `write` rule, so require exactly one
+            // target path (the common case). `PatchInvocation::parse`
+            // already guarantees the paths are distinct.
+            let [edit] = inv.edits.as_slice() else {
+                return Err(io::Error::other(
+                    "--grant is ambiguous for a patch touching multiple paths; approve one at a time"
+                        .to_string(),
+                ));
+            };
+            let target = edit.path();
+            // Persist an in-workspace target as a workspace-relative
+            // path, the same shape the `write` rules are evaluated
+            // against (`workspace_relative_write_target`), so a grant
+            // and a deny rule compare like-for-like under
+            // last-match-wins. Out-of-workspace or non-existent targets
+            // fall back to the raw path, which the executor rejects
+            // anyway.
+            match workspace_relative_write_target(target, workspace_root) {
+                Some(rel) => Ok(Some(GrantIntent::Write(rel))),
+                None => Ok(Some(GrantIntent::Write((*target).to_string()))),
+            }
+        }
     }
 }
 
@@ -1852,10 +1877,12 @@ fn apply_grant(cfg: &TellConfig, intent: &GrantIntent) {
     let outcome = match intent {
         GrantIntent::Command(argv_prefix) => permissions::grant(scope, argv_prefix),
         GrantIntent::Read(path) => permissions::grant_read(scope, path),
+        GrantIntent::Write(path) => permissions::grant_write(scope, path),
     };
     let display = match intent {
         GrantIntent::Command(argv_prefix) => shell_escape_argv(argv_prefix),
         GrantIntent::Read(path) => path.clone(),
+        GrantIntent::Write(path) => path.clone(),
     };
     match outcome {
         Ok(permissions::GrantOutcome::Appended(path)) => {
@@ -3854,19 +3881,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_grant_rejects_patch_pending() {
-        let root = std::env::temp_dir();
-        let pendings = vec![Pending {
+    fn patch_pending(call_id: &str, edits_json: &str) -> Pending {
+        Pending {
             ts: 0,
-            call_id: "p1".to_string(),
+            call_id: call_id.to_string(),
             tool_kind: PendingToolKind::Patch,
             function_name: "patch".to_string(),
-            arguments_json: "{}".to_string(),
+            arguments_json: format!("{{\"edits\":[{edits_json}]}}"),
             preview: String::new(),
-        }];
+        }
+    }
+
+    #[test]
+    fn plan_grant_resolves_patch_path_relative_to_workspace() {
+        let dir = std::env::temp_dir().join(format!("attini-patch-grant-{}", std::process::id()));
+        let sub = dir.join("sub");
+        let _ = std::fs::create_dir_all(&sub);
+        let file = sub.join("note.txt");
+        std::fs::write(&file, "hi").expect("write");
+        let edit = r#"{"kind":"add","path":"sub/note.txt","content":"new"}"#;
+        let pendings = vec![patch_pending("p1", edit)];
+        match plan_grant(GrantRequest::Session, &pendings, &dir).unwrap() {
+            Some(GrantIntent::Write(path)) => assert_eq!(path, "sub/note.txt"),
+            other => panic!("expected a write grant, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_grant_rejects_multi_path_patch() {
+        let root = std::env::temp_dir();
+        let edit = concat!(
+            r#"{"kind":"add","path":"a.txt","content":"x"},"#,
+            r#"{"kind":"add","path":"b.txt","content":"y"}"#
+        );
+        let pendings = vec![patch_pending("p1", edit)];
         let err = plan_grant(GrantRequest::Session, &pendings, &root).unwrap_err();
-        assert!(err.to_string().contains("commands and reads only"), "{err}");
+        assert!(err.to_string().contains("multiple paths"), "{err}");
     }
 
     #[test]

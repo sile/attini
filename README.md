@@ -185,18 +185,26 @@ do not have to edit `permissions.jsonl` by hand afterward:
 
 What gets persisted depends on the pending call's **kind**: a `command` stores
 its args-prefix (`{"type":"command","allow":true,"args_prefix":[...]}`), a
-`read` stores its canonical path (`{"type":"read","allow":true,"path":...}`).
-`SCOPE` keeps the same meaning for both — how long the grant lives — so one flag
-covers commands and reads.
+`read` stores its path (`{"type":"read","allow":true,"path":...}`), and a
+`patch` stores its path as a `write` rule (`{"type":"write","allow":true,"path":...}`).
+Inside the workspace that path is workspace-relative, the shape rules are
+written in; outside it, the absolute path is kept. `SCOPE` keeps the same
+meaning throughout — how long the grant lives — so one flag covers all three
+kinds.
 
 Approval and grant are independent: the approval always stands, and a grant that
 cannot be written (already granted, a conflicting deny rule, or an I/O error) is
 reported as a one-line warning rather than rolling the approval back. A grant
-that cannot be *formed* — the pending call is a `patch` (no scope exists for
-one), a command's argv yields no prefix, a read has no resolvable path, or
-several calls are pending — is rejected up front. The argv-prefix is truncated
-the same way as the printed suggestion (first two elements, e.g. `cargo test`),
-so the two never disagree.
+that cannot be *formed* — a command's argv yields no prefix, a read has no
+resolvable path, a patch touches more than one distinct path, or several calls
+are pending — is rejected up front. The argv-prefix is truncated the same way as
+the printed suggestion (first two elements, e.g. `cargo test`), so the two never
+disagree.
+
+A `patch` grant is the only way to auto-approve a non-tracked write without
+hand-editing `permissions.jsonl`; note that a hard `UntrackedTarget` rejection at
+preview is not a pending, so it must be lifted by a hand-written `write` rule
+(see the permissions section), not by `--grant`.
 
 When an `attini tell` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):

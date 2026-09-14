@@ -50,9 +50,8 @@ but the approval flow is no longer command-only.
 The grant vocabulary was not overloaded: `SCOPE` (`oneshot|session|workspace`) keeps its
 meaning (how long the grant lives), and the **pending call's kind** decides what gets
 persisted (argv prefix vs. path). So a single `--grant SCOPE` reads fine and no separate
-`--grant-read` option was needed. This is exactly the resolution the patch-side memo
-(`docs/deferred/patch-grant-scope.md`) is still waiting for; patches remain out of scope
-because a patch has no argv prefix and widening the write boundary is a bigger decision.
+`--grant-read` option was needed. The patch side (`docs/design/patch-grant-scope.md`) now
+follows the same pattern: a patch pending persists a `write` path rule.
 
 Case 2 of `read-outside-workspace-approval.md` — a `read` `allow:false` rule that denies
 a path *inside* the workspace — is now also implemented: the deny is turned into an
@@ -67,8 +66,8 @@ last-match-wins.
 - `docs/deferred/read-outside-workspace-approval.md` — the "approve a read on the spot"
   design; both case 1 (outside-the-workspace reads) and case 2 (a `read` `allow:false`
   rule) now park for approval and feed this grant.
-- `docs/deferred/patch-grant-scope.md` — the same asymmetry for patches (no path-based
-  `--grant`); still deferred.
+- `docs/design/patch-grant-scope.md` — the same pattern for patches (a `write` path
+  rule); implemented.
 - `docs/design/write-permission-type.md` — the declarative-rule version of the write
   side of the same family (`write` rule type); implemented.
 
@@ -78,4 +77,4 @@ last-match-wins.
   resolved the requested target to). A finer shape (exact file only) would need a new
   matcher; not needed so far.
 - The same "kind decides the payload, `SCOPE` decides the lifetime" pattern is the model
-  for the patch-side `--grant` if it ever lands (`docs/deferred/patch-grant-scope.md`).
+  the patch-side `--grant` followed (`docs/design/patch-grant-scope.md`).

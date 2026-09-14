@@ -60,10 +60,9 @@ writable nor auto-approved.
 
 ## Relationship to `patch-grant-scope.md`
 
-This is the declarative file-rule shape. `docs/deferred/patch-grant-scope.md`
-asks for the imperative `--grant` analogue scoped to patches. They are two
-shapes of the same idea; the file rule is implemented, the `--grant` form is
-still deferred.
+This is the declarative file-rule shape. `docs/design/patch-grant-scope.md`
+records the imperative `--grant` analogue scoped to patches. They are two shapes
+of the same idea; both are implemented.
 
 ## Not in scope
 
