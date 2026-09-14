@@ -24,8 +24,11 @@ There is no middle ground of the form "let this model keep patching files under
    been reported as tedious.
 2. **The scope vocabulary is unclear.** A command grant is naturally a prefix
    (`cargo test`); a patch grant is naturally a **path** scope (`src/`, a single
-   file, `tests/`?). These are different shapes, and forcing them into one
-   `SCOPE` vocabulary may not fit.
+   file, `tests/`?). The read side resolved the analogous worry: `SCOPE` keeps its
+   meaning (lifetime) and the pending call's *kind* decides what is persisted
+   (args-prefix vs. path) — see `docs/deferred/grant-read-scope.md`. A patch grant
+   could follow the same pattern (a `path` payload), so the vocabulary is no longer
+   the blocker. What remains is point 3.
 3. **It widens the write boundary.** Auto-approved writes are currently bounded
    by "git-tracked `Update` only", which is a strong, simple guarantee. A path
    grant would let new files / non-tracked edits through without a prompt, so it

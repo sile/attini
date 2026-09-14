@@ -88,10 +88,9 @@ one is cancelled), a parked read behaves like any other approval-gated call.
 
 - **Case 2: `read` `allow:false`.** A path inside the workspace denied by a `read` rule
   still returns a silent error; promoting it to an approval request is not done.
-- **Scope of approval.** The implemented grant is one-shot only. A `session` /
-  `workspace` scope (i.e. persisting a `read` allow rule) is not wired: `attini approve
-  --grant session|workspace` still applies to `command` pendings only and errors on a
-  read pending. See `docs/deferred/grant-read-scope.md`.
+- **Scope of approval.** Done: `attini approve --grant session|workspace` now persists
+  an allow `read` rule (a canonical path) for a `read` pending, alongside the one-shot
+  default. See `docs/design/approve-command.md` and `docs/deferred/grant-read-scope.md`.
 - **Symmetry.** `list` (directory) vs `read`/`search` (file/prefix) may want different
   approval granularity; the one-shot root currently uses the requested path as-is.
 
@@ -107,10 +106,10 @@ one is cancelled), a parked read behaves like any other approval-gated call.
 
 ## Decision
 
-**Case 1 implemented** as a one-shot, non-persisted approval (chosen over persisting a
-read root, which would outlive the call and needs the `--grant` read scope). **Case 2 is
-deferred** and belongs with `docs/design/approve-command.md`'s `--grant SCOPE` vocabulary
-(see `docs/deferred/grant-read-scope.md`).
+**Case 1 implemented.** A read outside the workspace is approved one-shot by default;
+`--grant session|workspace` persists an allow `read` rule when the human wants it to
+stick. **Case 2 is deferred** and still needs the `read` `allow:false` evaluation to park
+instead of erroring (see "How to revive").
 
 ## Connection to the permissions file
 
@@ -124,14 +123,15 @@ a denied read; this memo records the promotion into an approval request.
 
 ## How to revive (remaining work)
 
-Case 1 (outside-the-workspace) is implemented. To finish the memo:
+Case 1 (outside-the-workspace) is implemented, including the `--grant session|workspace`
+read scope. The one remaining piece is case 2:
 
 1. **Case 2.** Return `NeedsApproval` (not a plain error) when a `read` rule with
    `allow:false` wins the override chain during read-only resolution. `resolve_within_any`
    lives in `src/tools.rs`; the deny match happens in the permission layer, so the
    executor needs to consult `read` rules the way `dispatch_command` consults `command`
    rules. Park the same `PendingToolKind::Read`.
-2. **Read `--grant` scope.** Extend `plan_grant` / `apply_grant` in `src/tell_cli.rs` so
-   a `read` pending accepts `--grant session|workspace`, writing an allow `read` rule via
-   `permissions::grant` (a path-shaped entry, not an argv prefix). See
-   `docs/deferred/grant-read-scope.md` for the shape mismatch to resolve.
+
+(Done: the read `--grant` scope. `plan_grant` / `apply_grant` in `src/tell_cli.rs` now
+accept a `read` pending and write an allow `read` rule via `permissions::grant_read`, a
+path-shaped entry rather than an argv prefix.)

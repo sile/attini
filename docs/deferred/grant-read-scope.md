@@ -1,10 +1,15 @@
-# `--grant` scope for reads (deferred)
+# `--grant` scope for reads
 
-**Status:** Deferred. Not implemented. This memo records the asymmetry left after
-removing the standalone `attini grant` / `attini grant-read` subcommands: the only
-`--grant` path that remains is `attini approve --grant oneshot|session|workspace`, and
-it covers **commands only**. Read access has no `--grant` scope at all, so read rules
-are added **only by hand** to `permissions.jsonl`.
+**Status:** Implemented. `attini approve --grant session|workspace` now persists a
+`read` rule (a canonical path) when the single pending call is a read that reached
+outside the workspace, mirroring the command path. `--grant oneshot` stays
+approve-only (no persistence). Read rules can also still be added by hand to
+`permissions.jsonl`.
+
+This memo began as the record of the asymmetry left after removing the standalone
+`attini grant` / `attini grant-read` subcommands: the only `--grant` path that remained
+was `attini approve --grant oneshot|session|workspace`, and it covered **commands only**.
+That gap is now closed.
 
 ## The current asymmetry
 
@@ -14,71 +19,59 @@ line:
 - `type: command`, matched by an `args_prefix` (e.g. `["cargo", "test"]`),
 - `type: read`, matched by a `path` (recursive, segment-boundary aware).
 
-`attini approve --grant SCOPE` persists a **command** prefix rule and folds it into the
-approval. There is no equivalent for reads:
+`attini approve --grant SCOPE` persists a rule and folds it into the approval. It now
+handles both kinds:
 
-- `--grant` has no `read` scope (a read grant is a *path*, not an argv prefix, so the
-  same `SCOPE` word would be overloaded).
-- The standalone `attini grant-read` command that used to exist was removed. It was a
-  thin writer of `permissions.jsonl` read rules, and with the file now hand-editable it
-  added a code path without adding capability.
+- For a **command** pending, `--grant` persists an argv prefix
+  (`{"type":"command","allow":true,"args_prefix":[...]}`).
+- For a **read** pending (a read that reached outside the workspace and was parked),
+  `--grant` persists the **canonical target path**
+  (`{"type":"read","allow":true,"path":"..."}`). This reuses the same recursive
+  segment-boundary matching as a hand-written `read` rule, so the grant and a manual
+  line agree exactly.
 
-So today the intended way to grant a read is: edit `permissions.jsonl` and add a line,
-for example
+The read path is derived from the same `read_extra_root` helper the one-shot execution
+uses, so the granted path and the executed one-shot root are identical.
+
+Reads can still be granted by hand — edit `permissions.jsonl` and add a line, for
+example
 
 ```text
 {..."type":"read","allow":true,"path":"../docs/"...}
 ```
 
-This is deliberate (open, human-editable files) but it is a one-sided story: commands can
-be granted from inside the approval flow, reads cannot.
+but the approval flow is no longer command-only.
 
-## Why it is only deferred
+## Resolution
 
-1. **Reads are rarely discovered past the workspace root.** The observed friction is
-   command approvals (`emit_suggested_rule` still suggests `attini approve --grant
-   session|workspace`). A pre-added `read` rule is usually enough because the path is
-   known before the session starts.
-2. **The approval shape is unsolved.** A command grant is a prefix; a read grant is a
-   path (file, directory, prefix). Folding both into one `--grant SCOPE` vocabulary would
-   overload `SCOPE` and is the exact problem recorded in
-   `docs/deferred/patch-grant-scope.md` for patches.
-3. **The read approval problems belong to a different memo.** The interesting case — the
-   model *asks* to read something outside the workspace (or denied by a `read`
-   `allow:false` rule) and the human approves on the spot — is the subject of
-   `docs/deferred/read-outside-workspace-approval.md`, not of a `--grant` flag. That memo's
-   case 1 (outside-the-workspace reads) is now implemented as a **one-shot** approval with
-   no persistence, so `--grant` is not needed for it; only a *session*/*workspace* read
-   grant would need the vocabulary discussed here. Case 2 (a `read` `allow:false` rule) is
-   still unimplemented.
+The grant vocabulary was not overloaded: `SCOPE` (`oneshot|session|workspace`) keeps its
+meaning (how long the grant lives), and the **pending call's kind** decides what gets
+persisted (argv prefix vs. path). So a single `--grant SCOPE` reads fine and no separate
+`--grant-read` option was needed. This is exactly the resolution the patch-side memo
+(`docs/deferred/patch-grant-scope.md`) is still waiting for; patches remain out of scope
+because a patch has no argv prefix and widening the write boundary is a bigger decision.
 
-So this memo is narrower than `read-outside-workspace-approval.md`: it records only that
-*if* a read-approval flow lands, the read side should get a `--grant` scope of the same
-family as the command one, instead of only being hand-editable.
+Still unimplemented: **case 2** of `read-outside-workspace-approval.md` — a `read`
+`allow:false` rule that denies a path *inside* the workspace. That is a different flow
+(evaluation already decided deny; it does not currently park for approval), and it is not
+what this `--grant` scope addresses.
 
 ## Related
 
-- `docs/design/approve-command.md` — the shipped `attini approve` + `--grant
-  oneshot|session|workspace`; notes that standalone `grant` / `grant-read` were removed and
-  that `--grant` has no `read` scope.
-- `docs/deferred/read-outside-workspace-approval.md` — the fuller "approve a read on the
-  spot" design; its open question on approval scope is where this memo's vocabulary would
-  be decided.
+- `docs/design/approve-command.md` — the shipped `attini approve` +
+  `--grant oneshot|session|workspace`; now covers commands and reads.
+- `docs/deferred/read-outside-workspace-approval.md` — the "approve a read on the spot"
+  design; case 1 (outside-the-workspace reads) is the flow this grant extends, case 2
+  (a `read` `allow:false` rule) is still open.
 - `docs/deferred/patch-grant-scope.md` — the same asymmetry for patches (no path-based
-  `--grant`). Reads and patches arrive at the same "path scope vs. argv prefix" mismatch.
+  `--grant`); still deferred.
 - `docs/deferred/write-permission-type.md` — the declarative-rule version of the write
   side of the same family (`write` rule type).
 
-## If revived
+## If extended
 
-- Decide the read scope shape: exact path, directory (recursive), or prefix. Reuse the
-  recursive segment-boundary matching already implemented for `read` rules so the grant
-  and the file rule agree.
-- Keep the read scope separate from the command scope in the CLI surface if a shared
-  `SCOPE` word does not read well (e.g. distinct `--grant-command` / `--grant-read`
-  options), mirroring the patch-side note.
-- Only build this **on top of** the read-approval flow
-  (`docs/deferred/read-outside-workspace-approval.md`). Its one-shot approval is already
-  implemented; a `--grant session|workspace` would extend that flow from "allow this one
-  read" to "persist an allow `read` rule", which is the natural next step once a read
-  grant feels worth persisting.
+- A read grant persists a canonical **directory** path (whatever `read_extra_root`
+  resolved the requested target to). A finer shape (exact file only) would need a new
+  matcher; not needed so far.
+- The same "kind decides the payload, `SCOPE` decides the lifetime" pattern is the model
+  for the patch-side `--grant` if it ever lands (`docs/deferred/patch-grant-scope.md`).

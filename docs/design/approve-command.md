@@ -8,9 +8,11 @@ still worth reading before anyone proposes re-adding `--approve`.
 
 The standalone `attini grant` / `attini grant-read` subcommands described below were later
 **removed**: with the JSONL format, rules are plain lines edited by hand, and the only
-write path is `attini approve --grant` (commands). `--grant` has no `read` scope, so read
-rules are always added by hand; that asymmetry is recorded in
-`docs/deferred/grant-read-scope.md`.
+write path is `attini approve --grant`. `--grant` covers both **commands** (persists an
+args-prefix) and **reads** (persists a canonical path); the pending call's kind decides
+what is written and `SCOPE` only decides the lifetime. The read side is described in
+`docs/deferred/grant-read-scope.md`. Patches still have no scope
+(`docs/deferred/patch-grant-scope.md`).
 
 ## The observation
 

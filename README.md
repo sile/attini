@@ -139,9 +139,10 @@ on" — however the stop happened:
 - **Pending tool call** (the loop suspended for approval): the call is approved
   and executed, then the turn continues. A pending call is a `patch`, a
   `command`, or a `read`/`list`/`search` that targeted a path **outside the
-  workspace**. The read case is a **one-shot** grant: that single call is
-  allowed through, nothing is written to `permissions.jsonl`, and a later read
-  of the same path asks again. To grant a read persistently, add a `read` rule
+  workspace**. The read case is a **one-shot** grant by default: that single
+  call is allowed through, nothing is written to `permissions.jsonl`, and a
+  later read of the same path asks again. To make it stick, use `--grant
+  session|workspace` (which appends an allow `read` rule), or add a `read` rule
   to `permissions.jsonl` by hand.
 - **Transport failure** (a model call failed at the connection level — reset,
   timeout, DNS — before any assistant output was recorded): the *identical*
@@ -178,16 +179,23 @@ do not have to edit `permissions.jsonl` by hand afterward:
 | `SCOPE` | Effect |
 |---|---|
 | `oneshot` | approve only, persist nothing (the default) |
-| `session` | approve, then append the command's args-prefix to the session `permissions.jsonl` |
+| `session` | approve, then append a rule to the session `permissions.jsonl` |
 | `workspace` | approve, then append it to the workspace-wide `permissions.jsonl` |
+
+What gets persisted depends on the pending call's **kind**: a `command` stores
+its args-prefix (`{"type":"command","allow":true,"args_prefix":[...]}`), a
+`read` stores its canonical path (`{"type":"read","allow":true,"path":...}`).
+`SCOPE` keeps the same meaning for both — how long the grant lives — so one flag
+covers commands and reads.
 
 Approval and grant are independent: the approval always stands, and a grant that
 cannot be written (already granted, a conflicting deny rule, or an I/O error) is
 reported as a one-line warning rather than rolling the approval back. A grant
-that cannot be *formed* — the pending call is not a command, its argv yields no
-prefix, or several commands are pending — is rejected up front. The argv-prefix
-is truncated the same way as the printed suggestion (first two elements, e.g.
-`cargo test`), so the two never disagree.
+that cannot be *formed* — the pending call is a `patch` (no scope exists for
+one), a command's argv yields no prefix, a read has no resolvable path, or
+several calls are pending — is rejected up front. The argv-prefix is truncated
+the same way as the printed suggestion (first two elements, e.g. `cargo test`),
+so the two never disagree.
 
 When an `attini tell` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):

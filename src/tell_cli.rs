@@ -563,7 +563,7 @@ fn drive(
             // but applied only after every approval has succeeded, so a
             // rejected/broken pending set never leaves a grant behind. See
             // [`plan_grant`] for the up-front checks.
-            let grant_prefix = plan_grant(cfg.grant_request, &pendings)?;
+            let grant = plan_grant(cfg.grant_request, &pendings, executor.root())?;
             for pending in &pendings {
                 session.append(&SessionRecord::ToolApproval {
                     ts: now_unix_millis(),
@@ -577,8 +577,8 @@ fn drive(
             session.clear_pending()?;
             // Best-effort: the approval already stands, so a grant failure
             // is a warning, not a rollback.
-            if let Some(prefix) = grant_prefix {
-                apply_grant(cfg, &prefix);
+            if let Some(intent) = grant {
+                apply_grant(cfg, &intent);
             }
         }
         // Re-issue the identical request: append no new user record, just
@@ -1748,71 +1748,95 @@ fn grant_prefix(argv: &[String]) -> Option<Vec<String>> {
     Some(argv[..take].to_vec())
 }
 
+/// Resolved, not-yet-persisted grant for a single pending call. The
+/// variant mirrors the pending tool kind: a command grant persists an
+/// argv prefix, a read grant persists a canonical path.
+#[derive(Debug)]
+enum GrantIntent {
+    Command(Vec<String>),
+    Read(String),
+}
+
 /// Validate and resolve the `attini approve --grant` request against the
-/// pending set, returning the argv-prefix to persist (if any).
+/// pending set, returning the grant to persist (if any).
 ///
 /// A grant that cannot be formed is an error, not a silent no-op: if the
-/// pending call(s) are not exactly one command, or its argv yields no
-/// prefix, `--grant` is rejected before any approval is recorded.
-/// `--grant oneshot` (and no grant at all) never persist anything and
-/// therefore never depend on the pending set.
+/// pending call(s) are not exactly one grantable call, or the prefix/path
+/// cannot be derived, `--grant` is rejected before any approval is
+/// recorded. `--grant oneshot` (and no grant at all) never persist
+/// anything and therefore never depend on the pending set.
 ///
 /// `attini approve` on a session with no pending call (it stopped at
 /// `max_turns`) falls back to a plain continuation, in which case there is
 /// nothing to grant: `--grant` is silently ignored there rather than
 /// errored, since the human's intent was simply "keep going".
-fn plan_grant(request: GrantRequest, pendings: &[Pending]) -> io::Result<Option<Vec<String>>> {
-    let argv = match request {
+fn plan_grant(
+    request: GrantRequest,
+    pendings: &[Pending],
+    workspace_root: &std::path::Path,
+) -> io::Result<Option<GrantIntent>> {
+    match request {
         GrantRequest::None | GrantRequest::Oneshot => return Ok(None),
-        GrantRequest::Session | GrantRequest::Workspace => {
-            let commands: Vec<&Pending> = pendings
-                .iter()
-                .filter(|p| p.tool_kind == PendingToolKind::Command)
-                .collect();
-            match (commands.len(), pendings.len()) {
-                (0, _) => {
-                    return Err(io::Error::other(
-                        "--grant applies to commands only; the pending call(s) are not a command"
-                            .to_string(),
-                    ));
-                }
-                (1, 1) => {}
-                _ => {
-                    return Err(io::Error::other(
-                        "--grant is ambiguous with multiple pending calls; approve one at a time"
-                            .to_string(),
-                    ));
-                }
-            }
-            let inv = CommandInvocation::parse(&commands[0].arguments_json).map_err(|e| {
+        GrantRequest::Session | GrantRequest::Workspace => {}
+    }
+    let [pending] = pendings else {
+        return Err(io::Error::other(
+            "--grant is ambiguous with multiple pending calls; approve one at a time".to_string(),
+        ));
+    };
+    match pending.tool_kind {
+        PendingToolKind::Command => {
+            let inv = CommandInvocation::parse(&pending.arguments_json).map_err(|e| {
                 io::Error::other(format!(
                     "--grant: could not read the pending command: {e:?}"
                 ))
             })?;
             match grant_prefix(&inv.argv) {
-                Some(prefix) => prefix,
-                None => {
-                    return Err(io::Error::other(
-                        "--grant: the pending command has no argv to persist".to_string(),
-                    ));
-                }
+                Some(prefix) => Ok(Some(GrantIntent::Command(prefix))),
+                None => Err(io::Error::other(
+                    "--grant: the pending command has no argv to persist".to_string(),
+                )),
             }
         }
-    };
-    Ok(Some(argv))
+        PendingToolKind::Read => {
+            // Persist the canonical target path, matching the one-shot
+            // root the read is executed with, so a later grant-based load
+            // resolves the same directory.
+            let inv = ReadOnlyTool::parse(&pending.function_name, &pending.arguments_json)
+                .map_err(|e| {
+                    io::Error::other(format!("--grant: could not read the pending read: {e:?}"))
+                })?;
+            match read_extra_root(&inv, workspace_root) {
+                Some(path) => Ok(Some(GrantIntent::Read(path.display().to_string()))),
+                None => Err(io::Error::other(
+                    "--grant: the pending read has no resolvable path to persist".to_string(),
+                )),
+            }
+        }
+        PendingToolKind::Patch => Err(io::Error::other(
+            "--grant applies to commands and reads only; there is no scope for a patch".to_string(),
+        )),
+    }
 }
 
 /// Best-effort persistence of the resolved grant, run after every pending
 /// call has been approved. The approval already stands, so any failure is
 /// reported as a one-line warning rather than rolling the approval back.
-fn apply_grant(cfg: &TellConfig, argv_prefix: &[String]) {
+fn apply_grant(cfg: &TellConfig, intent: &GrantIntent) {
     let scope = match cfg.grant_request {
         GrantRequest::Session => permissions::GrantScope::Session(&cfg.session_name),
         GrantRequest::Workspace => permissions::GrantScope::Workspace,
         GrantRequest::None | GrantRequest::Oneshot => return,
     };
-    let display = shell_escape_argv(argv_prefix);
-    match permissions::grant(scope, argv_prefix) {
+    let outcome = match intent {
+        GrantIntent::Command(argv_prefix) => permissions::grant(scope, argv_prefix),
+        GrantIntent::Read(path) => permissions::grant_read(scope, path),
+    };
+    let display = match intent {
+        GrantIntent::Command(argv_prefix) => shell_escape_argv(argv_prefix),
+        GrantIntent::Read(path) => path.clone(),
+    };
+    match outcome {
         Ok(permissions::GrantOutcome::Appended(path)) => {
             eprintln!(
                 "[approve] granted: appended '{display}' to {}",
@@ -3627,24 +3651,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plan_grant_none_and_oneshot_never_persist() {
-        let pendings = vec![command_pending("c1", &["cargo", "test"])];
-        assert_eq!(plan_grant(GrantRequest::None, &pendings).unwrap(), None);
-        assert_eq!(plan_grant(GrantRequest::Oneshot, &pendings).unwrap(), None);
+    fn read_pending(call_id: &str, path: &str) -> Pending {
+        Pending {
+            ts: 0,
+            call_id: call_id.to_string(),
+            tool_kind: PendingToolKind::Read,
+            function_name: "read".to_string(),
+            arguments_json: format!("{{\"path\":\"{path}\"}}"),
+            preview: String::new(),
+        }
     }
 
     #[test]
-    fn plan_grant_session_resolves_command_prefix() {
-        let pendings = vec![command_pending("c1", &["cargo", "test", "--all"])];
-        assert_eq!(
-            plan_grant(GrantRequest::Session, &pendings).unwrap(),
-            Some(vec!["cargo".to_string(), "test".to_string()])
+    fn plan_grant_none_and_oneshot_never_persist() {
+        let root = std::env::temp_dir();
+        let pendings = vec![command_pending("c1", &["cargo", "test"])];
+        assert!(
+            plan_grant(GrantRequest::None, &pendings, &root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            plan_grant(GrantRequest::Oneshot, &pendings, &root)
+                .unwrap()
+                .is_none()
         );
     }
 
     #[test]
-    fn plan_grant_rejects_non_command_pending() {
+    fn plan_grant_session_resolves_command_prefix() {
+        let root = std::env::temp_dir();
+        let pendings = vec![command_pending("c1", &["cargo", "test", "--all"])];
+        match plan_grant(GrantRequest::Session, &pendings, &root).unwrap() {
+            Some(GrantIntent::Command(prefix)) => {
+                assert_eq!(prefix, vec!["cargo".to_string(), "test".to_string()]);
+            }
+            other => panic!("expected a command grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_grant_rejects_patch_pending() {
+        let root = std::env::temp_dir();
         let pendings = vec![Pending {
             ts: 0,
             call_id: "p1".to_string(),
@@ -3653,18 +3701,46 @@ mod tests {
             arguments_json: "{}".to_string(),
             preview: String::new(),
         }];
-        let err = plan_grant(GrantRequest::Session, &pendings).unwrap_err();
-        assert!(err.to_string().contains("commands only"), "{err}");
+        let err = plan_grant(GrantRequest::Session, &pendings, &root).unwrap_err();
+        assert!(err.to_string().contains("commands and reads only"), "{err}");
     }
 
     #[test]
     fn plan_grant_rejects_multiple_pending_commands() {
+        let root = std::env::temp_dir();
         let pendings = vec![
             command_pending("c1", &["cargo", "test"]),
             command_pending("c2", &["git", "status"]),
         ];
-        let err = plan_grant(GrantRequest::Workspace, &pendings).unwrap_err();
+        let err = plan_grant(GrantRequest::Workspace, &pendings, &root).unwrap_err();
         assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn plan_grant_session_resolves_read_path() {
+        let dir = std::env::temp_dir().join(format!("attini-plan-grant-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("outside.txt");
+        std::fs::write(&file, "hi").expect("write");
+        // A workspace root elsewhere makes the absolute target "outside".
+        let root = std::env::temp_dir().join("attini-plan-grant-other");
+        let pendings = vec![read_pending("r1", &file.display().to_string())];
+        match plan_grant(GrantRequest::Session, &pendings, &root).unwrap() {
+            Some(GrantIntent::Read(path)) => {
+                assert_eq!(path, file.canonicalize().unwrap().display().to_string());
+            }
+            other => panic!("expected a read grant, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn plan_grant_rejects_unresolvable_read() {
+        let root = std::env::temp_dir();
+        let pendings = vec![read_pending("r1", "no-such-file-xyz.txt")];
+        let err = plan_grant(GrantRequest::Session, &pendings, &root).unwrap_err();
+        assert!(err.to_string().contains("no resolvable path"), "{err}");
     }
 
     // -------------------------------------------------------------

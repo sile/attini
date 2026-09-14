@@ -211,6 +211,7 @@ pub enum GrantError {
     SessionMissing(PathBuf),
     ReadError(PathBuf, io::Error),
     ExistingDenyConflict(PathBuf, Vec<String>),
+    ExistingReadDenyConflict(PathBuf, String),
     Io(io::Error),
 }
 
@@ -229,6 +230,11 @@ impl std::fmt::Display for GrantError {
             Self::ExistingDenyConflict(p, args_prefix) => write!(
                 f,
                 "command rule for args_prefix {args_prefix:?} already exists as `allow:false` in {}; edit manually to resolve",
+                p.display()
+            ),
+            Self::ExistingReadDenyConflict(p, path) => write!(
+                f,
+                "read rule for path {path:?} already exists as `allow:false` in {}; edit manually to resolve",
                 p.display()
             ),
             Self::Io(e) => write!(f, "{e}"),
@@ -280,6 +286,36 @@ pub fn grant(scope: GrantScope<'_>, args_prefix: &[String]) -> Result<GrantOutco
         };
     }
     let rule = Rule::command(true, args_prefix);
+    append_rule_line(&target, &rule)?;
+    Ok(GrantOutcome::Appended(target))
+}
+
+/// Persist an `allow:true` `read` rule for `path` at the given scope.
+/// Mirrors [`grant`] but for the path matcher: an existing identical
+/// `allow:true` rule is a no-op, an existing identical `allow:false`
+/// rule is a conflict (edit manually), and a fresh rule is appended.
+pub fn grant_read(scope: GrantScope<'_>, path: &str) -> Result<GrantOutcome, GrantError> {
+    if path.trim().is_empty() {
+        return Err(GrantError::ArgsEmpty);
+    }
+    let target = resolve_target(scope)?;
+    let existing = load_rules_from_path(&target, "grant");
+    for rule in &existing {
+        if rule.kind != PermissionKind::Read {
+            continue;
+        }
+        if rule.path != path {
+            continue;
+        }
+        return match rule.allow {
+            true => Ok(GrantOutcome::AlreadyGranted(target)),
+            false => Err(GrantError::ExistingReadDenyConflict(
+                target,
+                path.to_string(),
+            )),
+        };
+    }
+    let rule = Rule::read(true, path.to_string());
     append_rule_line(&target, &rule)?;
     Ok(GrantOutcome::Appended(target))
 }
