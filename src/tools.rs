@@ -94,14 +94,29 @@ impl ToolExecutor {
     }
 
     pub fn execute(&self, tool: ReadOnlyTool) -> ToolOutcome {
+        self.execute_with_roots(tool, &self.extra_read_roots)
+    }
+
+    /// Execute a single read-only tool with an additional one-shot read
+    /// root appended to the executor's own roots. Used to honour a
+    /// human's approval to read one path outside the workspace for a
+    /// single call: the extra root lives only for this invocation and is
+    /// never persisted.
+    pub fn execute_with_extra_read_root(&self, tool: ReadOnlyTool, extra: PathBuf) -> ToolOutcome {
+        let mut roots = self.extra_read_roots.clone();
+        roots.push(extra);
+        self.execute_with_roots(tool, &roots)
+    }
+
+    fn execute_with_roots(&self, tool: ReadOnlyTool, roots: &[PathBuf]) -> ToolOutcome {
         match tool {
             ReadOnlyTool::List {
                 path,
                 recursive,
                 max_entries,
                 include_hidden,
-            } => self.execute_list(&path, recursive, max_entries, include_hidden),
-            ReadOnlyTool::Read { path, line_range } => self.execute_read(&path, line_range),
+            } => self.execute_list(&path, recursive, max_entries, include_hidden, roots),
+            ReadOnlyTool::Read { path, line_range } => self.execute_read(&path, line_range, roots),
             ReadOnlyTool::Search {
                 pattern,
                 path_prefix,
@@ -112,6 +127,7 @@ impl ToolExecutor {
                 path_prefix.as_deref(),
                 case_sensitive,
                 max_results,
+                roots,
             ),
         }
     }
@@ -434,8 +450,9 @@ impl ToolExecutor {
         recursive: bool,
         max_entries: usize,
         include_hidden: bool,
+        roots: &[PathBuf],
     ) -> ToolOutcome {
-        let dir = match resolve_within_any(&self.root, &self.extra_read_roots, rel_path) {
+        let dir = match resolve_within_any(&self.root, roots, rel_path) {
             Ok(p) => p,
             Err(e) => return ToolOutcome::Err(e),
         };
@@ -464,8 +481,13 @@ impl ToolExecutor {
         )
     }
 
-    fn execute_read(&self, rel_path: &str, line_range: Option<(usize, usize)>) -> ToolOutcome {
-        let path = match resolve_within_any(&self.root, &self.extra_read_roots, rel_path) {
+    fn execute_read(
+        &self,
+        rel_path: &str,
+        line_range: Option<(usize, usize)>,
+        roots: &[PathBuf],
+    ) -> ToolOutcome {
+        let path = match resolve_within_any(&self.root, roots, rel_path) {
             Ok(p) => p,
             Err(e) => return ToolOutcome::Err(e),
         };
@@ -533,6 +555,7 @@ impl ToolExecutor {
         path_prefix: Option<&str>,
         case_sensitive: bool,
         max_results: usize,
+        roots: &[PathBuf],
     ) -> ToolOutcome {
         if pattern.is_empty() {
             return ToolOutcome::Err(ToolExecutionError::ArgumentsParseFailed(
@@ -540,7 +563,7 @@ impl ToolExecutor {
             ));
         }
         let base = match path_prefix {
-            Some(p) => match resolve_within_any(&self.root, &self.extra_read_roots, p) {
+            Some(p) => match resolve_within_any(&self.root, roots, p) {
                 Ok(p) => p,
                 Err(e) => return ToolOutcome::Err(e),
             },

@@ -1110,6 +1110,7 @@ fn pending_tool_kind_str(kind: crate::session::PendingToolKind) -> &'static str 
     match kind {
         crate::session::PendingToolKind::Patch => "patch",
         crate::session::PendingToolKind::Command => "command",
+        crate::session::PendingToolKind::Read => "read",
     }
 }
 

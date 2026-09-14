@@ -45,9 +45,12 @@ be granted from inside the approval flow, reads cannot.
    `docs/deferred/patch-grant-scope.md` for patches.
 3. **The read approval problems belong to a different memo.** The interesting case — the
    model *asks* to read something outside the workspace (or denied by a `read`
-   `allow:false` rule) and the human approves on the spot — needs a read-only suspension
-   path and a mutable/rebuildable `ToolExecutor`, which is structural. That is the subject
-   of `docs/deferred/read-outside-workspace-approval.md`, not of a `--grant` flag.
+   `allow:false` rule) and the human approves on the spot — is the subject of
+   `docs/deferred/read-outside-workspace-approval.md`, not of a `--grant` flag. That memo's
+   case 1 (outside-the-workspace reads) is now implemented as a **one-shot** approval with
+   no persistence, so `--grant` is not needed for it; only a *session*/*workspace* read
+   grant would need the vocabulary discussed here. Case 2 (a `read` `allow:false` rule) is
+   still unimplemented.
 
 So this memo is narrower than `read-outside-workspace-approval.md`: it records only that
 *if* a read-approval flow lands, the read side should get a `--grant` scope of the same
@@ -74,6 +77,8 @@ family as the command one, instead of only being hand-editable.
 - Keep the read scope separate from the command scope in the CLI surface if a shared
   `SCOPE` word does not read well (e.g. distinct `--grant-command` / `--grant-read`
   options), mirroring the patch-side note.
-- Only build this **together with** the read-approval flow
-  (`docs/deferred/read-outside-workspace-approval.md`); a `--grant` for reads without a way
-  for the model to ask is just a second spelling of hand-editing the file.
+- Only build this **on top of** the read-approval flow
+  (`docs/deferred/read-outside-workspace-approval.md`). Its one-shot approval is already
+  implemented; a `--grant session|workspace` would extend that flow from "allow this one
+  read" to "persist an allow `read` rule", which is the natural next step once a read
+  grant feels worth persisting.

@@ -1885,6 +1885,10 @@ pub struct Pending {
 pub enum PendingToolKind {
     Patch,
     Command,
+    /// A read-only call (`read` / `list` / `search`) that targeted a path
+    /// outside the workspace and is waiting for one-shot human approval to
+    /// widen the read boundary for that single call.
+    Read,
 }
 
 impl PendingToolKind {
@@ -1892,6 +1896,7 @@ impl PendingToolKind {
         match self {
             Self::Patch => "patch",
             Self::Command => "command",
+            Self::Read => "read",
         }
     }
 
@@ -1899,6 +1904,7 @@ impl PendingToolKind {
         match s {
             "patch" => Some(Self::Patch),
             "command" => Some(Self::Command),
+            "read" => Some(Self::Read),
             _ => None,
         }
     }
@@ -2383,7 +2389,11 @@ mod tests {
 
     #[test]
     fn pending_tool_kind_roundtrips() {
-        for kind in [PendingToolKind::Patch, PendingToolKind::Command] {
+        for kind in [
+            PendingToolKind::Patch,
+            PendingToolKind::Command,
+            PendingToolKind::Read,
+        ] {
             assert_eq!(PendingToolKind::parse(kind.as_str()), Some(kind));
         }
         assert!(PendingToolKind::parse("bogus").is_none());

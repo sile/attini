@@ -750,12 +750,24 @@ fn drive(
                         // Left unanswered so the orphan-repair pass can
                         // cancel it in tool-call order on resume.
                     } else {
-                        let (summary, content, errored) = run_read_only(tc, executor);
-                        eprintln!("{summary}");
-                        if errored {
-                            counters.tool_errors += 1;
+                        match run_read_only(tc, executor) {
+                            ReadOnlyDispatch::Done {
+                                summary,
+                                content,
+                                errored,
+                            } => {
+                                eprintln!("{summary}");
+                                if errored {
+                                    counters.tool_errors += 1;
+                                }
+                                append_tool(session, &mut messages, &tc.id, content)?;
+                            }
+                            ReadOnlyDispatch::NeedsApproval { summary, preview } => {
+                                eprintln!("{summary}");
+                                parked.push(build_pending(tc, PendingToolKind::Read, preview));
+                                suspending = true;
+                            }
                         }
-                        append_tool(session, &mut messages, &tc.id, content)?;
                     }
                 }
                 ToolKind::Patch => {
@@ -1903,15 +1915,30 @@ fn classify(name: &str) -> ToolKind {
     }
 }
 
-/// Returns `(display_summary, tool_response_content, errored)`.
-/// `errored` is `true` iff the returned content is a `tool_error_json`
-/// payload (parse failure or executor error) so the caller can update
-/// `Counters::tool_errors` without re-parsing the string.
-fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> (String, String, bool) {
+/// Outcome of handling one read-only tool call.
+enum ReadOnlyDispatch {
+    /// Answered inline; `errored` is `true` iff `content` is a
+    /// `tool_error_json` payload (parse failure or executor error) so the
+    /// caller can update `Counters::tool_errors` without re-parsing.
+    Done {
+        summary: String,
+        content: String,
+        errored: bool,
+    },
+    /// The call targeted a path outside the workspace; park it for human
+    /// approval instead of answering with an error. Carries the display
+    /// line shown to the human and the preview stored in `pending.json`.
+    NeedsApproval { summary: String, preview: String },
+}
+
+/// Returns the dispatch result for one read-only tool call. `errored`
+/// in the `Done` case is `true` iff the returned content is a
+/// `tool_error_json` payload.
+fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> ReadOnlyDispatch {
     match ReadOnlyTool::parse(&tc.function_name, &tc.arguments_json) {
         Ok(inv) => {
             let args_summary = summarize_read_only(&inv);
-            match executor.execute(inv) {
+            match executor.execute(inv.clone()) {
                 ToolOutcome::Ok(payload) => {
                     let mut summary = format!("[{args_summary}] ok");
                     // Echo the head of a `read` result to stderr so a
@@ -1922,21 +1949,63 @@ fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> (String, String, boo
                         summary.push('\n');
                         summary.push_str(&preview);
                     }
-                    (summary, payload, false)
+                    ReadOnlyDispatch::Done {
+                        summary,
+                        content: payload,
+                        errored: false,
+                    }
                 }
-                ToolOutcome::Err(err) => (
-                    format!("[{args_summary}] err: {}", short_err(&err)),
-                    tool_error_json_from(&err),
-                    true,
-                ),
+                // Outside the workspace: this is the one read error we can
+                // turn into an approval request. Both the workspace and any
+                // granted roots were tried; offer the human the chance to
+                // widen the boundary for this single call. `inv` is reused
+                // (cloned) by `execute_pending` on approval.
+                ToolOutcome::Err(ToolExecutionError::OutsideWorkspace) => {
+                    let preview = format!(r#"{args_summary} (outside workspace)"#);
+                    ReadOnlyDispatch::NeedsApproval {
+                        summary: format!("[{args_summary}] approval required"),
+                        preview,
+                    }
+                }
+                ToolOutcome::Err(err) => ReadOnlyDispatch::Done {
+                    summary: format!("[{args_summary}] err: {}", short_err(&err)),
+                    content: tool_error_json_from(&err),
+                    errored: true,
+                },
             }
         }
-        Err(err) => (
-            format!("[{}] parse err: {}", tc.function_name, short_err(&err)),
-            tool_error_json_from(&err),
-            true,
-        ),
+        Err(err) => ReadOnlyDispatch::Done {
+            summary: format!("[{}] parse err: {}", tc.function_name, short_err(&err)),
+            content: tool_error_json_from(&err),
+            errored: true,
+        },
     }
+}
+
+/// Path a read-only invocation targets, for the purpose of deriving a
+/// one-shot extra read root after approval. `read`/`list` use their
+/// `path`; `search` uses its `path_prefix` when present (`None` means
+/// the workspace root, which never needs approval).
+fn read_only_target(inv: &ReadOnlyTool) -> Option<&str> {
+    match inv {
+        ReadOnlyTool::List { path, .. } => Some(path),
+        ReadOnlyTool::Read { path, .. } => Some(path),
+        ReadOnlyTool::Search { path_prefix, .. } => path_prefix.as_deref(),
+    }
+}
+
+/// Resolve the approved read target to an absolute canonical path to be
+/// used as a one-shot extra read root. Relative targets resolve against
+/// `workspace_root`, matching [`resolve_within_any`]'s semantics. Returns
+/// `None` when there is no target or it does not exist on disk.
+fn read_extra_root(inv: &ReadOnlyTool, workspace_root: &std::path::Path) -> Option<PathBuf> {
+    let target = read_only_target(inv)?;
+    let candidate = if std::path::Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace_root.join(target)
+    };
+    candidate.canonicalize().ok()
 }
 
 fn summarize_read_only(inv: &ReadOnlyTool) -> String {
@@ -2227,6 +2296,25 @@ fn execute_pending(
                     let (code, msg) = err.to_code_and_message();
                     Ok(tool_error_json(code, &msg))
                 }
+            }
+        }
+        PendingToolKind::Read => {
+            // A read approved to reach outside the workspace executes with
+            // a one-shot extra root derived from the requested path, so the
+            // boundary widens for exactly this call and is never persisted.
+            let inv = match ReadOnlyTool::parse(&pending.function_name, &pending.arguments_json) {
+                Ok(inv) => inv,
+                Err(e) => return Ok(tool_error_json_from(&e)),
+            };
+            let Some(extra) = read_extra_root(&inv, executor.root()) else {
+                return Ok(tool_error_json(
+                    "read_args",
+                    "approved read has no resolvable path",
+                ));
+            };
+            match executor.execute_with_extra_read_root(inv, extra) {
+                ToolOutcome::Ok(payload) => Ok(payload),
+                ToolOutcome::Err(e) => Ok(tool_error_json_from(&e)),
             }
         }
     }
@@ -3697,5 +3785,81 @@ mod tests {
         // A list/search result has no `content` member.
         assert!(read_content_preview(r#"{"entries":[],"truncated":false}"#).is_none());
         assert!(read_content_preview("not json").is_none());
+    }
+
+    // -------------------------------------------------------------
+    // read approval (outside-workspace reads)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn read_only_target_reads_the_path_field() {
+        let read = ReadOnlyTool::Read {
+            path: "../foo.txt".to_string(),
+            line_range: None,
+        };
+        assert_eq!(read_only_target(&read), Some("../foo.txt"));
+        let search = ReadOnlyTool::Search {
+            pattern: "x".to_string(),
+            path_prefix: None,
+            case_sensitive: false,
+            max_results: 10,
+        };
+        assert_eq!(read_only_target(&search), None);
+    }
+
+    #[test]
+    fn read_extra_root_is_none_for_missing_path() {
+        let root = std::env::temp_dir();
+        let inv = ReadOnlyTool::Read {
+            path: "definitely-missing-__attini__.txt".to_string(),
+            line_range: None,
+        };
+        assert!(read_extra_root(&inv, &root).is_none());
+    }
+
+    #[test]
+    fn read_extra_root_canonicalises_existing_path() {
+        // The workspace root itself always exists; requesting it as a
+        // read target yields a canonical extra root.
+        let root = std::env::temp_dir();
+        let expected = root.canonicalize().unwrap();
+        let inv = ReadOnlyTool::List {
+            path: ".".to_string(),
+            recursive: false,
+            max_entries: 10,
+            include_hidden: false,
+        };
+        assert_eq!(read_extra_root(&inv, &root), Some(expected));
+    }
+
+    #[test]
+    fn run_read_only_needs_approval_outside_workspace() {
+        // A temp workspace with no granted roots; reading an absolute
+        // path elsewhere on disk (the real cwd) is outside it.
+        let workspace =
+            std::env::temp_dir().join(format!("attini-read-approval-ws-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
+        let cwd_file = std::env::current_dir().unwrap().join("Cargo.toml");
+        if !cwd_file.exists() {
+            // Unexpected working directory; skip rather than false-fail.
+            let _ = std::fs::remove_dir_all(&workspace);
+            return;
+        }
+        let tc = ToolCall {
+            id: "call_x".to_string(),
+            function_name: "read".to_string(),
+            arguments_json: format!(r#"{{"path":"{}"}}"#, cwd_file.display()),
+        };
+        match run_read_only(&tc, &executor) {
+            ReadOnlyDispatch::NeedsApproval { summary, preview } => {
+                assert!(summary.contains("approval required"), "{summary}");
+                assert!(preview.contains("outside workspace"), "{preview}");
+            }
+            ReadOnlyDispatch::Done { content, .. } => {
+                panic!("expected approval request, got: {content}")
+            }
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }
