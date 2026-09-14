@@ -121,8 +121,15 @@ fn parse_rule_line(line: &str) -> Result<Rule, String> {
             }
             Ok(Rule::read(allow, path))
         }
+        "write" => {
+            let path = required_string(value, "path")?;
+            if path.trim().is_empty() {
+                return Err("path is empty".to_string());
+            }
+            Ok(Rule::write(allow, path))
+        }
         other => Err(format!(
-            "unknown type {other:?} (expected \"command\" or \"read\")"
+            "unknown type {other:?} (expected \"command\", \"read\" or \"write\")"
         )),
     }
 }
@@ -182,6 +189,9 @@ impl DisplayJson for Rule {
                     f.member("args_prefix", &self.args_prefix)?;
                 }
                 PermissionKind::Read => {
+                    f.member("path", &self.path)?;
+                }
+                PermissionKind::Write => {
                     f.member("path", &self.path)?;
                 }
             }
@@ -426,12 +436,32 @@ not json
 
     #[test]
     fn unknown_type_is_skipped() {
-        let text = r#"{"type":"write","allow":true,"path":"src/"}
+        let text = r#"{"type":"bogus","allow":true,"path":"src/"}
 "#;
         let dir = tempdir("jsonl_unknown_type");
         let path = dir.join(PERMISSIONS_FILENAME);
         let rules = parse_jsonl(text, &path, "workspace");
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn write_rule_parses_and_round_trips() {
+        let text = r#"{"type":"write","allow":true,"path":"src/"}
+{"type":"write","allow":false,"path":"src/generated"}
+"#;
+        let dir = tempdir("jsonl_write");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].kind, PermissionKind::Write);
+        assert!(rules[0].allow);
+        assert_eq!(rules[0].path, "src/");
+        assert_eq!(rules[1].kind, PermissionKind::Write);
+        assert!(!rules[1].allow);
+        assert_eq!(
+            render_rule_line(&rules[0]),
+            r#"{"type":"write","allow":true,"path":"src/"}"#
+        );
     }
 
     #[test]
@@ -445,6 +475,11 @@ not json
         assert_eq!(
             render_rule_line(&read),
             r#"{"type":"read","allow":false,"path":"secret/"}"#
+        );
+        let write = Rule::write(true, "src/".to_string());
+        assert_eq!(
+            render_rule_line(&write),
+            r#"{"type":"write","allow":true,"path":"src/"}"#
         );
     }
 

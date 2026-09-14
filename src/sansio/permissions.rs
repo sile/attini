@@ -28,6 +28,8 @@ pub enum PermissionKind {
     Command,
     /// A read-only tool call (`read`/`list`/`search`), matched by path.
     Read,
+    /// A `patch` tool call, matched by the target path of each edit.
+    Write,
 }
 
 impl PermissionKind {
@@ -35,6 +37,7 @@ impl PermissionKind {
         match self {
             Self::Command => "command",
             Self::Read => "read",
+            Self::Write => "write",
         }
     }
 }
@@ -48,10 +51,10 @@ pub struct Rule {
     /// turns a rule off.
     pub allow: bool,
     /// `command`: the argv prefix to match (token-wise).
-    /// `read`: unused.
+    /// `read`/`write`: unused.
     pub args_prefix: Vec<String>,
-    /// `read`: the path to match (recursively, on segment boundaries).
-    /// `command`: unused.
+    /// `read`/`write`: the path to match (recursively, on segment
+    /// boundaries). `command`: unused.
     pub path: String,
 }
 
@@ -68,6 +71,15 @@ impl Rule {
     pub fn read(allow: bool, path: String) -> Self {
         Self {
             kind: PermissionKind::Read,
+            allow,
+            args_prefix: Vec::new(),
+            path,
+        }
+    }
+
+    pub fn write(allow: bool, path: String) -> Self {
+        Self {
+            kind: PermissionKind::Write,
             allow,
             args_prefix: Vec::new(),
             path,
@@ -194,6 +206,36 @@ pub fn evaluate_read(
     finish_decision(matches)
 }
 
+/// Evaluate a `patch` edit target (a workspace-relative path, as
+/// written by the model, or the canonical path it maps to) against the
+/// permission rules. Same last-match-wins semantics as `evaluate_read`;
+/// `write` and `read` are distinct kinds and do not cross-match.
+pub fn evaluate_write(
+    layers: &[ScopedRules<'_>],
+    path: &Path,
+    _authorization: &Authorization,
+) -> Judgment {
+    let mut matches: Vec<RuleMatch> = Vec::new();
+    for (scope, rules) in layers {
+        for rule in rules.iter() {
+            if rule.kind != PermissionKind::Write {
+                continue;
+            }
+            if rule_matches_path(rule, path) {
+                matches.push(RuleMatch {
+                    scope: *scope,
+                    kind: rule.kind,
+                    allow: rule.allow,
+                    args_prefix: Vec::new(),
+                    path: rule.path.clone(),
+                    adopted: false,
+                });
+            }
+        }
+    }
+    finish_decision(matches)
+}
+
 /// Turn a match history into a `Judgment`. The last match's `allow`
 /// decides; the last match is marked `adopted`.
 fn finish_decision(mut matches: Vec<RuleMatch>) -> Judgment {
@@ -230,11 +272,12 @@ fn rule_matches_argv(rule: &Rule, argv: &[String]) -> bool {
         .all(|(a, b)| a == b)
 }
 
-/// Match a `read` rule against a path: the rule's path matches the
-/// requested path itself and anything underneath it, on path-segment
-/// boundaries (`foo/bar` matches `foo/bar/x` but not `foo/barbaz`).
-/// The rule path is compared as given (usually workspace-relative); the
-/// caller supplies a path in a consistent form.
+/// Match a `read`/`write` rule against a path: the rule's path matches
+/// the requested path itself and anything underneath it, on
+/// path-segment boundaries (`foo/bar` matches `foo/bar/x` but not
+/// `foo/barbaz`). The rule path is compared as given (usually
+/// workspace-relative); the caller supplies a path in a consistent
+/// form.
 fn rule_matches_path(rule: &Rule, path: &Path) -> bool {
     if rule.path.is_empty() {
         return false;
@@ -428,6 +471,70 @@ mod tests {
             evaluate_read(&layers, Path::new("secret/x"), &Authorization::PerTool),
             Judgment::AutoDeny(_)
         ));
+    }
+
+    #[test]
+    fn write_rule_matches_recursively_on_segments() {
+        let r = Rule::write(true, "src".to_string());
+        let layers = [(RuleScope::Workspace, r.as_slice())];
+        assert!(matches!(
+            evaluate_write(&layers, Path::new("src/lib.rs"), &Authorization::PerTool),
+            Judgment::AutoApprove(_)
+        ));
+        assert!(matches!(
+            evaluate_write(
+                &layers,
+                Path::new("src/deep/mod.rs"),
+                &Authorization::PerTool
+            ),
+            Judgment::AutoApprove(_)
+        ));
+        assert!(matches!(
+            evaluate_write(&layers, Path::new("src2/lib.rs"), &Authorization::PerTool),
+            Judgment::Pending
+        ));
+    }
+
+    #[test]
+    fn write_deny_rule_denies() {
+        let r = Rule::write(false, "src/generated".to_string());
+        let layers = [(RuleScope::Workspace, r.as_slice())];
+        assert!(matches!(
+            evaluate_write(
+                &layers,
+                Path::new("src/generated/x.rs"),
+                &Authorization::PerTool
+            ),
+            Judgment::AutoDeny(_)
+        ));
+    }
+
+    #[test]
+    fn write_and_read_rules_do_not_cross_match() {
+        let read_rule = Rule::read(true, "src".to_string());
+        let write_rule = Rule::write(true, "src".to_string());
+        let layers = [
+            (RuleScope::Workspace, read_rule.as_slice()),
+            (RuleScope::Session, write_rule.as_slice()),
+        ];
+        // A write evaluation ignores the read rule; only the write match counts.
+        match evaluate_write(&layers, Path::new("src/lib.rs"), &Authorization::PerTool) {
+            Judgment::AutoApprove(d) => {
+                assert_eq!(d.scope, RuleScope::Session);
+                assert_eq!(d.matches.len(), 1);
+                assert_eq!(d.matches[0].kind, PermissionKind::Write);
+            }
+            other => panic!("expected AutoApprove(session write), got {other:?}"),
+        }
+        // And the read evaluation ignores the write rule.
+        match evaluate_read(&layers, Path::new("src/lib.rs"), &Authorization::PerTool) {
+            Judgment::AutoApprove(d) => {
+                assert_eq!(d.scope, RuleScope::Workspace);
+                assert_eq!(d.matches.len(), 1);
+                assert_eq!(d.matches[0].kind, PermissionKind::Read);
+            }
+            other => panic!("expected AutoApprove(workspace read), got {other:?}"),
+        }
     }
 
     #[test]

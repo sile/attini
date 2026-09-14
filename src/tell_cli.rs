@@ -17,6 +17,7 @@ use crate::sansio::agent::{
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{
     Authorization, AutoDecision, Judgment, Rule, RuleScope, ScopedRules, evaluate, evaluate_read,
+    evaluate_write,
 };
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, AutoDecidedMatch, ChatMessageWithTs, InvocationEndReason,
@@ -774,6 +775,8 @@ fn drive(
                     if let PatchDispatch::Awaiting(pending) = dispatch_patch_unapproved(
                         tc,
                         executor,
+                        &permission_layers,
+                        &cfg.authorization,
                         session,
                         &mut messages,
                         counters,
@@ -2105,6 +2108,65 @@ fn read_extra_root(inv: &ReadOnlyTool, workspace_root: &Path) -> Option<PathBuf>
     candidate.canonicalize().ok()
 }
 
+/// Aggregate verdict of the `write` rules over every edit in a patch.
+enum WriteVerdict {
+    /// Every edit is allowed by a winning `write` `allow:true` rule.
+    Allowed,
+    /// At least one edit is denied by a winning `write` `allow:false`
+    /// rule. Denial wins over anything else.
+    Denied,
+    /// No edit is denied, but at least one is not covered by an
+    /// allow rule, so fall back to the git-tracking heuristic.
+    Undecided,
+}
+
+/// Evaluate every edit in `inv` against the `write` rules. A single
+/// denied edit denies the whole patch; otherwise the patch is allowed
+/// only when every edit is covered by a winning `allow:true` rule.
+fn patch_write_verdict(
+    inv: &PatchInvocation,
+    permission_layers: &[(RuleScope, &[Rule])],
+    authorization: &Authorization,
+    workspace_root: &Path,
+) -> WriteVerdict {
+    let mut all_allowed = true;
+    for edit in &inv.edits {
+        let Some(rel) = workspace_relative_write_target(edit.path(), workspace_root) else {
+            // A path we cannot reduce to a workspace-relative form (an
+            // absolute path the executor would reject anyway, or one
+            // that does not canonicalise) cannot be covered by a
+            // workspace-relative `write` rule.
+            all_allowed = false;
+            continue;
+        };
+        match evaluate_write(permission_layers, Path::new(&rel), authorization) {
+            Judgment::AutoDeny(_) => return WriteVerdict::Denied,
+            Judgment::AutoApprove(_) => {}
+            Judgment::Pending => all_allowed = false,
+        }
+    }
+    if all_allowed {
+        WriteVerdict::Allowed
+    } else {
+        WriteVerdict::Undecided
+    }
+}
+
+/// Reduce a patch edit's target path to the workspace-relative form a
+/// `write` rule is compared against. Returns `None` when the path
+/// escapes the workspace or cannot be canonicalised.
+fn workspace_relative_write_target(target: &str, workspace_root: &Path) -> Option<String> {
+    let candidate = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace_root.join(target)
+    };
+    let canon = candidate.canonicalize().ok()?;
+    let root = workspace_root.canonicalize().ok()?;
+    let rel = canon.strip_prefix(&root).ok()?;
+    Some(rel.to_string_lossy().into_owned())
+}
+
 fn summarize_read_only(inv: &ReadOnlyTool) -> String {
     match inv {
         ReadOnlyTool::List {
@@ -2196,9 +2258,12 @@ enum PatchDispatch {
 /// the working tree is never mutated: auto-approved edits are
 /// skipped and preview errors are not appended. The caller still
 /// receives `Awaiting(Pending)` for edits that need a human.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_patch_unapproved(
     tc: &ToolCall,
     executor: &ToolExecutor,
+    permission_layers: &[(RuleScope, &[Rule])],
+    authorization: &Authorization,
     session: &mut Session,
     messages: &mut Vec<ChatMessage>,
     counters: &mut Counters,
@@ -2228,7 +2293,18 @@ fn dispatch_patch_unapproved(
             return Ok(PatchDispatch::Continue);
         }
     };
-    if preview.auto_approve {
+    // A patch auto-runs when either every edit is a git-tracked Update
+    // (revertible, no prompt needed) or every edit is permitted by a
+    // `write` `allow:true` rule. Any edit whose winning `write` rule is
+    // `allow:false` forces approval, regardless of git tracking.
+    let write_verdict =
+        patch_write_verdict(&inv, permission_layers, authorization, executor.root());
+    let auto_approve = match write_verdict {
+        WriteVerdict::Denied => false,
+        WriteVerdict::Allowed => true,
+        WriteVerdict::Undecided => preview.auto_approve,
+    };
+    if auto_approve {
         if !dry_run {
             match executor.apply_patch(&inv, &preview_content) {
                 Ok(paths) => {
