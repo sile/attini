@@ -100,6 +100,21 @@ can distinguish "not implemented yet" from "intentionally not there".
   (which falls through to a pending approval). Rules carry no attributes that
   silently change behavior under some mode.
 
+### 8. Conversation checkpoint / rollback / fork
+
+- **What:** a dedicated checkpoint + rollback primitive — a monotonic `seq` on
+  every record, a destructive `attini reset --at <checkpoint>`, and a
+  non-destructive `attini fork --at <checkpoint>`.
+- **Status:** not implemented, and intentionally not planned.
+- **Why not:** the underlying need ("try things without permanently polluting
+  the log") is met by plain file operations. `conversation.jsonl` is an open,
+  human-editable file: snapshot before risky work by copying it, and restore by
+  copying back; "fork" is copying the session directory to a new name. Asking
+  questions without writing is what `attini ask` already does. A first-class
+  primitive would have to introduce a `seq` into the on-disk schema and solve
+  rollback across a compaction `Summary` boundary (where the underlying records
+  are already replaced) — real cost for a need that existing tools cover.
+
 ## The common thread
 
 All are the same shape: **implicit, convention-based context or delegation
