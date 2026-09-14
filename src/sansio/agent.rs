@@ -398,8 +398,8 @@ impl CommandInvocation {
                  directly (no shell). Every call requires user approval unless a matching \
                  argv_prefix rule pre-approves it. Output is capped at 256 KiB per stream; if \
                  a stream is truncated the result sets `truncated: true`. Non-zero exit status \
-                 is returned as a normal result (not an error). Runtime is not capped by \
-                 attini; the user can interrupt a long-running command with Ctrl+C."
+                 is returned as a normal result (not an error). Runtime is capped (default 180 \
+                 seconds); a command killed on timeout reports `termination_reason: \"timeout\"`."
                 .to_string(),
             parameters_json: COMMAND_PARAMS_SCHEMA.to_string(),
         }

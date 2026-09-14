@@ -16,11 +16,30 @@
 //! is a terminal the streamed bytes are coloured (dim for the child's
 //! stdout, yellow for its stderr) so the output is clearly marked as
 //! coming from the child process.
+//!
+//! A caller-supplied timeout (see [`run_streamed`]) runs the child in
+//! its own process group and kills that group with SIGTERM (then
+//! SIGKILL) when the cap elapses, so a hung command cannot block a
+//! turn forever.
 
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Upper bound on how long a child may run before the watchdog sends
+/// SIGTERM to its process group. Not a hard constant: the caller
+/// supplies the cap (see `ATTINI_COMMAND_TIMEOUT_SECONDS`).
+///
+/// Grace period after SIGTERM before the watchdog escalates to
+/// SIGKILL, giving the child a chance to clean up.
+const KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// How often the watchdog wakes to check whether the child has exited
+/// or the timeout has elapsed. Bounds the response latency of the
+/// timeout and the granularity of the kill, not the run time itself.
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Upper bound on bytes of a child stream displayed to the parent's
 /// stderr per one-second window. Excess bytes are still accumulated.
@@ -55,6 +74,10 @@ pub struct ChildOutput {
     /// True when either stream was truncated at
     /// [`COMMAND_MAX_STREAM_BYTES`]; the stdio text is incomplete.
     pub truncated: bool,
+    /// True when the watchdog killed the child (or its process group)
+    /// after the caller-supplied timeout elapsed. The retained output
+    /// is whatever the child produced up to the kill.
+    pub timed_out: bool,
 }
 
 /// Run `cmd` with piped stdout / stderr, streaming both to the parent
@@ -63,9 +86,27 @@ pub struct ChildOutput {
 /// drained. Prints `[child] started` / `[child] finished` separator
 /// lines to stderr, and colours the streamed bytes when stderr is a
 /// terminal.
-pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
+///
+/// When `timeout` is `Some`, the child is started in its own process
+/// group (`setpgid`) and a watchdog kills that group (SIGTERM, then
+/// SIGKILL after [`KILL_GRACE`]) once the cap elapses. `None` runs
+/// without a cap. Pipes are always drained to EOF, so accumulation
+/// stays bounded by [`COMMAND_MAX_STREAM_BYTES`] regardless.
+pub fn run_streamed(cmd: &mut Command, timeout: Option<Duration>) -> io::Result<ChildOutput> {
     let started = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Put the child in its own process group so the watchdog can kill
+    // the whole tree (e.g. a `bash -c` wrapper and its children) with
+    // one `killpg`, not just the immediate pid. Safe across fork/exec
+    // because it only touches the child's own pgid.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = cmd.spawn()?;
     let pid = child.id();
     let color = io::stderr().is_terminal();
@@ -83,7 +124,7 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
         thread::spawn(move || pump(reader, StreamKind::Stderr, color, limiter))
     });
 
-    let status = child.wait()?;
+    let (status, timed_out) = wait_with_timeout(&mut child, pid, timeout)?;
     let (stdout_bytes, stdout_truncated) = join_pump(stdout_thread)?;
     let (stderr_bytes, stderr_truncated) = join_pump(stderr_thread)?;
     let duration = started.elapsed();
@@ -95,7 +136,56 @@ pub fn run_streamed(cmd: &mut Command) -> io::Result<ChildOutput> {
         status,
         duration,
         truncated: stdout_truncated || stderr_truncated,
+        timed_out,
     })
+}
+
+/// Wait for `child` to exit, killing its process group if `timeout`
+/// elapses first. Returns the child's exit status and whether the
+/// watchdog killed it. Polls with [`WATCHDOG_POLL_INTERVAL`] so the
+/// same loop owns both the child and the pgid (the pgid equals `pid`
+/// because `run_streamed` started the child with `setpgid(0, 0)`).
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    pid: u32,
+    timeout: Option<Duration>,
+) -> io::Result<(ExitStatus, bool)> {
+    let Some(timeout) = timeout else {
+        return Ok((child.wait()?, false));
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        if Instant::now() >= deadline {
+            kill_group(pid, libc::SIGTERM);
+            // Give the child a chance to exit cleanly, then force it.
+            let force_at = Instant::now() + KILL_GRACE;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok((status, true));
+                }
+                if Instant::now() >= force_at {
+                    kill_group(pid, libc::SIGKILL);
+                    let status = child.wait()?;
+                    return Ok((status, true));
+                }
+                thread::sleep(WATCHDOG_POLL_INTERVAL);
+            }
+        }
+        thread::sleep(WATCHDOG_POLL_INTERVAL);
+    }
+}
+
+/// Send `signal` to the process group led by `pid`. Best-effort: a
+/// failure (e.g. the group already exited) is ignored because the
+/// subsequent `try_wait` / `wait` still observes the real status.
+fn kill_group(pid: u32, signal: i32) {
+    // SAFETY: `killpg` only reads its arguments; a failure returns -1.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, signal);
+    }
 }
 
 /// `[child] started (pid NNNN)` separator line.
@@ -320,7 +410,7 @@ mod tests {
     fn run_streamed_truncates_large_output_at_stream_cap() {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("yes x | head -c 300000");
-        let out = run_streamed(&mut cmd).expect("run");
+        let out = run_streamed(&mut cmd, None).expect("run");
         assert!(out.status.success());
         assert_eq!(
             out.stdout.len(),
@@ -335,7 +425,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg("printf 'out-line1\\nout-line2\\n'; printf 'err-line\\n' >&2");
-        let out = run_streamed(&mut cmd).expect("run");
+        let out = run_streamed(&mut cmd, None).expect("run");
         assert!(out.status.success());
         assert_eq!(out.stdout, "out-line1\nout-line2\n");
         assert_eq!(out.stderr, "err-line\n");
@@ -345,7 +435,7 @@ mod tests {
     fn run_streamed_non_zero_exit_is_not_an_error() {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("exit 3");
-        let out = run_streamed(&mut cmd).expect("run");
+        let out = run_streamed(&mut cmd, None).expect("run");
         assert_eq!(out.status.code(), Some(3));
     }
 
@@ -358,9 +448,48 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg("i=0; while [ $i -lt 100000 ]; do echo out; echo err >&2; i=$((i+1)); done");
-        let out = run_streamed(&mut cmd).expect("run");
+        let out = run_streamed(&mut cmd, None).expect("run");
         assert!(out.status.success());
         assert!(out.truncated);
+    }
+
+    #[test]
+    fn run_streamed_kills_child_on_timeout() {
+        // The child would run far longer than the cap; the watchdog
+        // must kill it and report `timed_out` well before then.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30");
+        let started = Instant::now();
+        let out = run_streamed(&mut cmd, Some(Duration::from_millis(200))).expect("run");
+        assert!(out.timed_out, "watchdog killed the child");
+        // The kill (plus the 1s grace before SIGKILL) must land far
+        // short of the child's own 30s sleep.
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn run_streamed_timeout_disabled_when_none() {
+        // With no cap, a fast child completes normally and is not
+        // marked as timed out.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 0");
+        let out = run_streamed(&mut cmd, None).expect("run");
+        assert!(!out.timed_out);
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn run_streamed_timeout_kills_process_group_descendants() {
+        // A background grandchild keeps the pipe open past the parent
+        // shell's exit. Killing the *group* must take the descendant
+        // down too; otherwise `join_pump` would block on the still-open
+        // pipe and `run_streamed` would never return.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sh -c 'sleep 30' & wait");
+        let started = Instant::now();
+        let out = run_streamed(&mut cmd, Some(Duration::from_millis(200))).expect("run");
+        assert!(out.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     // -----------------------------------------------------------------

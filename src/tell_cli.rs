@@ -228,7 +228,17 @@ pub struct TellConfig {
     /// the approved command's argv-prefix after the approval succeeds.
     /// `None` for every other entry point.
     pub grant_request: GrantRequest,
+    /// Wall-clock cap on a single `command` tool call, in seconds. The
+    /// child runs in its own process group and is killed (SIGTERM, then
+    /// SIGKILL) when the cap elapses; the result sets `termination_reason`
+    /// to `timeout`. `None` disables the cap. `Some(0)` is treated as
+    /// disabled too, so `--command-timeout 0` opts out.
+    pub command_timeout_seconds: Option<u64>,
 }
+
+/// Default `command` tool timeout in seconds, used when neither
+/// `--command-timeout` nor `ATTINI_COMMAND_TIMEOUT_SECONDS` is set.
+pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 180;
 
 /// The `--grant SCOPE` value accepted by `attini approve`.
 ///
@@ -561,7 +571,7 @@ fn drive(
                     decision: ApprovalDecision::Approve,
                     auto_decided_by: None,
                 })?;
-                let content = execute_pending(pending, executor)?;
+                let content = execute_pending(pending, executor, command_timeout(cfg))?;
                 append_tool(session, &mut messages, &pending.call_id, content)?;
             }
             session.clear_pending()?;
@@ -771,6 +781,7 @@ fn drive(
                         &mut messages,
                         counters,
                         suspending,
+                        command_timeout(cfg),
                     )? {
                         parked.push(pending);
                         suspending = true;
@@ -1588,6 +1599,7 @@ fn dispatch_command(
     messages: &mut Vec<ChatMessage>,
     counters: &mut Counters,
     dry_run: bool,
+    timeout: Option<Duration>,
 ) -> io::Result<CommandDispatch> {
     let inv = match CommandInvocation::parse(&tc.arguments_json) {
         Ok(inv) => inv,
@@ -1614,7 +1626,7 @@ fn dispatch_command(
                     display
                 );
                 append_auto_approval(session, &tc.id, ApprovalDecision::Approve, &dec)?;
-                let content = match run_command_sync(&inv, executor) {
+                let content = match run_command_sync(&inv, executor, timeout) {
                     Ok(s) => s,
                     Err(err) => {
                         let (code, msg) = err.to_code_and_message();
@@ -2182,7 +2194,11 @@ fn build_pending(tc: &ToolCall, kind: PendingToolKind, preview: String) -> Pendi
     }
 }
 
-fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<String> {
+fn execute_pending(
+    pending: &Pending,
+    executor: &ToolExecutor,
+    timeout: Option<Duration>,
+) -> io::Result<String> {
     match pending.tool_kind {
         PendingToolKind::Patch => {
             // Convert any patch parse / preview / apply failure into a
@@ -2205,7 +2221,7 @@ fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<Str
         PendingToolKind::Command => {
             let inv = CommandInvocation::parse(&pending.arguments_json)
                 .map_err(|e| io::Error::other(format!("command args: {e:?}")))?;
-            match run_command_sync(&inv, executor) {
+            match run_command_sync(&inv, executor, timeout) {
                 Ok(s) => Ok(s),
                 Err(err) => {
                     let (code, msg) = err.to_code_and_message();
@@ -2216,20 +2232,33 @@ fn execute_pending(pending: &Pending, executor: &ToolExecutor) -> io::Result<Str
     }
 }
 
+/// Resolve the configured `command` timeout into a [`Duration`], or
+/// `None` when the cap is disabled (`--command-timeout 0`).
+fn command_timeout(cfg: &TellConfig) -> Option<Duration> {
+    match cfg.command_timeout_seconds {
+        Some(0) | None => None,
+        Some(secs) => Some(Duration::from_secs(secs)),
+    }
+}
+
 fn run_command_sync(
     inv: &CommandInvocation,
     executor: &ToolExecutor,
+    timeout: Option<Duration>,
 ) -> Result<String, CommandError> {
     let started = Instant::now();
     // argv is guaranteed non-empty by CommandInvocation::parse.
     let mut cmd = Command::new(&inv.argv[0]);
     cmd.args(&inv.argv[1..]).current_dir(executor.root());
-    let output =
-        crate::child_output::run_streamed(&mut cmd).map_err(|e| CommandError::SpawnFailed {
+    let output = crate::child_output::run_streamed(&mut cmd, timeout).map_err(|e| {
+        CommandError::SpawnFailed {
             message: e.to_string(),
-        })?;
+        }
+    })?;
     let elapsed = started.elapsed();
-    let termination_reason = if output.status.code().is_some() {
+    let termination_reason = if output.timed_out {
+        "timeout"
+    } else if output.status.code().is_some() {
         "exited"
     } else {
         "signaled"
@@ -2944,6 +2973,7 @@ mod tests {
             authorization: Authorization::PerTool,
             temperature: None,
             grant_request: GrantRequest::None,
+            command_timeout_seconds: None,
         }
     }
 
@@ -3212,6 +3242,26 @@ mod tests {
         let json = command_result_json("out", "", Some(0), "exited", Duration::ZERO, true);
         assert!(json.contains("\"truncated\":true"));
         assert!(!json.contains("\"truncated\":false"));
+    }
+
+    // -----------------------------------------------------------------
+    // command_timeout
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn command_timeout_zero_and_none_disable_the_cap() {
+        let mut cfg = gate_config(1, None, None);
+        cfg.command_timeout_seconds = None;
+        assert_eq!(command_timeout(&cfg), None);
+        cfg.command_timeout_seconds = Some(0);
+        assert_eq!(command_timeout(&cfg), None);
+    }
+
+    #[test]
+    fn command_timeout_seconds_becomes_a_duration() {
+        let mut cfg = gate_config(1, None, None);
+        cfg.command_timeout_seconds = Some(180);
+        assert_eq!(command_timeout(&cfg), Some(Duration::from_secs(180)));
     }
 
     // -------------------------------------------------------------

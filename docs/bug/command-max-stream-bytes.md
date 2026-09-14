@@ -15,10 +15,10 @@ bound; `run_streamed` now truncates each stream at 256 KiB and sets a
 pub const COMMAND_MAX_STREAM_BYTES: usize = 256 * 1024;
 ```
 
-It is `pub` and exported, but a repo-wide search finds **no reader**. The only
-textual references are this constant itself and the note in
-`docs/deferred/command-tool-timeout.md` (which mislocates it as "in
-`child_output.rs`" — it is in `sansio/agent.rs`).
+It is `pub` and exported, but a repo-wide search finds **no reader** (at the time
+this bug was written). The only textual references were this constant itself and
+the note in the (since renamed) command-timeout memo, which mislocated it as
+"in `child_output.rs`" — it is in `sansio/agent.rs`.
 
 ## The claim vs. reality
 
@@ -64,7 +64,7 @@ lives in a module that cannot import it.
 `truncated` flag the way the doc comment describes), or delete the constant and
 rewrite the tool description to say honestly that output is not capped.
 
-**With the timeout work (`docs/deferred/command-tool-timeout.md`):** that memo's
+**With the timeout work (now `docs/design/command-timeout.md`):** that memo's
 MVP already proposes a process-group SIGTERM→SIGKILL watchdog. A natural
 companion is to enforce `COMMAND_MAX_STREAM_BYTES` so that a streaming child
 that exceeds the cap causes the same process-group termination and a
@@ -79,7 +79,7 @@ the I/O layer (or a small shared module).
 ## How to verify the bug
 
 1. `grep -rn COMMAND_MAX_STREAM_BYTES src` → only the definition in
-   `sansio/agent.rs` (plus `docs/deferred/command-tool-timeout.md`).
+   `sansio/agent.rs` (that constant has since been removed by the fix below).
 2. Run a command that emits > 256 KiB (e.g. `bash -c "yes x | head -c 1000000"`
    via the `command` tool); the returned `stdout` exceeds 256 KiB, so the cap
    is demonstrably not enforced.
@@ -91,5 +91,6 @@ each retained stream at `COMMAND_MAX_STREAM_BYTES`, sets `ChildOutput::truncated
 when a stream exceeds it, and `command_result_json` serializes a `truncated`
 member so the model sees that output was cut. The dead constants in
 `sansio/agent.rs` were removed; the cap lives in `child_output.rs`, next to the
-code that enforces it. The process-group watchdog from
-`docs/deferred/command-tool-timeout.md` was deliberately left out for now.
+code that enforces it. The process-group watchdog was deliberately left out of
+this fix; it has since been implemented separately, see
+`docs/design/command-timeout.md`.

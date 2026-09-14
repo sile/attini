@@ -23,6 +23,9 @@ const TEMPERATURE_ENV: &str = "ATTINI_TEMPERATURE";
 /// Environment variable that supplies a default system prompt when
 /// `--system-prompt` is omitted.
 const SYSTEM_PROMPT_ENV: &str = "ATTINI_SYSTEM_PROMPT";
+/// Environment variable that supplies a default `command` tool timeout
+/// (seconds) when `--command-timeout` is omitted.
+const COMMAND_TIMEOUT_ENV: &str = "ATTINI_COMMAND_TIMEOUT_SECONDS";
 
 /// Cap on how many bytes `--stdin` may contribute to the prompt, to avoid
 /// bloating the user message with an unbounded paste.
@@ -272,6 +275,16 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .take(args)
         .present_and_then(|o| o.value().parse::<f64>())?;
 
+    let command_timeout_seconds: Option<u64> = noargs::opt("command-timeout")
+        .ty("N")
+        .doc(
+            "Wall-clock cap in seconds on a single `command` tool call; the child is killed \
+             (SIGTERM, then SIGKILL) on expiry. Default 180. `0` disables the cap.",
+        )
+        .env(COMMAND_TIMEOUT_ENV)
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
+
     let use_stdin = noargs::flag("stdin")
         .short('I')
         .doc(
@@ -332,6 +345,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         authorization,
         temperature,
         grant_request: tell_cli::GrantRequest::None,
+        command_timeout_seconds,
     };
     match tell_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
         tell_cli::TellOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
@@ -407,6 +421,15 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         },
         None => tell_cli::GrantRequest::None,
     };
+    let command_timeout_seconds: Option<u64> = noargs::opt("command-timeout")
+        .ty("N")
+        .doc(
+            "Wall-clock cap in seconds on a single `command` tool call; the child is killed \
+             (SIGTERM, then SIGKILL) on expiry. Default 180. `0` disables the cap.",
+        )
+        .env(COMMAND_TIMEOUT_ENV)
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
 
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
@@ -432,6 +455,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         authorization: attini::sansio::permissions::Authorization::PerTool,
         temperature: None,
         grant_request: grant,
+        command_timeout_seconds,
     };
     match tell_cli::run(cfg, Continuation::Approve).map_err(|e| RunError::Runtime(e.to_string()))? {
         tell_cli::TellOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),

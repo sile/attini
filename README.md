@@ -87,9 +87,9 @@ export DEEPSEEK_API_KEY=sk-...
 ### Tell CLI (`attini tell`)
 
 ```sh
-attini tell [--system-prompt TEXT] [--max-tokens N] [--temperature N] [--stdin] "<PROMPT>"
+attini tell [--system-prompt TEXT] [--max-tokens N] [--temperature N] [--command-timeout N] [--stdin] "<PROMPT>"
 
-attini approve [-s NAME] [--grant oneshot|session|workspace]
+attini approve [-s NAME] [--grant oneshot|session|workspace] [--command-timeout N]
 ```
 
 `--stdin` reads standard input (until EOF) and appends it to the prompt as a
@@ -112,6 +112,13 @@ can also be set via `ATTINI_TEMPERATURE`.
 `--system-prompt TEXT` prepends a system message to the conversation. It can
 also be set via `ATTINI_SYSTEM_PROMPT`; precedence is CLI flag, then env var,
 then none.
+
+`--command-timeout N` caps how long a single `command` tool call may run, in
+seconds (default 180). The child runs in its own process group and is killed
+with SIGTERM (then SIGKILL after a one-second grace) on expiry; the tool
+result then reports `termination_reason: "timeout"`. `0` disables the cap. It
+can also be set via `ATTINI_COMMAND_TIMEOUT_SECONDS`; precedence is CLI flag,
+then env var, then the 180-second default.
 
 DeepSeek thinking mode is always **disabled**: attini sends
 `{"thinking":{"type":"disabled"}}` on every request and offers no way to
@@ -305,4 +312,5 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
 | `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). |
 | `ATTINI_SYSTEM_PROMPT` | Default system prompt when `--system-prompt` is omitted. Precedence: CLI flag, then this env var, then none. |
+| `ATTINI_COMMAND_TIMEOUT_SECONDS` | Default `command` tool timeout in seconds when `--command-timeout` is omitted. Precedence: CLI flag, then this env var, then 180. `0` disables the cap. |
 | `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line status that `attini tell` prints to stderr at invocation start. Unset (or any other value) keeps it on. |
