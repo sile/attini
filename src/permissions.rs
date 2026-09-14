@@ -102,9 +102,9 @@ fn parse_rule_line(line: &str) -> Result<Rule, String> {
     let json = RawJson::parse(line).map_err(|e| e.to_string())?;
     let value = json.value();
     let type_str = required_string(value, "type")?;
-    let allow = required_bool(value, "allow")?;
     match type_str.as_str() {
         "command" => {
+            let allow = required_bool(value, "allow")?;
             let args_prefix = required_string_array(value, "args_prefix")?;
             if args_prefix.is_empty() {
                 return Err("args_prefix is empty".to_string());
@@ -119,9 +119,19 @@ fn parse_rule_line(line: &str) -> Result<Rule, String> {
             if path.trim().is_empty() {
                 return Err("path is empty".to_string());
             }
-            Ok(Rule::read(allow, path))
+            // Read rules are allow-only: `allow` may be omitted (or
+            // `true`), but `allow:false` is rejected because a read deny
+            // cannot be enforced (the model can always read via the
+            // `command` tool).
+            match optional_bool(value, "allow")? {
+                None | Some(true) => Ok(Rule::read(path)),
+                Some(false) => {
+                    Err("read rules are allow-only; `allow:false` is not supported".to_string())
+                }
+            }
         }
         "write" => {
+            let allow = required_bool(value, "allow")?;
             let path = required_string(value, "path")?;
             if path.trim().is_empty() {
                 return Err("path is empty".to_string());
@@ -158,6 +168,22 @@ fn required_bool(value: RawJsonValue<'_, '_>, key: &str) -> Result<bool, String>
     }
 }
 
+/// Read an optional boolean member. Returns `Ok(None)` when the key is
+/// absent, `Ok(Some(b))` when present and boolean, and an error when
+/// the key is present but not a boolean.
+fn optional_bool(value: RawJsonValue<'_, '_>, key: &str) -> Result<Option<bool>, String> {
+    let member = match value.to_member(key).and_then(|m| m.required()) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let raw = member.as_boolean_str().map_err(|e| format!("{key}: {e}"))?;
+    match raw {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        other => Err(format!("{key}: expected a boolean (got {other})")),
+    }
+}
+
 fn required_string_array(value: RawJsonValue<'_, '_>, key: &str) -> Result<Vec<String>, String> {
     let member = value
         .to_member(key)
@@ -183,7 +209,11 @@ impl DisplayJson for Rule {
     fn fmt(&self, f: &mut JsonFormatter<'_, '_>) -> std::fmt::Result {
         f.object(|f| {
             f.member("type", self.kind.as_str())?;
-            f.member("allow", self.allow)?;
+            // Read rules are allow-only, so `allow` is omitted (implied
+            // `true`). Command and write rules always carry `allow`.
+            if self.kind != PermissionKind::Read {
+                f.member("allow", self.allow)?;
+            }
             match self.kind {
                 PermissionKind::Command => {
                     f.member("args_prefix", &self.args_prefix)?;
@@ -221,7 +251,6 @@ pub enum GrantError {
     SessionMissing(PathBuf),
     ReadError(PathBuf, io::Error),
     ExistingDenyConflict(PathBuf, Vec<String>),
-    ExistingReadDenyConflict(PathBuf, String),
     ExistingWriteDenyConflict(PathBuf, String),
     Io(io::Error),
 }
@@ -241,11 +270,6 @@ impl std::fmt::Display for GrantError {
             Self::ExistingDenyConflict(p, args_prefix) => write!(
                 f,
                 "command rule for args_prefix {args_prefix:?} already exists as `allow:false` in {}; edit manually to resolve",
-                p.display()
-            ),
-            Self::ExistingReadDenyConflict(p, path) => write!(
-                f,
-                "read rule for path {path:?} already exists as `allow:false` in {}; edit manually to resolve",
                 p.display()
             ),
             Self::ExistingWriteDenyConflict(p, path) => write!(
@@ -306,10 +330,10 @@ pub fn grant(scope: GrantScope<'_>, args_prefix: &[String]) -> Result<GrantOutco
     Ok(GrantOutcome::Appended(target))
 }
 
-/// Persist an `allow:true` `read` rule for `path` at the given scope.
-/// Mirrors [`grant`] but for the path matcher: an existing identical
-/// `allow:true` rule is a no-op, an existing identical `allow:false`
-/// rule is a conflict (edit manually), and a fresh rule is appended.
+/// Persist a `read` rule for `path` at the given scope. Mirrors
+/// [`grant`] but for the path matcher: `read` rules are allow-only, so
+/// an existing identical rule is a no-op and a fresh rule is appended
+/// (there is no read deny to conflict with).
 pub fn grant_read(scope: GrantScope<'_>, path: &str) -> Result<GrantOutcome, GrantError> {
     if path.trim().is_empty() {
         return Err(GrantError::ArgsEmpty);
@@ -323,15 +347,9 @@ pub fn grant_read(scope: GrantScope<'_>, path: &str) -> Result<GrantOutcome, Gra
         if rule.path != path {
             continue;
         }
-        return match rule.allow {
-            true => Ok(GrantOutcome::AlreadyGranted(target)),
-            false => Err(GrantError::ExistingReadDenyConflict(
-                target,
-                path.to_string(),
-            )),
-        };
+        return Ok(GrantOutcome::AlreadyGranted(target));
     }
-    let rule = Rule::read(true, path.to_string());
+    let rule = Rule::read(path.to_string());
     append_rule_line(&target, &rule)?;
     Ok(GrantOutcome::Appended(target))
 }
@@ -472,6 +490,31 @@ not json
     }
 
     #[test]
+    fn read_rule_may_omit_allow() {
+        let text = r#"{"type":"read","path":"../docs/"}
+"#;
+        let dir = tempdir("jsonl_read_no_allow");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].kind, PermissionKind::Read);
+        assert!(rules[0].allow);
+        assert_eq!(rules[0].path, "../docs/");
+    }
+
+    #[test]
+    fn read_rule_with_allow_false_is_skipped() {
+        // Read rules are allow-only; `allow:false` is not supported and
+        // the line is rejected (reported and skipped).
+        let text = r#"{"type":"read","allow":false,"path":"secret/"}
+"#;
+        let dir = tempdir("jsonl_read_deny");
+        let path = dir.join(PERMISSIONS_FILENAME);
+        let rules = parse_jsonl(text, &path, "workspace");
+        assert!(rules.is_empty());
+    }
+
+    #[test]
     fn unknown_type_is_skipped() {
         let text = r#"{"type":"bogus","allow":true,"path":"src/"}
 "#;
@@ -508,10 +551,11 @@ not json
             render_rule_line(&cmd),
             r#"{"type":"command","allow":true,"args_prefix":["cargo","test"]}"#
         );
-        let read = Rule::read(false, "secret/".to_string());
+        // Read rules are allow-only: `allow` is omitted from the line.
+        let read = Rule::read("secret/".to_string());
         assert_eq!(
             render_rule_line(&read),
-            r#"{"type":"read","allow":false,"path":"secret/"}"#
+            r#"{"type":"read","path":"secret/"}"#
         );
         let write = Rule::write(true, "src/".to_string());
         assert_eq!(

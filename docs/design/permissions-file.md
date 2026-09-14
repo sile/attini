@@ -1,9 +1,10 @@
 # The permissions file: format and evaluation
 
-**Status:** Implemented (format + last-match-wins evaluation, plus `read` and
-`write` enforcement). The `docs/deferred/permissions-json-editability.md` memo is
-superseded by this document and has been removed. The `read` denial to approval
-path is implemented (`docs/deferred/read-outside-workspace-approval.md`); the
+**Status:** Implemented (format + last-match-wins evaluation, plus `read` grant
+and `write` enforcement). The `docs/deferred/permissions-json-editability.md`
+memo is superseded by this document and has been removed. `read` rules are
+allow-only and widen the read roots; a read outside the workspace is promoted to
+an approval request (`docs/deferred/read-outside-workspace-approval.md`). The
 `write` type is implemented (`docs/design/write-permission-type.md`).
 
 ## Why change it
@@ -49,10 +50,8 @@ file uses JSON double quotes.
 {'type':'command','allow':true,'args_prefix':['cargo','test']}
 # deny destructive rm
 {'type':'command','allow':false,'args_prefix':['rm']}
-# read outside the workspace
-{'type':'read','allow':true,'path':'../docs/'}
-# but not this directory
-{'type':'read','allow':false,'path':'secret/'}
+# read outside the workspace (read rules are allow-only)
+{'type':'read','path':'../docs/'}
 # let the model write under src/ without prompting
 {'type':'write','allow':true,'path':'src'}
 # never touch generated output
@@ -61,9 +60,12 @@ file uses JSON double quotes.
 
 - `type` (string, required): one of `command`, `read`, or `write`. See
   `docs/design/write-permission-type.md` for the `write` type.
-- `allow` (bool, required): `true` = allow, `false` = deny. There is no
-  implicit/pending value: an omitted `allow` is an error, so a typo never
-  silently turns a rule off.
+- `allow` (bool): `true` = allow, `false` = deny. It is **required** for
+  `command` and `write` rules: there is no implicit/pending value, so an
+  omitted `allow` is an error and a typo never silently turns a rule off.
+  `read` rules are **allow-only**: `allow` may be omitted (meaning `true`),
+  and `allow:false` is a load error (a read deny cannot be enforced; see
+  "Why read has no deny").
 - `command` adds `args_prefix` (array of strings, required). It matches when
   the rule's prefix is a token-wise prefix of the command's argv.
 - `read` adds `path` (string, required). It matches when the requested path is
@@ -141,14 +143,33 @@ All kinds of rule are enforced:
 
 - A `command` rule decides whether a `command` call auto-runs, auto-denies, or
   falls through to the per-call approval flow.
-- A `read` rule is consulted before a `read`/`list`/`search` runs. A winning
-  `allow:true` rule (or the workspace/granted roots) lets it through; a winning
-  `allow:false` rule parks the call as an approval request rather than a silent
-  success or a plain error. See `docs/deferred/read-outside-workspace-approval.md`.
+- A `read` rule widens the roots a `read`/`list`/`search` may reach (an
+  `allow` rule grants access to a path outside the workspace). It is not a
+  gate: see "Why read has no deny". A read outside the workspace (and every
+  granted root) is parked as a one-shot approval request. See
+  `docs/deferred/read-outside-workspace-approval.md`.
 - A `write` rule is consulted by the patch tool's write guard, before the
   git-tracking heuristic. `allow:true` permits the write (even untracked);
   `allow:false` refuses it (even tracked). See
   `docs/design/write-permission-type.md`.
+
+## Why read has no deny
+
+A `read` rule is allow-only. A read deny cannot be enforced: the model can read
+any file it can name through the `command` tool (`cat`, `grep`, ...), and the
+workspace boundary only limits the `read`/`list`/`search` tools, not `command`.
+Closing every such bypass would mean parsing command lines, which is open-ended
+and not worth it. A read deny would therefore be a promise the tool cannot
+keep, which is worse than no promise at all.
+
+The rule for read access is the same as for the rest of the workspace: whatever
+the model may read should simply live where it may reach. If a file must not be
+read, keep it out of the workspace (or out of reach) rather than writing a
+`read` `allow:false` rule.
+
+`write` is different: a write is destructive and hard to undo, so it is worth
+gating even though the model could also route around it. Precision pays off
+there; for reads it does not.
 
 ## History output
 
@@ -161,7 +182,6 @@ This lets a reader reconstruct which layer's rule produced the final answer.
 
 - `docs/design/tool-call.md` -- how an approval-requiring call is parked and
   resumed.
-- `docs/deferred/read-outside-workspace-approval.md` -- how a `read` denial
-  (outside the workspace, or a winning `allow:false` rule) becomes an approval
-  request.
+- `docs/deferred/read-outside-workspace-approval.md` -- how a read outside the
+  workspace becomes an approval request.
 - `docs/design/write-permission-type.md` -- the `write` type.

@@ -139,12 +139,12 @@ on" — however the stop happened:
 - **Pending tool call** (the loop suspended for approval): the call is approved
   and executed, then the turn continues. A pending call is a `patch`, a
   `command`, or a `read`/`list`/`search` that targeted a path **outside the
-  workspace** or one **denied by a `read` `allow:false` rule**. The read case is
-  a **one-shot** grant by default: that single call is allowed through, nothing
-  is written to `permissions.jsonl`, and a later read of the same path asks
-  again. To make it stick, use `--grant session|workspace` (which appends an
-  allow `read` rule — workspace-relative inside the workspace, absolute outside
-  it), or add a `read` rule to `permissions.jsonl` by hand.
+  workspace**. The read case is a **one-shot** grant by default: that single
+  call is allowed through, nothing is written to `permissions.jsonl`, and a
+  later read of the same path asks again. To make it stick, use
+  `--grant session|workspace` (which appends a `read` rule —
+  workspace-relative inside the workspace, absolute outside it), or add a
+  `read` rule to `permissions.jsonl` by hand.
 - **Transport failure** (a model call failed at the connection level — reset,
   timeout, DNS — before any assistant output was recorded): the *identical*
   request is re-issued. Nothing is appended, so a transient outage can be
@@ -185,12 +185,12 @@ do not have to edit `permissions.jsonl` by hand afterward:
 
 What gets persisted depends on the pending call's **kind**: a `command` stores
 its args-prefix (`{"type":"command","allow":true,"args_prefix":[...]}`), a
-`read` stores its path (`{"type":"read","allow":true,"path":...}`), and a
-`patch` stores its path as a `write` rule (`{"type":"write","allow":true,"path":...}`).
-Inside the workspace that path is workspace-relative, the shape rules are
-written in; outside it, the absolute path is kept. `SCOPE` keeps the same
-meaning throughout — how long the grant lives — so one flag covers all three
-kinds.
+`read` stores its path (`{"type":"read","path":...}` — read rules are
+allow-only, so `allow` is omitted), and a `patch` stores its path as a `write`
+rule (`{"type":"write","allow":true,"path":...}`). Inside the workspace that
+path is workspace-relative, the shape rules are written in; outside it, the
+absolute path is kept. `SCOPE` keeps the same meaning throughout — how long the
+grant lives — so one flag covers all three kinds.
 
 Approval and grant are independent: the approval always stands, and a grant that
 cannot be written (already granted, a conflicting deny rule, or an I/O error) is
@@ -250,19 +250,20 @@ boundary (never splitting an `assistant -> tool` pair), roughly halving the file
 
 Permissions live in plain `permissions.jsonl` files -- **JSONL**: one rule per
 line, `#` comments allowed, edited by hand. Each rule has `type` (`command`,
-`read`, or `write`) and `allow`
-(`true`/`false`), and the layer a rule belongs to is the file it lives in:
-`.attini/permissions.jsonl` (workspace) or `.attini/<NAME>/permissions.jsonl`
-(session). Evaluation is last-match-wins over `workspace ++ session`, so a
-session rule overrides a workspace one.
+`read`, or `write`); `command` and `write` rules carry `allow`
+(`true`/`false`), while `read` rules are allow-only and omit it. The layer a
+rule belongs to is the file it lives in: `.attini/permissions.jsonl`
+(workspace) or `.attini/<NAME>/permissions.jsonl` (session). Evaluation is
+last-match-wins over `workspace ++ session`, so a session rule overrides a
+workspace one.
 
 ```jsonl
 # allow cargo test
 {"type":"command","allow":true,"args_prefix":["cargo","test"]}
 # deny destructive rm
 {"type":"command","allow":false,"args_prefix":["rm"]}
-# read outside the workspace
-{"type":"read","allow":true,"path":"../docs/"}
+# read outside the workspace (read rules are allow-only)
+{"type":"read","path":"../docs/"}
 # let the model write under src/ without prompting
 {"type":"write","allow":true,"path":"src"}
 # never touch generated output
@@ -273,6 +274,12 @@ A `write` rule governs `patch` edit targets before the git-tracking heuristic: a
 winning `allow:true` rule permits a write even to an untracked file; a winning
 `allow:false` rule refuses one even to a tracked file. See the `patch` row in
 *Agent tools* below.
+
+A `read` rule **widens** the roots a `read`/`list`/`search` may reach; it is not
+a gate. There is no `read` deny, and `allow:false` on a `read` rule is a load
+error, because a read deny cannot be enforced (the model can always read through
+the `command` tool). Keep a file you do not want read out of the workspace rather
+than writing a deny rule.
 
 Rules are added by hand, or through `attini approve --grant` (see the Approving
 section above), which folds a persistent rule into the approval you were already

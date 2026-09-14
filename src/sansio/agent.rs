@@ -92,9 +92,8 @@ impl ReadOnlyTool {
                 description: "List files and directories under a workspace-relative path. \
                      Returns a JSON array of {path, kind, size} entries; the \
                      result includes truncated:true when max_entries is hit. \
-                     A path outside the workspace, or one denied by a read \
-                     rule, requires one-shot human approval before it can be \
-                     listed."
+                     A path outside the workspace requires one-shot human \
+                     approval before it can be listed."
                     .to_string(),
                 parameters_json: LIST_PARAMS_SCHEMA.to_string(),
             },
@@ -103,9 +102,8 @@ impl ReadOnlyTool {
                 description: "Read a UTF-8 text file at a workspace-relative path. \
                      Optionally restrict to a 1-indexed inclusive [start, end] \
                      line range. Content is truncated to the first 1 MiB. \
-                     A path outside the workspace, or one denied by a read \
-                     rule, requires one-shot human approval before it can be \
-                     read."
+                     A path outside the workspace requires one-shot human \
+                     approval before it can be read."
                     .to_string(),
                 parameters_json: READ_PARAMS_SCHEMA.to_string(),
             },
@@ -115,8 +113,7 @@ impl ReadOnlyTool {
                      optional workspace-relative prefix. Returns \
                      {path, line, snippet} hits; binary or non-UTF-8 files \
                      are silently skipped. A path_prefix outside the \
-                     workspace, or one denied by a read rule, requires \
-                     one-shot human approval."
+                     workspace requires one-shot human approval."
                     .to_string(),
                 parameters_json: SEARCH_PARAMS_SCHEMA.to_string(),
             },

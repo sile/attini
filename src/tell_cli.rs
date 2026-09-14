@@ -16,8 +16,7 @@ use crate::sansio::agent::{
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{
-    Authorization, AutoDecision, Judgment, Rule, RuleScope, ScopedRules, evaluate, evaluate_read,
-    evaluate_write,
+    Authorization, AutoDecision, Judgment, Rule, RuleScope, evaluate, evaluate_write,
 };
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, AutoDecidedMatch, ChatMessageWithTs, InvocationEndReason,
@@ -760,7 +759,7 @@ fn drive(
                         // Left unanswered so the orphan-repair pass can
                         // cancel it in tool-call order on resume.
                     } else {
-                        match run_read_only(tc, executor, &permission_layers, &cfg.authorization) {
+                        match run_read_only(tc, executor) {
                             ReadOnlyDispatch::Done {
                                 summary,
                                 content,
@@ -1821,11 +1820,9 @@ fn plan_grant(
                 })?;
             match read_extra_root(&inv, workspace_root) {
                 // Persist an in-workspace target as a workspace-relative
-                // path, the same shape the `read` deny check evaluates
-                // (`workspace_relative_read_target`), so a grant and a
-                // deny rule compare like-for-like under last-match-wins.
-                // Out-of-workspace targets keep the absolute canonical
-                // path, which the executor accepts as a root.
+                // path (the shape a human writes by hand). Out-of-workspace
+                // targets keep the absolute canonical path, which the
+                // executor accepts as a root.
                 Some(path) => Ok(Some(GrantIntent::Read(grant_read_path(
                     &path,
                     workspace_root,
@@ -2007,34 +2004,14 @@ enum ReadOnlyDispatch {
 /// in the `Done` case is `true` iff the returned content is a
 /// `tool_error_json` payload.
 ///
-/// `permission_layers` is consulted for a workspace-internal `read`
-/// `allow:false` rule (case 2): if the winning rule denies the target,
-/// the call is parked for a one-shot approval instead of being answered
-/// with a silent error. The deny check runs before the executor so a
-/// deny rule short-circuits even though the path is inside a root the
-/// executor would otherwise accept.
-fn run_read_only(
-    tc: &ToolCall,
-    executor: &ToolExecutor,
-    permission_layers: &[ScopedRules<'_>],
-    authorization: &Authorization,
-) -> ReadOnlyDispatch {
+/// `read` rules only widen the executor's roots (they are allow-only),
+/// so there is no permission gate here: a read either lands inside a
+/// known root or falls out of the workspace and is parked for one-shot
+/// approval.
+fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> ReadOnlyDispatch {
     match ReadOnlyTool::parse(&tc.function_name, &tc.arguments_json) {
         Ok(inv) => {
             let args_summary = summarize_read_only(&inv);
-            // Case 2: a `read` `allow:false` rule that wins the override
-            // chain turns the read into an approval request, even when the
-            // path is inside the workspace.
-            if let Some(rel) = workspace_relative_read_target(&inv, executor.root())
-                && let Judgment::AutoDeny(_) =
-                    evaluate_read(permission_layers, Path::new(&rel), authorization)
-            {
-                let preview = format!(r#"{args_summary} (denied by a read rule)"#);
-                return ReadOnlyDispatch::NeedsApproval {
-                    summary: format!("[{args_summary}] approval required"),
-                    preview,
-                };
-            }
             match executor.execute(inv.clone()) {
                 ToolOutcome::Ok(payload) => {
                     let mut summary = format!("[{args_summary}] ok");
@@ -2091,35 +2068,13 @@ fn read_only_target(inv: &ReadOnlyTool) -> Option<&str> {
     }
 }
 
-/// Resolve a read-only call's target to a workspace-relative path (with
-/// `/`-separated components preserved as written) for the purpose of
-/// matching `read` rules. Returns `None` when there is no target, the
-/// target resolves outside the workspace, or it cannot be canonicalised.
-///
-/// Rule paths are stored as the human wrote them (usually
-/// workspace-relative, e.g. `src/secret`), so an in-workspace target is
-/// reduced to that same shape before matching.
-fn workspace_relative_read_target(inv: &ReadOnlyTool, workspace_root: &Path) -> Option<String> {
-    let target = read_only_target(inv)?;
-    let candidate = if Path::new(target).is_absolute() {
-        PathBuf::from(target)
-    } else {
-        workspace_root.join(target)
-    };
-    let canon = candidate.canonicalize().ok()?;
-    let root = workspace_root.canonicalize().ok()?;
-    let rel = canon.strip_prefix(&root).ok()?;
-    Some(rel.to_string_lossy().into_owned())
-}
-
-/// The path to persist in a `read` allow rule for a granted read.
+/// The path to persist in a `read` rule for a granted read.
 ///
 /// Inside the workspace, the rule is stored workspace-relative (e.g.
-/// `secret_dir/secret.txt`) so it matches the same form the `read` deny
-/// check evaluates — otherwise an absolute allow rule and a relative
-/// deny rule would not compare under last-match-wins. Outside the
-/// workspace, the absolute canonical path is kept, since the executor
-/// accepts it as a root and there is no workspace-relative form.
+/// `secret_dir/secret.txt`) because that is the shape a human writes by
+/// hand. Outside the workspace, the absolute canonical path is kept,
+/// since the executor accepts it as a root and there is no
+/// workspace-relative form.
 fn grant_read_path(canonical: &Path, workspace_root: &Path) -> String {
     let root = workspace_root
         .canonicalize()
@@ -4149,53 +4104,13 @@ mod tests {
             function_name: "read".to_string(),
             arguments_json: format!(r#"{{"path":"{}"}}"#, cwd_file.display()),
         };
-        match run_read_only(&tc, &executor, &[], &Authorization::PerTool) {
+        match run_read_only(&tc, &executor) {
             ReadOnlyDispatch::NeedsApproval { summary, preview } => {
                 assert!(summary.contains("approval required"), "{summary}");
                 assert!(preview.contains("outside workspace"), "{preview}");
             }
             ReadOnlyDispatch::Done { content, .. } => {
                 panic!("expected approval request, got: {content}")
-            }
-        }
-        let _ = std::fs::remove_dir_all(&workspace);
-    }
-
-    #[test]
-    fn run_read_only_needs_approval_for_denied_workspace_path() {
-        // Case 2: a `read` `allow:false` rule denies an in-workspace path,
-        // so the read is parked for approval rather than silently allowed.
-        let workspace =
-            std::env::temp_dir().join(format!("attini-read-deny-ws-{}", std::process::id()));
-        std::fs::create_dir_all(workspace.join("secret")).unwrap();
-        std::fs::write(workspace.join("secret/data.txt"), "top secret").unwrap();
-        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
-        let rule = Rule::read(false, "secret".to_string());
-        let layers = [(RuleScope::Workspace, std::slice::from_ref(&rule))];
-        let tc = ToolCall {
-            id: "call_y".to_string(),
-            function_name: "read".to_string(),
-            arguments_json: r#"{"path":"secret/data.txt"}"#.to_string(),
-        };
-        match run_read_only(&tc, &executor, &layers, &Authorization::PerTool) {
-            ReadOnlyDispatch::NeedsApproval { summary, preview } => {
-                assert!(summary.contains("approval required"), "{summary}");
-                assert!(preview.contains("denied by a read rule"), "{preview}");
-            }
-            ReadOnlyDispatch::Done { content, .. } => {
-                panic!("expected approval request, got: {content}")
-            }
-        }
-        // Without the deny rule, the same read runs inline.
-        match run_read_only(&tc, &executor, &[], &Authorization::PerTool) {
-            ReadOnlyDispatch::Done {
-                content, errored, ..
-            } => {
-                assert!(!errored);
-                assert!(content.contains("top secret"), "{content}");
-            }
-            ReadOnlyDispatch::NeedsApproval { .. } => {
-                panic!("expected inline read without the deny rule")
             }
         }
         let _ = std::fs::remove_dir_all(&workspace);

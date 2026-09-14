@@ -1,14 +1,17 @@
-//! Pure permission judgment for `command` and `read` tool invocations.
+//! Pure permission judgment for `command`, `read` and `write` tool
+//! invocations.
 //!
 //! Rules come from the JSONL permissions files (see
-//! `docs/design/permissions-file.md`). Each rule is a `command` rule
-//! (argv-prefix matcher) or a `read` rule (recursive path matcher),
-//! and carries an explicit `allow` boolean. Evaluation is
-//! **last-match-wins** over the concatenated list
-//! `[workspace] ++ [session]`; if no rule matches, the
-//! outcome is `Pending`. No I/O — file loading and session record
-//! writing live in the impl-layer `crate::permissions` and
-//! `crate::tell_cli`.
+//! `docs/design/permissions-file.md`). A `command` rule is an
+//! argv-prefix matcher; a `read` rule grants access to a path
+//! (recursive, allow-only); a `write` rule is a recursive path matcher
+//! that may be `allow` or `deny`. For `command` and `write`, evaluation
+//! is **last-match-wins** over the concatenated list
+//! `[workspace] ++ [session]`; if no rule matches, the outcome is
+//! `Pending`. `read` has no deny, so it is not evaluated as a gate —
+//! its rules only widen the executor's read roots. No I/O — file
+//! loading and session record writing live in the impl-layer
+//! `crate::permissions` and `crate::tell_cli`.
 
 use std::path::Path;
 
@@ -46,9 +49,11 @@ impl PermissionKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub kind: PermissionKind,
-    /// `true` = allow, `false` = deny. Always present on disk: an
-    /// omitted `allow` is a load error, so a typo never silently
-    /// turns a rule off.
+    /// `true` = allow, `false` = deny. Always present on disk for
+    /// `command` and `write` rules; an omitted `allow` is a load error,
+    /// so a typo never silently turns a rule off. `read` rules are
+    /// allow-only: `allow` may be omitted (meaning `true`) and
+    /// `allow:false` is a load error.
     pub allow: bool,
     /// `command`: the argv prefix to match (token-wise).
     /// `read`/`write`: unused.
@@ -68,10 +73,12 @@ impl Rule {
         }
     }
 
-    pub fn read(allow: bool, path: String) -> Self {
+    /// A `read` rule. Read rules are allow-only (they grant access to a
+    /// path); there is no `read` deny, so `allow` is always `true`.
+    pub fn read(path: String) -> Self {
         Self {
             kind: PermissionKind::Read,
-            allow,
+            allow: true,
             args_prefix: Vec::new(),
             path,
         }
@@ -177,39 +184,11 @@ pub fn evaluate(
     finish_decision(matches)
 }
 
-/// Evaluate a read-only request (a canonicalised absolute path) against
-/// the permission rules. Same last-match-wins semantics as `evaluate`,
-/// but matching uses recursive path components.
-pub fn evaluate_read(
-    layers: &[ScopedRules<'_>],
-    path: &Path,
-    _authorization: &Authorization,
-) -> Judgment {
-    let mut matches: Vec<RuleMatch> = Vec::new();
-    for (scope, rules) in layers {
-        for rule in rules.iter() {
-            if rule.kind != PermissionKind::Read {
-                continue;
-            }
-            if rule_matches_path(rule, path) {
-                matches.push(RuleMatch {
-                    scope: *scope,
-                    kind: rule.kind,
-                    allow: rule.allow,
-                    args_prefix: Vec::new(),
-                    path: rule.path.clone(),
-                    adopted: false,
-                });
-            }
-        }
-    }
-    finish_decision(matches)
-}
-
 /// Evaluate a `patch` edit target (a workspace-relative path, as
 /// written by the model, or the canonical path it maps to) against the
-/// permission rules. Same last-match-wins semantics as `evaluate_read`;
-/// `write` and `read` are distinct kinds and do not cross-match.
+/// permission rules. Same last-match-wins semantics as `evaluate`; a
+/// `write` rule is distinct from `command` and `read` kinds and does not
+/// cross-match them.
 pub fn evaluate_write(
     layers: &[ScopedRules<'_>],
     path: &Path,
@@ -447,30 +426,12 @@ mod tests {
 
     #[test]
     fn read_rule_matches_recursively_on_segments() {
-        let r = Rule::read(true, "foo/bar".to_string());
-        let layers = [(RuleScope::Workspace, r.as_slice())];
-        assert!(matches!(
-            evaluate_read(&layers, Path::new("foo/bar"), &Authorization::PerTool),
-            Judgment::AutoApprove(_)
-        ));
-        assert!(matches!(
-            evaluate_read(&layers, Path::new("foo/bar/y/z"), &Authorization::PerTool),
-            Judgment::AutoApprove(_)
-        ));
-        assert!(matches!(
-            evaluate_read(&layers, Path::new("foo/barbaz"), &Authorization::PerTool),
-            Judgment::Pending
-        ));
-    }
-
-    #[test]
-    fn read_deny_rule_denies() {
-        let r = Rule::read(false, "secret".to_string());
-        let layers = [(RuleScope::Workspace, r.as_slice())];
-        assert!(matches!(
-            evaluate_read(&layers, Path::new("secret/x"), &Authorization::PerTool),
-            Judgment::AutoDeny(_)
-        ));
+        // Read rules are allow-only and not evaluated as a gate; their
+        // path matching is exercised directly via `rule_matches_path`.
+        let r = Rule::read("foo/bar".to_string());
+        assert!(rule_matches_path(&r, Path::new("foo/bar")));
+        assert!(rule_matches_path(&r, Path::new("foo/bar/y/z")));
+        assert!(!rule_matches_path(&r, Path::new("foo/barbaz")));
     }
 
     #[test]
@@ -511,7 +472,7 @@ mod tests {
 
     #[test]
     fn write_and_read_rules_do_not_cross_match() {
-        let read_rule = Rule::read(true, "src".to_string());
+        let read_rule = Rule::read("src".to_string());
         let write_rule = Rule::write(true, "src".to_string());
         let layers = [
             (RuleScope::Workspace, read_rule.as_slice()),
@@ -526,21 +487,17 @@ mod tests {
             }
             other => panic!("expected AutoApprove(session write), got {other:?}"),
         }
-        // And the read evaluation ignores the write rule.
-        match evaluate_read(&layers, Path::new("src/lib.rs"), &Authorization::PerTool) {
-            Judgment::AutoApprove(d) => {
-                assert_eq!(d.scope, RuleScope::Workspace);
-                assert_eq!(d.matches.len(), 1);
-                assert_eq!(d.matches[0].kind, PermissionKind::Read);
-            }
-            other => panic!("expected AutoApprove(workspace read), got {other:?}"),
-        }
+        // Read rules are not evaluated as a gate at all, so a read rule
+        // never contributes a match to a write decision (asserted above)
+        // and a write rule is never consulted for reads. The path matcher
+        // stays kind-agnostic, so verify the read rule's shape directly.
+        assert!(rule_matches_path(&read_rule, Path::new("src/lib.rs")));
     }
 
     #[test]
     fn read_and_command_rules_do_not_cross_match() {
         let cmd_rule = cmd(true, &["foo"]);
-        let read_rule = Rule::read(true, "foo".to_string());
+        let read_rule = Rule::read("foo".to_string());
         let layers = [
             (RuleScope::Workspace, cmd_rule.as_slice()),
             (RuleScope::Session, read_rule.as_slice()),
