@@ -21,6 +21,9 @@ use crate::sansio::agent::{
     PatchInvocation, PatchPreview, PatchTool, PreviewContent, READ_MAX_BYTES, ReadOnlyTool,
     ToolExecutionError, ToolOutcome,
 };
+use crate::sansio::permissions::{
+    Authorization, Judgment, Rule, RuleScope, ScopedRules, evaluate_write,
+};
 
 /// Workspace-scoped executor for [`ReadOnlyTool`] invocations.
 #[derive(Debug)]
@@ -40,6 +43,13 @@ pub struct ToolExecutor {
     /// Git repository state captured at startup for the patch tool's
     /// Layer 3 (tracked files) and Layer 4 (not-in-repo) checks.
     git_state: GitState,
+    /// `write` permission rules in increasing precedence (workspace
+    /// layer, then session layer, flattened). Injected after
+    /// construction by the caller once rules are loaded, so `patch`
+    /// writes can be authorised by an explicit rule before falling
+    /// back to the git-tracking heuristic. Empty by default: the
+    /// executor then behaves exactly as before.
+    write_rules: Vec<Rule>,
 }
 
 /// Git repository state as observed by `ToolExecutor::new`.
@@ -82,7 +92,16 @@ impl ToolExecutor {
             extra_read_roots,
             session_name,
             git_state,
+            write_rules: Vec::new(),
         })
+    }
+
+    /// Inject the flattened `write` permission rules (workspace layer
+    /// first, then session layer). Called by the caller after both
+    /// layers are loaded. When empty, patch writes fall back to the
+    /// git-tracking heuristic (Layer 3/4).
+    pub fn set_write_rules(&mut self, write_rules: Vec<Rule>) {
+        self.write_rules = write_rules;
     }
 
     pub fn root(&self) -> &Path {
@@ -787,6 +806,25 @@ impl ToolExecutor {
             && canon.starts_with(&sp_canon)
         {
             return Ok(());
+        }
+        // Explicit `write` rules take precedence over the git-tracking
+        // heuristic. A winning `allow:true` rule permits the write even
+        // when Layer 3 would reject it (untracked / not-a-repo); a
+        // winning `allow:false` rule refuses it even when git tracking
+        // would allow. With no matching rule, fall through to Layer 3/4.
+        // The rules are held flattened; the scope tag is only cosmetic
+        // for the decision record, so a single workspace-labelled layer
+        // is enough for matching here.
+        let layers: [ScopedRules<'_>; 1] = [(RuleScope::Workspace, self.write_rules.as_slice())];
+        match evaluate_write(&layers, &rel, &Authorization::PerTool) {
+            Judgment::AutoApprove(_) => return Ok(()),
+            Judgment::AutoDeny(_) => {
+                return Err(PatchError::ExcludedPath {
+                    path: display_workspace_relative(&rel),
+                    reason: "denied by a write rule".to_string(),
+                });
+            }
+            Judgment::Pending => {}
         }
         // Layer 3 / 4
         match &self.git_state {

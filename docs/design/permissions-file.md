@@ -1,11 +1,10 @@
 # The permissions file: format and evaluation
 
-**Status:** Implemented (format + last-match-wins evaluation, plus `read`
-enforcement and approval). The `docs/deferred/permissions-json-editability.md`
-memo is superseded by this document and has been removed. The `write` type
-remains deferred (`docs/deferred/write-permission-type.md`); the `read` denial to
-approval path is implemented
-(`docs/deferred/read-outside-workspace-approval.md`).
+**Status:** Implemented (format + last-match-wins evaluation, plus `read` and
+`write` enforcement). The `docs/deferred/permissions-json-editability.md` memo is
+superseded by this document and has been removed. The `read` denial to approval
+path is implemented (`docs/deferred/read-outside-workspace-approval.md`); the
+`write` type is implemented (`docs/design/write-permission-type.md`).
 
 ## Why change it
 
@@ -54,10 +53,14 @@ file uses JSON double quotes.
 {'type':'read','allow':true,'path':'../docs/'}
 # but not this directory
 {'type':'read','allow':false,'path':'secret/'}
+# let the model write under src/ without prompting
+{'type':'write','allow':true,'path':'src'}
+# never touch generated output
+{'type':'write','allow':false,'path':'dist'}
 ```
 
-- `type` (string, required): one of `command` or `read`. (`write` is a
-  future addition; see `docs/deferred/write-permission-type.md`.)
+- `type` (string, required): one of `command`, `read`, or `write`. See
+  `docs/design/write-permission-type.md` for the `write` type.
 - `allow` (bool, required): `true` = allow, `false` = deny. There is no
   implicit/pending value: an omitted `allow` is an error, so a typo never
   silently turns a rule off.
@@ -66,6 +69,9 @@ file uses JSON double quotes.
 - `read` adds `path` (string, required). It matches when the requested path is
   the given path **or under it** -- recursive, on path-segment boundaries. See
   "Path matching" below.
+- `write` adds `path` (string, required). Same recursive, segment-boundary
+  matching as `read`, but it governs `patch` edit targets, not reads. See
+  `docs/design/write-permission-type.md`.
 
 ### Path matching (recursive, not string prefix)
 
@@ -125,13 +131,13 @@ calls, which the single-call approval flow does not require.
 
 ## What is implemented today
 
-The JSONL format, the `command`/`read` types, the required `allow` field, the
-recursive path matching, and last-match-wins evaluation over
+The JSONL format, the `command`/`read`/`write` types, the required `allow` field,
+the recursive path matching, and last-match-wins evaluation over
 `[workspace] ++ [session]` are all in place. Rules are hand-edited; the only
 programmatic writer is `attini approve --grant` (commands and reads), which
 appends a single line and leaves hand-written comments intact.
 
-Both kinds of rule are enforced:
+All kinds of rule are enforced:
 
 - A `command` rule decides whether a `command` call auto-runs, auto-denies, or
   falls through to the per-call approval flow.
@@ -139,6 +145,10 @@ Both kinds of rule are enforced:
   `allow:true` rule (or the workspace/granted roots) lets it through; a winning
   `allow:false` rule parks the call as an approval request rather than a silent
   success or a plain error. See `docs/deferred/read-outside-workspace-approval.md`.
+- A `write` rule is consulted by the patch tool's write guard, before the
+  git-tracking heuristic. `allow:true` permits the write (even untracked);
+  `allow:false` refuses it (even tracked). See
+  `docs/design/write-permission-type.md`.
 
 ## History output
 
@@ -154,4 +164,4 @@ This lets a reader reconstruct which layer's rule produced the final answer.
 - `docs/deferred/read-outside-workspace-approval.md` -- how a `read` denial
   (outside the workspace, or a winning `allow:false` rule) becomes an approval
   request.
-- `docs/deferred/write-permission-type.md` -- adding a `write` type.
+- `docs/design/write-permission-type.md` -- the `write` type.

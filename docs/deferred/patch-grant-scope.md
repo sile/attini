@@ -37,10 +37,11 @@ There is no middle ground of the form "let this model keep patching files under
 
 ## Related
 
-`docs/deferred/write-permission-type.md` records the declarative-file-rule version of
-the same idea (a `write` rule type in `docs/design/permissions-file.md`). A file rule and
-a `--grant` analogue are two shapes of the same thing; if either is revived, decide which
-one subsumes the other before building both.
+`docs/design/write-permission-type.md` records the now-implemented declarative-file-rule
+version of the same idea (a `write` rule type in `docs/design/permissions-file.md`). The
+declarative file rule exists; only the imperative `--grant` analogue is still deferred. A
+file rule and a `--grant` form are two shapes of the same thing; before building the
+`--grant` form, decide whether it adds anything over hand-editing a `write` rule.
 
 ## If revived
 

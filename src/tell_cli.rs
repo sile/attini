@@ -313,11 +313,20 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let loaded = permissions::load(&cfg.session_name)?;
     let candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
     let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
-    let executor = ToolExecutor::new(
+    let mut executor = ToolExecutor::new(
         &cfg.workspace_root,
         extra_read_roots,
         cfg.session_name.clone(),
     )?;
+    // Hand the executor the flattened `write` rules (workspace layer
+    // first, then session layer) so `patch` writes can be authorised by
+    // an explicit rule before falling back to the git-tracking
+    // heuristic. Rules from both layers are concatenated; last-match-wins
+    // is preserved because `evaluate_write` walks the slice in order.
+    let mut write_rules: Vec<Rule> = Vec::new();
+    write_rules.extend(loaded.workspace.iter().cloned());
+    write_rules.extend(loaded.session.iter().cloned());
+    executor.set_write_rules(write_rules);
 
     let start_ts = now_unix_millis();
     session.append(&SessionRecord::InvocationStart {
@@ -2109,6 +2118,7 @@ fn read_extra_root(inv: &ReadOnlyTool, workspace_root: &Path) -> Option<PathBuf>
 }
 
 /// Aggregate verdict of the `write` rules over every edit in a patch.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum WriteVerdict {
     /// Every edit is allowed by a winning `write` `allow:true` rule.
     Allowed,
@@ -2297,6 +2307,9 @@ fn dispatch_patch_unapproved(
     // (revertible, no prompt needed) or every edit is permitted by a
     // `write` `allow:true` rule. Any edit whose winning `write` rule is
     // `allow:false` forces approval, regardless of git tracking.
+    // (`preview_patch` already applies the same `write` rules inside the
+    // executor's Layer 3; this dispatch-level verdict decides whether the
+    // human must be asked, not whether the path is writable at all.)
     let write_verdict =
         patch_write_verdict(&inv, permission_layers, authorization, executor.root());
     let auto_approve = match write_verdict {
@@ -2308,10 +2321,12 @@ fn dispatch_patch_unapproved(
         if !dry_run {
             match executor.apply_patch(&inv, &preview_content) {
                 Ok(paths) => {
-                    eprintln!(
-                        "[patch] auto-approved: {} file(s) (git-tracked)",
-                        paths.len()
-                    );
+                    let via = if matches!(write_verdict, WriteVerdict::Allowed) {
+                        "write rule"
+                    } else {
+                        "git-tracked"
+                    };
+                    eprintln!("[patch] auto-approved: {} file(s) ({via})", paths.len());
                     eprintln!("{}", render_patch_diff(&inv));
                     append_tool(session, messages, &tc.id, patch_result_json(&paths))?;
                 }

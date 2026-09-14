@@ -238,8 +238,8 @@ past 100 MB the next compaction pass drops the records before the midpoint at a 
 boundary (never splitting an `assistant -> tool` pair), roughly halving the file.
 
 Permissions live in plain `permissions.jsonl` files -- **JSONL**: one rule per
-line, `#` comments allowed, edited by hand. Each rule has `type` (`command`
-or `read`) and `allow`
+line, `#` comments allowed, edited by hand. Each rule has `type` (`command`,
+`read`, or `write`) and `allow`
 (`true`/`false`), and the layer a rule belongs to is the file it lives in:
 `.attini/permissions.jsonl` (workspace) or `.attini/<NAME>/permissions.jsonl`
 (session). Evaluation is last-match-wins over `workspace ++ session`, so a
@@ -252,7 +252,16 @@ session rule overrides a workspace one.
 {"type":"command","allow":false,"args_prefix":["rm"]}
 # read outside the workspace
 {"type":"read","allow":true,"path":"../docs/"}
+# let the model write under src/ without prompting
+{"type":"write","allow":true,"path":"src"}
+# never touch generated output
+{"type":"write","allow":false,"path":"dist"}
 ```
+
+A `write` rule governs `patch` edit targets before the git-tracking heuristic: a
+winning `allow:true` rule permits a write even to an untracked file; a winning
+`allow:false` rule refuses one even to a tracked file. See the `patch` row in
+*Agent tools* below.
 
 Rules are added by hand, or through `attini approve --grant` (see the Approving
 section above), which folds a persistent rule into the approval you were already
@@ -269,10 +278,11 @@ giving.
 | `list` | List files and directories under a workspace-relative path | `max_entries` limit (default 200) |
 | `read` | Read a UTF-8 text file | Up to 1 MiB; optional `line_range` |
 | `search` | Literal substring search (no regex) | `max_results` limit (default 50) |
-| `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files are auto-applied; any add or non-tracked edit needs approval. `before` must match exactly once; workspace-boundary check |
+| `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files, or covered by a `write` `allow:true` rule, are auto-applied; any add or non-tracked edit not covered by a rule needs approval. `before` must match exactly once; workspace-boundary check |
 
-`patch` first presents a preview (SHA-256 hashes + a diff summary) and is applied only
-after approval.
+`patch` first presents a preview (file names + a diff body) and is applied only
+after approval, unless every edit is auto-approvable (git-tracked, or allowed by
+a `write` rule).
 
 **Tool call batching:** the model may emit several tool calls in one turn. When a
 turn contains an approval-gated call (a `command`, or a `patch` on a non-tracked

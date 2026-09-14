@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use attini::sansio::agent::{PatchError, PatchInvocation, PatchTool};
+use attini::sansio::permissions::Rule;
 use attini::tools::ToolExecutor;
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -631,6 +632,64 @@ fn layer4_not_in_git_repo_rejects_layer3_writes_but_allows_scratchpad() {
     executor
         .preview_patch(&inv(vec![add(".attini/test/scratchpad/note.md", "hi")]))
         .expect("scratchpad ok even without git");
+}
+
+// ---------------------------------------------------------------
+// write permission rules (Layer 3 precedence override)
+// ---------------------------------------------------------------
+
+#[test]
+fn write_allow_rule_permits_untracked_update() {
+    // A non-tracked Update is refused by Layer 3 (UntrackedTarget)
+    // unless an explicit `write` `allow:true` rule covers it.
+    let root = TempRoot::new("write-allow-untracked");
+    let mut executor = exec_with_git(&root, &[]);
+    root.write("notes/draft.md", b"before\n");
+    executor.set_write_rules(vec![Rule::write(true, "notes".to_string())]);
+    let (hashes, _) = executor
+        .preview_patch(&inv(vec![update("notes/draft.md", "before\n", "after\n")]))
+        .expect("preview under write allow");
+    executor
+        .apply_patch(
+            &inv(vec![update("notes/draft.md", "before\n", "after\n")]),
+            &hashes,
+        )
+        .expect("apply under write allow");
+    assert_eq!(root.read("notes/draft.md"), b"after\n");
+}
+
+#[test]
+fn write_deny_rule_rejects_tracked_update() {
+    // A tracked Update would be allowed by Layer 3, but an explicit
+    // `write` `allow:false` rule overrides it and refuses.
+    let root = TempRoot::new("write-deny-tracked");
+    root.write("tracked.md", b"before\n");
+    let mut executor = exec_with_git(&root, &[]);
+    executor.set_write_rules(vec![Rule::write(false, "tracked.md".to_string())]);
+    let err = executor
+        .preview_patch(&inv(vec![update("tracked.md", "before\n", "after\n")]))
+        .expect_err("reject under write deny");
+    assert!(
+        matches!(err, PatchError::ExcludedPath { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(root.read("tracked.md"), b"before\n", "file untouched");
+}
+
+#[test]
+fn write_rules_absent_falls_back_to_git_heuristic() {
+    // No write rules: a non-tracked Update is still refused, exactly
+    // as before the write-rule feature.
+    let root = TempRoot::new("write-fallback");
+    let executor = exec_with_git(&root, &[]);
+    root.write("untracked.md", b"before\n");
+    let err = executor
+        .preview_patch(&inv(vec![update("untracked.md", "before\n", "after\n")]))
+        .expect_err("reject without rules");
+    assert!(
+        matches!(err, PatchError::UntrackedTarget { .. }),
+        "got {err:?}"
+    );
 }
 
 /// Best-effort relative path constructor for the traversal test.

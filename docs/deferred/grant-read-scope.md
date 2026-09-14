@@ -69,8 +69,8 @@ last-match-wins.
   rule) now park for approval and feed this grant.
 - `docs/deferred/patch-grant-scope.md` — the same asymmetry for patches (no path-based
   `--grant`); still deferred.
-- `docs/deferred/write-permission-type.md` — the declarative-rule version of the write
-  side of the same family (`write` rule type).
+- `docs/design/write-permission-type.md` — the declarative-rule version of the write
+  side of the same family (`write` rule type); implemented.
 
 ## If extended
 
