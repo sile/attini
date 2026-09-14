@@ -115,6 +115,21 @@ can distinguish "not implemented yet" from "intentionally not there".
   rollback across a compaction `Summary` boundary (where the underlying records
   are already replaced) — real cost for a need that existing tools cover.
 
+### 9. Cross-repo handoff
+
+- **What:** a model tool (`handoff_send` / `handoff_take`) that writes a
+  structured "handoff" into another repo's `.attini/handoffs/`, auto-detected
+  on startup, with take-once semantics and a human `list`/`show`/`close` CLI.
+- **Status:** not implemented, and intentionally not planned.
+- **Why not:** the need — carrying context from a session in repo A to a
+  session in repo B — is already met by plain files and one hand-edited rule:
+  repo A writes `scratchpad/relay.md`, then repo B either gets the file copied
+  in or is granted read access via a `read` rule in `permissions.jsonl`. A
+  dedicated tool would touch the approval state machine and introduce a
+  cross-workspace write exception for what is mainly ergonomics. The recipe is
+  written up in
+  [`docs/guides/cross-repo-handoff.md`](../guides/cross-repo-handoff.md).
+
 ## The common thread
 
 All are the same shape: **implicit, convention-based context or delegation
