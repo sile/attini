@@ -694,6 +694,10 @@ enum PidStatus {
     EPerm,
 }
 
+#[expect(
+    unsafe_code,
+    reason = "libc::kill with signal 0 only probes process existence and touches no memory"
+)]
 fn probe_pid(pid: i32) -> PidStatus {
     // SAFETY: `kill` with signal 0 does not send a signal; it only
     // probes whether the process (or one with the same effective

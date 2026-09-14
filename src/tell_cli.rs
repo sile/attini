@@ -1612,7 +1612,11 @@ enum CommandDispatch {
     Continue,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatcher threads the shared tool-call context (session, messages, counters, \
+              rules, executor) through in one call to keep dispatch borrows in one place"
+)]
 fn dispatch_command(
     tc: &ToolCall,
     executor: &ToolExecutor,
@@ -2250,7 +2254,11 @@ enum PatchDispatch {
 /// the working tree is never mutated: auto-approved edits are
 /// skipped and preview errors are not appended. The caller still
 /// receives `Awaiting(Pending)` for edits that need a human.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatcher threads the shared tool-call context (session, messages, counters, \
+              rules, executor) through in one call to keep dispatch borrows in one place"
+)]
 fn dispatch_patch_unapproved(
     tc: &ToolCall,
     executor: &ToolExecutor,

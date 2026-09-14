@@ -92,6 +92,10 @@ pub struct ChildOutput {
 /// SIGKILL after [`KILL_GRACE`]) once the cap elapses. `None` runs
 /// without a cap. Pipes are always drained to EOF, so accumulation
 /// stays bounded by [`COMMAND_MAX_STREAM_BYTES`] regardless.
+#[expect(
+    unsafe_code,
+    reason = "CommandExt::pre_exec is an unsafe API; the closure only calls setpgid(0, 0) in the child after fork"
+)]
 pub fn run_streamed(cmd: &mut Command, timeout: Option<Duration>) -> io::Result<ChildOutput> {
     let started = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -181,6 +185,10 @@ fn wait_with_timeout(
 /// Send `signal` to the process group led by `pid`. Best-effort: a
 /// failure (e.g. the group already exited) is ignored because the
 /// subsequent `try_wait` / `wait` still observes the real status.
+#[expect(
+    unsafe_code,
+    reason = "libc::killpg only reads its arguments and reports failure via the return value"
+)]
 fn kill_group(pid: u32, signal: i32) {
     // SAFETY: `killpg` only reads its arguments; a failure returns -1.
     unsafe {
