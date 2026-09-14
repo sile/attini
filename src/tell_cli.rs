@@ -2407,6 +2407,10 @@ fn render_patch_preview_text(p: &PatchPreview, inv: &PatchInvocation) -> String 
         out.push_str("\n  ");
         out.push_str(path);
     }
+    if let Some(reason) = &p.not_revertible {
+        out.push_str("\n  NOTE: cannot be reverted with `git checkout`: ");
+        out.push_str(reason);
+    }
     out.push('\n');
     out.push_str(&render_patch_diff(inv));
     out
@@ -4023,6 +4027,7 @@ mod tests {
             removed_lines: 1,
             edit_count: 1,
             auto_approve: true,
+            not_revertible: None,
         };
         let out = render_patch_preview_text(&preview, &inv);
         assert!(out.contains("patch preview: 1 edit(s)"), "{out}");
@@ -4038,6 +4043,7 @@ mod tests {
             removed_lines: 1,
             edit_count: 2,
             auto_approve: false,
+            not_revertible: None,
         };
         let plain = render_patch_approval_footer(&preview);
         assert_eq!(

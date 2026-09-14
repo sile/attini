@@ -165,6 +165,7 @@ impl ToolExecutor {
         let mut removed_lines: u64 = 0;
         let mut target_paths: Vec<String> = Vec::with_capacity(invocation.edits.len());
         let mut auto_approve = true;
+        let mut not_revertible: Option<String> = None;
         for edit in &invocation.edits {
             target_paths.push(edit.path().to_string());
             match edit {
@@ -172,7 +173,10 @@ impl ToolExecutor {
                     // A brand-new file is not yet under git control, so
                     // creating it cannot be auto-approved.
                     auto_approve = false;
-                    let full = self.resolve_add_target(path)?;
+                    let (full, guard) = self.resolve_add_target(path)?;
+                    if let WriteGuard::NeedsApproval { reason } = guard {
+                        not_revertible.get_or_insert(reason);
+                    }
                     if full.exists() {
                         return Err(PatchError::AddOnExistingFile { path: path.clone() });
                     }
@@ -187,12 +191,15 @@ impl ToolExecutor {
                     before,
                     after,
                 } => {
-                    let full = self.resolve_update_target(path)?;
-                    // Only edits on files already tracked by git are
-                    // considered safe (revertible). Scratchpad / other
-                    // non-tracked writes still need approval.
-                    if !self.is_git_tracked(&full) {
+                    let (full, guard) = self.resolve_update_target(path)?;
+                    // A git-tracked Update (or one covered by a `write
+                    // allow:true` rule) is safe to auto-approve. A
+                    // `NeedsApproval` guard means the change is not
+                    // revertible with `git checkout`, so the human must
+                    // see it first.
+                    if let WriteGuard::NeedsApproval { reason } = guard {
                         auto_approve = false;
+                        not_revertible.get_or_insert(reason);
                     }
                     let bytes = read_file_capped(&full, path)?;
                     snapshots.push(PreviewContent {
@@ -224,21 +231,9 @@ impl ToolExecutor {
             removed_lines,
             edit_count: invocation.edits.len() as u64,
             auto_approve,
+            not_revertible,
         };
         Ok((snapshots, preview))
-    }
-
-    /// Whether an already-canonical absolute `canon` path is tracked
-    /// by the workspace's git repository (i.e. safe to rewrite without
-    /// an approval prompt). Outside a git repo, returns `false`.
-    fn is_git_tracked(&self, canon: &Path) -> bool {
-        let GitState::Repo { tracked } = &self.git_state else {
-            return false;
-        };
-        let Some(rel) = workspace_relative_canonical(canon, &self.root) else {
-            return false;
-        };
-        tracked.borrow().contains(&rel)
     }
 
     /// Apply all edits atomically in two phases (see `0007` design):
@@ -267,7 +262,7 @@ impl ToolExecutor {
             let step = || -> Result<Prepared, PatchError> {
                 match edit {
                     PatchTool::Add { path, content } => {
-                        let full = self.resolve_add_target(path)?;
+                        let (full, _) = self.resolve_add_target(path)?;
                         if full.exists() {
                             return Err(PatchError::AddOnExistingFile { path: path.clone() });
                         }
@@ -280,7 +275,7 @@ impl ToolExecutor {
                         before,
                         after,
                     } => {
-                        let full = self.resolve_update_target(path)?;
+                        let (full, _) = self.resolve_update_target(path)?;
                         let bytes = read_file_capped(&full, path)?;
                         let expected = snapshot
                             .content
@@ -354,7 +349,7 @@ impl ToolExecutor {
         Ok(applied)
     }
 
-    fn resolve_add_target(&self, rel: &str) -> Result<PathBuf, PatchError> {
+    fn resolve_add_target(&self, rel: &str) -> Result<(PathBuf, WriteGuard), PatchError> {
         // For Add, the file itself does not exist yet. Resolve the
         // parent directory with the read-only path resolver, then
         // append the final component.
@@ -408,11 +403,11 @@ impl ToolExecutor {
             }
         };
         let target = parent_resolved.join(file_name);
-        self.check_patch_write(&target, rel, PatchOp::Add)?;
-        Ok(target)
+        let guard = self.check_patch_write(&target, rel, PatchOp::Add)?;
+        Ok((target, guard))
     }
 
-    fn resolve_update_target(&self, rel: &str) -> Result<PathBuf, PatchError> {
+    fn resolve_update_target(&self, rel: &str) -> Result<(PathBuf, WriteGuard), PatchError> {
         let rel_path = Path::new(rel);
         if rel_path.is_absolute() {
             return Err(PatchError::OutsideWorkspace {
@@ -432,8 +427,8 @@ impl ToolExecutor {
                 });
             }
         };
-        self.check_patch_write(&resolved, rel, PatchOp::Update)?;
-        Ok(resolved)
+        let guard = self.check_patch_write(&resolved, rel, PatchOp::Update)?;
+        Ok((resolved, guard))
     }
 
     /// If `rel_path` syntactically normalises to a location under this
@@ -782,7 +777,7 @@ impl ToolExecutor {
         canon: &Path,
         rel_hint: &str,
         op: PatchOp,
-    ) -> Result<(), PatchError> {
+    ) -> Result<WriteGuard, PatchError> {
         let rel = match workspace_relative_canonical(canon, &self.root) {
             Some(r) => r,
             None => {
@@ -805,7 +800,7 @@ impl ToolExecutor {
         if let Ok(sp_canon) = scratchpad_root(&self.root, &self.session_name).canonicalize()
             && canon.starts_with(&sp_canon)
         {
-            return Ok(());
+            return Ok(WriteGuard::Allow);
         }
         // Explicit `write` rules take precedence over the git-tracking
         // heuristic. A winning `allow:true` rule permits the write even
@@ -817,7 +812,7 @@ impl ToolExecutor {
         // is enough for matching here.
         let layers: [ScopedRules<'_>; 1] = [(RuleScope::Workspace, self.write_rules.as_slice())];
         match evaluate_write(&layers, &rel, &Authorization::PerTool) {
-            Judgment::AutoApprove(_) => return Ok(()),
+            Judgment::AutoApprove(_) => return Ok(WriteGuard::Allow),
             Judgment::AutoDeny(_) => {
                 return Err(PatchError::ExcludedPath {
                     path: display_workspace_relative(&rel),
@@ -826,18 +821,22 @@ impl ToolExecutor {
             }
             Judgment::Pending => {}
         }
-        // Layer 3 / 4
+        // Layer 3 / 4. These no longer hard-reject the write; instead
+        // they ask for human approval (decision D1). The `IgnoredParent`
+        // case stays a hard rejection: a gitignored region is an
+        // explicit user declaration that the path is out-of-scope, not
+        // merely "irrecoverable with git checkout".
         match &self.git_state {
-            GitState::NotARepo => Err(PatchError::NotInGitRepo {
-                path: display_workspace_relative(&rel),
+            GitState::NotARepo => Ok(WriteGuard::NeedsApproval {
+                reason: "the workspace is not a git repository".to_string(),
             }),
             GitState::Repo { tracked } => match op {
                 PatchOp::Update => {
                     if tracked.borrow().contains(&rel) {
-                        Ok(())
+                        Ok(WriteGuard::Allow)
                     } else {
-                        Err(PatchError::UntrackedTarget {
-                            path: display_workspace_relative(&rel),
+                        Ok(WriteGuard::NeedsApproval {
+                            reason: "the target is not tracked by git".to_string(),
                         })
                     }
                 }
@@ -848,7 +847,7 @@ impl ToolExecutor {
                             path: display_workspace_relative(&rel),
                         })
                     } else {
-                        Ok(())
+                        Ok(WriteGuard::Allow)
                     }
                 }
             },
@@ -871,6 +870,20 @@ impl ToolExecutor {
 enum PatchOp {
     Add,
     Update,
+}
+
+/// Outcome of the patch write guard (`check_patch_write`). `Allow`
+/// means the write may proceed without an approval prompt (a git-
+/// tracked Update, a Layer-2 scratchpad path, or a `write allow:true`
+/// rule). `NeedsApproval` means the write must be previewed for the
+/// human, carrying a short reason that explains why the change cannot
+/// be reverted with `git checkout`. Hard rejections (Layer 1 protected
+/// paths, `write allow:false` rules, gitignored parents, workspace
+/// escapes) are returned as `Err(PatchError)` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteGuard {
+    Allow,
+    NeedsApproval { reason: String },
 }
 
 fn display_workspace_relative(rel: &Path) -> String {

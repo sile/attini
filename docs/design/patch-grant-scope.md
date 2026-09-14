@@ -26,14 +26,17 @@ A `--grant` only acts on a **pending** call. A patch parks only when its
 preview succeeds but it is not auto-applied. In practice that is:
 
 - an `Add` of a new, non-gitignored file (the heuristic never auto-approves a
-  new file), or
+  new file),
+- an `Update` on a file not tracked by git (including every non-scratchpad
+  write in a non-git workspace), or
 - an `Update` that a `write allow:true` rule covers but the dispatch layer still
   chooses to prompt.
 
-An `UntrackedTarget` / `IgnoredParent` / `NotInGitRepo` rejection is a hard
-`preview_patch` **error**, not a pending -- so a `--grant` cannot originate from
-it. Those cases are lifted by hand-editing a `write` rule (see
-`docs/design/write-permission-type.md`), not by `--grant`.
+The only remaining hard `preview_patch` **error** for a would-be write is an
+`Add` into a gitignored region (`IgnoredParent`) or a Layer-1 / deny-rule
+protected path; a `--grant` cannot originate from those. A gitignored parent is
+lifted by hand-editing a `write` rule (see `docs/design/write-permission-type.md`),
+not by `--grant`.
 
 ## What is persisted
 

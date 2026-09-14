@@ -36,9 +36,11 @@ heuristic. The guard order is:
    - a winning `allow:false` rule refuses the write, *including* a tracked
      `Update` that the heuristic would otherwise allow.
 4. **Git-tracking heuristic** -- only when no `write` rule matches:
-   tracked `Update` allowed, untracked `Update` refused (`UntrackedTarget`),
-   `Add` refused when the parent is gitignored, and a non-git workspace refuses
-   everything (`NotInGitRepo`).
+   a tracked `Update` is auto-approved; an untracked `Update` and any `Add`
+   in a git repo are writable but require approval (the preview is flagged
+   `not_revertible`); a gitignored parent refuses the `Add` outright
+   (`IgnoredParent`); and a non-git workspace makes every non-scratchpad write
+   require approval. None of these are hard errors except `IgnoredParent`.
 
 So a `write` rule *narrows or widens within the workspace*; it never escapes
 the workspace boundary (Layer 0 / `resolve_within`) or overrides Layer 1.
@@ -48,11 +50,15 @@ the workspace boundary (Layer 0 / `resolve_within`) or overrides Layer 1.
 There are two independent decisions for a patch:
 
 - **Writability** -- enforced by the executor's Layer 3 (`write` rules, then
-  git tracking). If the path is not writable at all, `preview_patch` returns an
-error (`ExcludedPath` for a deny rule, `UntrackedTarget` etc. otherwise).
-- **Whether to prompt** -- the dispatch layer (`dispatch_patch_unapproved`)
-  auto-applies only when every edit is either git-tracked or covered by a
-  winning `allow:true` `write` rule; a `allow:false` rule forces approval.
+  git tracking). The only *hard* rejections left are `ExcludedPath` (Layer 1
+  protected path or a `write` deny rule) and `IgnoredParent` (Add into a
+  gitignored region). An untracked `Update`, a non-git workspace, or a plain
+  `Add` are all *writable*; they just require approval.
+- **Whether to prompt** -- `preview_patch` returns `auto_approve = true` only
+  when every edit is git-tracked or covered by a winning `allow:true` `write`
+  rule. Otherwise the preview is parked for approval and carries a
+  `not_revertible` reason (rendered as a `NOTE:` line in the preview) so the
+  human knows `git checkout` cannot undo it.
 
 A `write` `allow:true` rule makes a non-tracked path both writable and
 auto-approved. A `write` `allow:false` rule makes a tracked path neither

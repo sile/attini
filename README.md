@@ -201,10 +201,13 @@ are pending — is rejected up front. The argv-prefix is truncated the same way 
 the printed suggestion (first two elements, e.g. `cargo test`), so the two never
 disagree.
 
-A `patch` grant is the only way to auto-approve a non-tracked write without
-hand-editing `permissions.jsonl`; note that a hard `UntrackedTarget` rejection at
-preview is not a pending, so it must be lifted by a hand-written `write` rule
-(see the permissions section), not by `--grant`.
+A patch that touches a non-git-tracked path (including any non-scratchpad write
+in a non-git workspace) is still *writable*, but it is parked for approval with a
+`NOTE:` line explaining that `git checkout` cannot undo it. `approve --grant` is
+the way to auto-approve such a write without hand-editing `permissions.jsonl`.
+The only hard refusal left is an `Add` into a gitignored region, which must be
+lifted by a hand-written `write` rule (see the permissions section), not by
+`--grant`.
 
 When an `attini tell` invocation starts, a one-line diagnostic is printed to
 stderr (never stdout, so streamed content and `| jq`/redirects stay clean):

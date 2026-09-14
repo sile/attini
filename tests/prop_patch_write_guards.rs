@@ -410,7 +410,7 @@ fn prop_add_then_update_within_invocation_is_allowed() -> noprop::RunResult {
             .apply_patch(&add_inv, &hashes)
             .expect("apply add for propgen file");
         // Now Update. Without the tracked-set mutation on rename,
-        // this would fail as UntrackedTarget.
+        // this would need approval as an untracked target.
         let update_inv = PatchInvocation {
             edits: vec![PatchTool::Update {
                 path: leaf.clone(),

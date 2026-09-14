@@ -558,19 +558,12 @@ pub enum PatchError {
     /// (`"git metadata"`, `"session runtime state"`, etc.) embedded in
     /// the message; it is not exposed as a separate JSON field.
     ExcludedPath { path: String, reason: String },
-    /// Layer 3 Update reject: the target is not present in the
-    /// startup-captured git tracked set (nor added by an earlier
-    /// successful Add in the same invocation). Writing would be
-    /// irrecoverable, so the write is refused.
-    UntrackedTarget { path: String },
     /// Layer 3 Add reject: the parent directory of the new file is
     /// under a gitignored region, indicating an area the user has
-    /// declared out-of-scope for the repo.
+    /// declared out-of-scope for the repo. Unlike an untracked Update
+    /// (which the shell surfaces for approval), a gitignored parent is
+    /// a hard refusal: the user has explicitly excluded the region.
     IgnoredParent { path: String },
-    /// Layer 4 reject: the workspace is not inside a git repository,
-    /// so Layer 3 cannot judge. Layer 1/2 still apply; writes outside
-    /// scratchpad are refused as the safe default.
-    NotInGitRepo { path: String },
     /// `edits.len()` exceeded [`PATCH_MAX_EDITS`].
     TooManyEdits { count: u64 },
     /// Two edits within the same call named the same target path.
@@ -627,19 +620,9 @@ impl PatchError {
                 "patch_excluded_path",
                 format!("path is runtime-critical ({reason}): {path}"),
             ),
-            Self::UntrackedTarget { path } => (
-                "patch_untracked_target",
-                format!("cannot update git-untracked file (would be irrecoverable): {path}"),
-            ),
             Self::IgnoredParent { path } => (
                 "patch_ignored_parent",
                 format!("cannot add into git-ignored directory: {path}"),
-            ),
-            Self::NotInGitRepo { path } => (
-                "patch_not_in_git_repo",
-                format!(
-                    "workspace is not a git repository; patch refused outside scratchpad: {path}"
-                ),
             ),
             Self::TooManyEdits { count } => (
                 "patch_too_many_edits",
@@ -771,6 +754,12 @@ pub struct PatchPreview {
     /// workspace's git repository, so the shell may apply the patch
     /// without an approval prompt (git makes the change revertible).
     pub auto_approve: bool,
+    /// When set, at least one target cannot be reverted with `git
+    /// checkout` after the write (the path is outside git control, or
+    /// the workspace is not a git repository). Holds a short human
+    /// reason shown in the approval preview. `None` when every target
+    /// is either git-tracked or covered by an explicit `write` rule.
+    pub not_revertible: Option<String>,
 }
 
 /// Approval status of a tool call. Read-only tools always report
@@ -3148,6 +3137,7 @@ mod tests {
             removed_lines: 0,
             edit_count: 1,
             auto_approve: false,
+            not_revertible: None,
         };
         let actions = core.handle_event(Event::PatchPreviewReady {
             request: id,

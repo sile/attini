@@ -516,7 +516,7 @@ fn layer2_syntactic_bypass_does_not_leak_side_effect_outside_scratchpad() {
         "gotcha",
     )]));
     let err = outcome.expect_err("bypass must be rejected");
-    // Either OutsideWorkspace or NotInGitRepo / IgnoredParent — the
+    // Either OutsideWorkspace or IgnoredParent — the
     // point is the side effect must not have created a directory.
     assert!(
         !root.path().join("malicious").exists(),
@@ -527,42 +527,41 @@ fn layer2_syntactic_bypass_does_not_leak_side_effect_outside_scratchpad() {
 #[test]
 fn layer2_other_session_scratchpad_is_not_layer2() {
     // Layer 2 covers only the current session's scratchpad. Other
-    // session's scratchpad falls through to Layer 3 (which sees the
-    // path as untracked → reject on Update, gitignored parent →
-    // reject on Add if `.attini/` is gitignored, else allow on Add).
+    // session's scratchpad falls through to Layer 3, which sees the
+    // path as untracked and therefore requires approval (`NeedsApproval`)
+    // rather than a hard rejection.
     let root = TempRoot::new("layer2-other-session-scratchpad");
     fs::create_dir_all(root.path().join(".attini/other/scratchpad"))
         .expect("mkdir other scratchpad");
     let executor = exec_with_git(&root, &["other"]);
     root.write(".attini/other/scratchpad/notes.md", b"prev\n");
-    let err = executor
+    let (_, preview) = executor
         .preview_patch(&inv(vec![update(
             ".attini/other/scratchpad/notes.md",
             "prev\n",
             "hijack",
         )]))
-        .expect_err("other session scratchpad must not be Layer 2");
-    // File was created after git add, so tracked set does not
-    // contain it → UntrackedTarget for Update.
+        .expect("other session scratchpad previews but needs approval");
+    // File was created after git add, so tracked set does not contain
+    // it → not auto-approved, and flagged as not revertible.
+    assert!(!preview.auto_approve, "must not be Layer 2");
     assert!(
-        matches!(err, PatchError::UntrackedTarget { .. }),
-        "got {err:?}"
+        preview.not_revertible.is_some(),
+        "untracked → not revertible"
     );
 }
 
 #[test]
-fn layer3_update_rejects_untracked_file() {
+fn layer3_update_on_untracked_file_needs_approval() {
     let root = TempRoot::new("layer3-untracked");
     let executor = exec_with_git(&root, &[]);
     // Create AFTER git init → untracked.
     root.write("untracked.md", b"before\n");
-    let err = executor
+    let (_, preview) = executor
         .preview_patch(&inv(vec![update("untracked.md", "before\n", "after\n")]))
-        .expect_err("reject");
-    assert!(
-        matches!(err, PatchError::UntrackedTarget { .. }),
-        "got {err:?}"
-    );
+        .expect("untracked Update previews but needs approval");
+    assert!(!preview.auto_approve);
+    assert!(preview.not_revertible.is_some());
 }
 
 #[test]
@@ -602,7 +601,7 @@ fn layer3_in_invocation_add_then_update_is_allowed() {
     let add_inv = inv(vec![add("new.md", "hello\n")]);
     let (hashes, _) = executor.preview_patch(&add_inv).expect("preview add");
     executor.apply_patch(&add_inv, &hashes).expect("apply add");
-    // Now Update the just-added file. Would fail as UntrackedTarget
+    // Now Update the just-added file. Would need approval (untracked)
     // if the tracked set were only initialised at startup.
     let update_inv = inv(vec![update("new.md", "hello\n", "world\n")]);
     let (hashes, _) = executor.preview_patch(&update_inv).expect("preview update");
@@ -613,25 +612,25 @@ fn layer3_in_invocation_add_then_update_is_allowed() {
 }
 
 #[test]
-fn layer4_not_in_git_repo_rejects_layer3_writes_but_allows_scratchpad() {
+fn layer4_not_in_git_repo_needs_approval_but_allows_scratchpad() {
     // No git init here — Layer 4 fallback kicks in.
     let root = TempRoot::new("layer4-not-a-repo");
     fs::create_dir_all(root.path().join(".attini/test/scratchpad")).expect("mkdir scratchpad");
     let executor =
         ToolExecutor::new(root.path(), Vec::new(), "test".to_string()).expect("executor");
-    // Any non-scratchpad Update / Add is rejected.
+    // Any non-scratchpad Update / Add requires approval outside a repo.
     root.write("outside.md", b"pre\n");
-    let err = executor
+    let (_, preview) = executor
         .preview_patch(&inv(vec![update("outside.md", "pre\n", "post\n")]))
-        .expect_err("reject");
-    assert!(
-        matches!(err, PatchError::NotInGitRepo { .. }),
-        "got {err:?}"
-    );
-    // Scratchpad still writeable (Layer 2 is git-independent).
-    executor
+        .expect("non-scratchpad write previews but needs approval");
+    assert!(!preview.auto_approve);
+    assert!(preview.not_revertible.is_some());
+    // Scratchpad is Layer 2 (git-independent): no git-tracking concern,
+    // so it is not flagged as unrevertible.
+    let (_, sp_preview) = executor
         .preview_patch(&inv(vec![add(".attini/test/scratchpad/note.md", "hi")]))
         .expect("scratchpad ok even without git");
+    assert!(sp_preview.not_revertible.is_none());
 }
 
 // ---------------------------------------------------------------
@@ -640,8 +639,8 @@ fn layer4_not_in_git_repo_rejects_layer3_writes_but_allows_scratchpad() {
 
 #[test]
 fn write_allow_rule_permits_untracked_update() {
-    // A non-tracked Update is refused by Layer 3 (UntrackedTarget)
-    // unless an explicit `write` `allow:true` rule covers it.
+    // A non-tracked Update needs approval under Layer 3 unless an
+    // explicit `write` `allow:true` rule covers it.
     let root = TempRoot::new("write-allow-untracked");
     let mut executor = exec_with_git(&root, &[]);
     root.write("notes/draft.md", b"before\n");
@@ -678,18 +677,16 @@ fn write_deny_rule_rejects_tracked_update() {
 
 #[test]
 fn write_rules_absent_falls_back_to_git_heuristic() {
-    // No write rules: a non-tracked Update is still refused, exactly
-    // as before the write-rule feature.
+    // No write rules: a non-tracked Update still needs approval (not
+    // auto-approved), exactly as before the write-rule feature.
     let root = TempRoot::new("write-fallback");
     let executor = exec_with_git(&root, &[]);
     root.write("untracked.md", b"before\n");
-    let err = executor
+    let (_, preview) = executor
         .preview_patch(&inv(vec![update("untracked.md", "before\n", "after\n")]))
-        .expect_err("reject without rules");
-    assert!(
-        matches!(err, PatchError::UntrackedTarget { .. }),
-        "got {err:?}"
-    );
+        .expect("previews without rules but needs approval");
+    assert!(!preview.auto_approve);
+    assert!(preview.not_revertible.is_some());
 }
 
 /// Best-effort relative path constructor for the traversal test.

@@ -127,8 +127,8 @@ Settled semantics:
   are against attini's philosophy.
 - **Applies to commands, reads, and patches.** The persisted shape is decided by the
   pending call's kind (argv prefix, read path, or `write` path). A patch pending arises
-  from an `Add`/non-tracked edit that reached a prompt; a hard `UntrackedTarget` error is
-  not a pending and is lifted by hand-editing a `write` rule instead. See
+  from an `Add` or a non-tracked `Update` that reached a prompt; a gitignored-parent
+  rejection is not a pending and is lifted by hand-editing a `write` rule instead. See
   `docs/design/patch-grant-scope.md`.
 - **Which prefix gets granted.** Reuse the same truncation `emit_suggested_rule` uses
   (first two argv elements, e.g. `cargo test`) so `--grant session` does not bake in
