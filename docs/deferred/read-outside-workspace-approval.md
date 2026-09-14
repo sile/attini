@@ -1,28 +1,30 @@
-# Read outside the workspace with on-the-spot approval (partially implemented)
+# Read outside the workspace with on-the-spot approval (implemented)
 
-**Status:** Partially implemented. Case 1 (read outside the workspace) is implemented
-as a **one-shot, non-persisted** approval: a read-only call that resolves outside every
-root is parked as a `Pending` (`PendingToolKind::Read`) instead of erroring, and
-`attini approve` re-runs that single call with a one-shot extra read root derived from
-the requested path. Nothing is written to `permissions.jsonl`, so the grant does not
-outlive the call (no resume persistence needed). Case 2 (a `read` `allow:false` rule
-becoming an approval request) is **not** implemented. This memo records the design idea
-related to `docs/design/approve-command.md` (the dedicated `attini approve` command +
-`--grant`) and to `docs/design/permissions-file.md` (the `read` rule type).
+**Status:** Implemented. Case 1 (read outside the workspace) and case 2 (a `read`
+`allow:false` rule) are both implemented as a **one-shot, non-persisted** approval: a
+read-only call that resolves outside every root, or that is denied by a winning `read`
+rule, is parked as a `Pending` (`PendingToolKind::Read`) instead of erroring, and
+`attini approve` re-runs that single call. For an outside path the executor runs with a
+one-shot extra read root derived from the requested path; for a denied path it runs the
+same call (the deny rule is only enforced by the pre-dispatch check, not by the
+executor). Nothing is written to `permissions.jsonl` unless `--grant session|workspace`
+is given, so the default does not outlive the call (no resume persistence needed). This
+memo records the design related to `docs/design/approve-command.md` (the dedicated
+`attini approve` command + `--grant`) and to `docs/design/permissions-file.md` (the
+`read` rule type).
 
 ## Two related cases
 
 This memo covers two shapes of the same itch:
 
-1. **Read outside the workspace.** The path is under no granted root, so today it is
-   rejected outright. The model cannot ask to look at it *now*.
+1. **Read outside the workspace.** The path is under no granted root, so it used to be
+   rejected outright. The model could not ask to look at it *now*.
 2. **Read under a `read` `allow:false` rule.** The path is inside the workspace, but a
-   permission rule denies it. `docs/design/permissions-file.md` makes this a *silent*
-   error today; ideally the model could ask and the human could approve a one-off read.
+   permission rule denies it. This used to be *silently* allowed, since the deny rule was
+   never consulted during read resolution.
 
 Both want the same mechanism: turn a read denial into an approval request instead of a
-flat error. For now (case 2) the design keeps the error, and this memo records the
-ideal.
+flat error. Both are now implemented this way.
 
 ## Problem
 
@@ -38,8 +40,8 @@ awkward when it is discovered mid-task.
 - Read-only resolution goes through `resolve_within_any(workspace_root, extra_read_roots, input)`
   (`src/tools.rs:859`). It accepts a path under `workspace_root` or any of
   `extra_read_roots`. A path outside all roots returns
-  `ToolExecutionError::OutsideWorkspace`, surfaced to the model as a plain tool error.
-  There is no approval hook.
+  `ToolExecutionError::OutsideWorkspace`; `run_read_only` turns that into an approval
+  request. (Historically it was surfaced as a plain tool error with no approval hook.)
 - `extra_read_roots` is built **once** in `run()` (`src/tell_cli.rs:289`) from the
   allow `read` rules in `permissions.jsonl`.
   `canonicalise_extra_read_roots` dedupes and canonicalises. The `ToolExecutor` is then
@@ -84,13 +86,17 @@ become mutable during the loop, or be rebuilt when a new root is granted.
 \* Because of the tool-batching rule (approval-gated calls go last, and anything after
 one is cancelled), a parked read behaves like any other approval-gated call.
 
-## Still open (case 2 and beyond)
+## Still open
 
-- **Case 2: `read` `allow:false`.** A path inside the workspace denied by a `read` rule
-  still returns a silent error; promoting it to an approval request is not done.
 - **Scope of approval.** Done: `attini approve --grant session|workspace` now persists
-  an allow `read` rule (a canonical path) for a `read` pending, alongside the one-shot
-  default. See `docs/design/approve-command.md` and `docs/deferred/grant-read-scope.md`.
+  an allow `read` rule for a `read` pending, alongside the one-shot default. An
+  in-workspace target is stored workspace-relative (the same shape the deny check
+  evaluates), an out-of-workspace target is stored as an absolute canonical path (which
+  the executor accepts as a root). See `docs/design/approve-command.md` and
+  `docs/deferred/grant-read-scope.md`.
+- **`search` without a prefix.** A `search` over the whole workspace (`path_prefix`
+  omitted) has no single target, so the case-2 deny check is skipped for it; a file
+  denied by a rule can still be read indirectly through such a search.
 - **Symmetry.** `list` (directory) vs `read`/`search` (file/prefix) may want different
   approval granularity; the one-shot root currently uses the requested path as-is.
 
@@ -102,36 +108,38 @@ one is cancelled), a parked read behaves like any other approval-gated call.
 - **Persistence key.** Not needed for one-shot. A session/workspace read grant would
   need one (see `grant-read-scope.md`).
 - **Model signal.** Done: the `list` / `read` / `search` tool descriptions state that an
-  outside path requires one-shot human approval.
+  outside path, or one denied by a read rule, requires one-shot human approval.
 
 ## Decision
 
-**Case 1 implemented.** A read outside the workspace is approved one-shot by default;
-`--grant session|workspace` persists an allow `read` rule when the human wants it to
-stick. **Case 2 is deferred** and still needs the `read` `allow:false` evaluation to park
-instead of erroring (see "How to revive").
+**Both cases implemented.** A read outside the workspace, or one denied by a winning
+`read` rule, is approved one-shot by default; `--grant session|workspace` persists an
+allow `read` rule when the human wants it to stick. The deny check runs before the
+executor in `run_read_only`, so an in-workspace `read` `allow:false` rule parks the call
+instead of silently succeeding.
 
 ## Connection to the permissions file
 
 With the JSONL permissions file (`docs/design/permissions-file.md`), a denied read is no
 longer only "outside every root"; it can also be a `read` rule with `allow:false` that
 wins the override chain. That gives the approval flow a cleaner thing to ask about: the
-model requested a specific path, a rule denied it, so approve/deny for *that path*. The
-ideal end state is that both cases (outside the workspace, and denied by a rule) surface
-the same "approve this read?" prompt. For now the file design returns a plain error for
-a denied read; this memo records the promotion into an approval request.
+model requested a specific path, a rule denied it, so approve/deny for *that path*. Both
+cases (outside the workspace, and denied by a rule) now surface the same "approve this
+read?" prompt.
 
-## How to revive (remaining work)
+## How case 2 is implemented
 
-Case 1 (outside-the-workspace) is implemented, including the `--grant session|workspace`
-read scope. The one remaining piece is case 2:
+`run_read_only` (`src/tell_cli.rs`) consults the permission layers before running the
+read. `workspace_relative_read_target` reduces an in-workspace target to its
+workspace-relative form (the shape rule paths are written in, e.g. `secret_dir`), and
+`evaluate_read` runs last-match-wins over `[workspace] ++ [session]`. A winning
+`allow:false` rule yields `ReadOnlyDispatch::NeedsApproval`, parking the same
+`PendingToolKind::Read` as case 1. The deny check lives in the dispatch layer, not in the
+executor, so on approval the call runs normally (no one-shot root is needed for an
+in-workspace path).
 
-1. **Case 2.** Return `NeedsApproval` (not a plain error) when a `read` rule with
-   `allow:false` wins the override chain during read-only resolution. `resolve_within_any`
-   lives in `src/tools.rs`; the deny match happens in the permission layer, so the
-   executor needs to consult `read` rules the way `dispatch_command` consults `command`
-   rules. Park the same `PendingToolKind::Read`.
+## Remaining work
 
-(Done: the read `--grant` scope. `plan_grant` / `apply_grant` in `src/tell_cli.rs` now
-accept a `read` pending and write an allow `read` rule via `permissions::grant_read`, a
-path-shaped entry rather than an argv prefix.)
+- `search` with no `path_prefix` is not covered (no single target; see "Still open").
+- Nothing else: the read `--grant` scope persists a workspace-relative allow rule for an
+  in-workspace target so it wins over a broader deny rule under last-match-wins.

@@ -139,11 +139,12 @@ on" — however the stop happened:
 - **Pending tool call** (the loop suspended for approval): the call is approved
   and executed, then the turn continues. A pending call is a `patch`, a
   `command`, or a `read`/`list`/`search` that targeted a path **outside the
-  workspace**. The read case is a **one-shot** grant by default: that single
-  call is allowed through, nothing is written to `permissions.jsonl`, and a
-  later read of the same path asks again. To make it stick, use `--grant
-  session|workspace` (which appends an allow `read` rule), or add a `read` rule
-  to `permissions.jsonl` by hand.
+  workspace** or one **denied by a `read` `allow:false` rule**. The read case is
+  a **one-shot** grant by default: that single call is allowed through, nothing
+  is written to `permissions.jsonl`, and a later read of the same path asks
+  again. To make it stick, use `--grant session|workspace` (which appends an
+  allow `read` rule — workspace-relative inside the workspace, absolute outside
+  it), or add a `read` rule to `permissions.jsonl` by hand.
 - **Transport failure** (a model call failed at the connection level — reset,
   timeout, DNS — before any assistant output was recorded): the *identical*
   request is re-issued. Nothing is appended, so a transient outage can be

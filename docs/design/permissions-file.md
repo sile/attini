@@ -1,10 +1,10 @@
 # The permissions file: format and evaluation
 
-**Status:** Implemented (format + last-match-wins evaluation). The
-`docs/deferred/permissions-json-editability.md` memo is superseded by this
-document and has been removed. Two pieces remain deferred and are noted below:
-the `write` type (`docs/deferred/write-permission-type.md`) and promoting a
-`read` denial into an approval request
+**Status:** Implemented (format + last-match-wins evaluation, plus `read`
+enforcement and approval). The `docs/deferred/permissions-json-editability.md`
+memo is superseded by this document and has been removed. The `write` type
+remains deferred (`docs/deferred/write-permission-type.md`); the `read` denial to
+approval path is implemented
 (`docs/deferred/read-outside-workspace-approval.md`).
 
 ## Why change it
@@ -128,14 +128,17 @@ calls, which the single-call approval flow does not require.
 The JSONL format, the `command`/`read` types, the required `allow` field, the
 recursive path matching, and last-match-wins evaluation over
 `[workspace] ++ [session]` are all in place. Rules are hand-edited; the only
-programmatic writer is `attini approve --grant` (commands), which appends a
-single line and leaves hand-written comments intact.
+programmatic writer is `attini approve --grant` (commands and reads), which
+appends a single line and leaves hand-written comments intact.
 
-One piece of the document is **not** wired up yet and is tracked elsewhere:
+Both kinds of rule are enforced:
 
-- A matching `read` rule with `allow:false` is not yet enforced as an
-  approval request; read access is still governed by the executor's granted
-  roots. See `docs/deferred/read-outside-workspace-approval.md`.
+- A `command` rule decides whether a `command` call auto-runs, auto-denies, or
+  falls through to the per-call approval flow.
+- A `read` rule is consulted before a `read`/`list`/`search` runs. A winning
+  `allow:true` rule (or the workspace/granted roots) lets it through; a winning
+  `allow:false` rule parks the call as an approval request rather than a silent
+  success or a plain error. See `docs/deferred/read-outside-workspace-approval.md`.
 
 ## History output
 
@@ -148,6 +151,7 @@ This lets a reader reconstruct which layer's rule produced the final answer.
 
 - `docs/design/tool-call.md` -- how an approval-requiring call is parked and
   resumed.
-- `docs/deferred/read-outside-workspace-approval.md` -- promoting a
-  `read` denial into an approval request.
+- `docs/deferred/read-outside-workspace-approval.md` -- how a `read` denial
+  (outside the workspace, or a winning `allow:false` rule) becomes an approval
+  request.
 - `docs/deferred/write-permission-type.md` -- adding a `write` type.

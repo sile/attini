@@ -1,10 +1,10 @@
 # `--grant` scope for reads
 
 **Status:** Implemented. `attini approve --grant session|workspace` now persists a
-`read` rule (a canonical path) when the single pending call is a read that reached
-outside the workspace, mirroring the command path. `--grant oneshot` stays
-approve-only (no persistence). Read rules can also still be added by hand to
-`permissions.jsonl`.
+`read` rule when the single pending call is a read that reached outside the workspace or
+that was denied by a `read` `allow:false` rule, mirroring the command path. `--grant
+oneshot` stays approve-only (no persistence). Read rules can also still be added by hand
+to `permissions.jsonl`.
 
 This memo began as the record of the asymmetry left after removing the standalone
 `attini grant` / `attini grant-read` subcommands: the only `--grant` path that remained
@@ -24,14 +24,17 @@ handles both kinds:
 
 - For a **command** pending, `--grant` persists an argv prefix
   (`{"type":"command","allow":true,"args_prefix":[...]}`).
-- For a **read** pending (a read that reached outside the workspace and was parked),
-  `--grant` persists the **canonical target path**
-  (`{"type":"read","allow":true,"path":"..."}`). This reuses the same recursive
-  segment-boundary matching as a hand-written `read` rule, so the grant and a manual
-  line agree exactly.
+- For a **read** pending (a read that reached outside the workspace, or one denied by a
+  `read` `allow:false` rule), `--grant` persists an allow `read` rule
+  (`{"type":"read","allow":true,"path":"..."}`). Inside the workspace the path is
+  stored **workspace-relative** (the shape rule paths are written in, so it compares
+  like-for-like with the deny check under last-match-wins); outside it, the **absolute
+  canonical path** is stored (which the executor accepts as a root). This reuses the same
+  recursive segment-boundary matching as a hand-written `read` rule, so the grant and a
+  manual line agree exactly.
 
 The read path is derived from the same `read_extra_root` helper the one-shot execution
-uses, so the granted path and the executed one-shot root are identical.
+uses.
 
 Reads can still be granted by hand — edit `permissions.jsonl` and add a line, for
 example
@@ -51,18 +54,19 @@ persisted (argv prefix vs. path). So a single `--grant SCOPE` reads fine and no 
 (`docs/deferred/patch-grant-scope.md`) is still waiting for; patches remain out of scope
 because a patch has no argv prefix and widening the write boundary is a bigger decision.
 
-Still unimplemented: **case 2** of `read-outside-workspace-approval.md` — a `read`
-`allow:false` rule that denies a path *inside* the workspace. That is a different flow
-(evaluation already decided deny; it does not currently park for approval), and it is not
-what this `--grant` scope addresses.
+Case 2 of `read-outside-workspace-approval.md` — a `read` `allow:false` rule that denies
+a path *inside* the workspace — is now also implemented: the deny is turned into an
+approval request (it parks a `PendingToolKind::Read`), and `--grant` on that pending
+persists a workspace-relative allow rule that wins over the broader deny under
+last-match-wins.
 
 ## Related
 
 - `docs/design/approve-command.md` — the shipped `attini approve` +
   `--grant oneshot|session|workspace`; now covers commands and reads.
 - `docs/deferred/read-outside-workspace-approval.md` — the "approve a read on the spot"
-  design; case 1 (outside-the-workspace reads) is the flow this grant extends, case 2
-  (a `read` `allow:false` rule) is still open.
+  design; both case 1 (outside-the-workspace reads) and case 2 (a `read` `allow:false`
+  rule) now park for approval and feed this grant.
 - `docs/deferred/patch-grant-scope.md` — the same asymmetry for patches (no path-based
   `--grant`); still deferred.
 - `docs/deferred/write-permission-type.md` — the declarative-rule version of the write
