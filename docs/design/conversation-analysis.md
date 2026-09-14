@@ -1,9 +1,8 @@
 # Conversation analysis tooling
 
-**Status:** Implemented (measurement half). The deterministic `attini
-analyze` subcommand is implemented and committed; the interpretation skill is
-still deferred. This document records the design of the implemented half and
-points at the deferred remaining half.
+**Status:** Implemented. The deterministic `attini logstats` subcommand is
+implemented and committed. Interpreting its output is guidance for the prompt,
+not a feature — see "Interpreting the output" below.
 
 ## Problem
 
@@ -69,8 +68,24 @@ only, never appended to `conversation.jsonl`.
   multiple subcommands under one program are all preserved.
 - Human output uses top-10 per section; `--json` emits the full list.
 
-## Deferred remaining half: interpretation guidance
+## Interpreting the output
 
-See `docs/deferred/conversation-analysis.md` — guidance for interpreting
-`attini logstats` output is still deferred. (Originally framed as a `-S` skill,
-but `--skill` has since been removed, so it can only live in the prompt now.)
+`logstats` deliberately stops at the numbers. Turning those numbers into a
+diagnosis is the model's job, and there is **no dedicated mechanism** for it
+(no skill flag, no tool). Type a short instruction into the prompt — or paste
+it via `--stdin` — when you want an analysis:
+
+1. Run `attini logstats <NAME>` (add `--json` when machine parsing helps).
+2. Read the histogram and identify which record kind / tool result dominates.
+3. Explain the finding in one or two sentences (for example, "`cargo test` is
+   1.40 MB across 69 calls", or "`reasoning` is 4.29 MB and was still being
+   re-sent on resume").
+4. When something looks unusual, drill into the specific offender with `read`
+   / `command` (the largest single `read` range, the largest `command`
+   stdout) to decide whether the fix is a tool change (output cap, reasoning
+   drop) or a workflow change (split the session).
+5. Report a recommendation, not a restatement of the numbers.
+
+This is guidance for the human driving the session, not a feature. The
+measurement half is deterministic and committed; the interpretation half is
+erogonomics that the prompt already covers.
