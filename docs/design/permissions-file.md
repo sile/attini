@@ -1,11 +1,11 @@
 # The permissions file: format and evaluation
 
 **Status:** Implemented (format + last-match-wins evaluation, plus `read` grant
-and `write` enforcement). The `docs/deferred/permissions-json-editability.md`
-memo is superseded by this document and has been removed. `read` rules are
-allow-only and widen the read roots; a read outside the workspace is promoted to
-an approval request (`docs/deferred/read-outside-workspace-approval.md`). The
-`write` type is implemented (`docs/design/write-permission-type.md`).
+and `write` enforcement). The former `permissions-json-editability` memo is
+superseded by this document and has been removed. `read` rules are allow-only and
+widen the read roots; a read outside the workspace is promoted to an approval
+request (`docs/design/read-approval.md`). The `write` type is implemented
+(`docs/design/write-permission-type.md`).
 
 ## Why change it
 
@@ -147,7 +147,7 @@ All kinds of rule are enforced:
   `allow` rule grants access to a path outside the workspace). It is not a
   gate: see "Why read has no deny". A read outside the workspace (and every
   granted root) is parked as a one-shot approval request. See
-  `docs/deferred/read-outside-workspace-approval.md`.
+  `docs/design/read-approval.md`.
 - A `write` rule is consulted by the patch tool's write guard, before the
   git-tracking heuristic. `allow:true` permits the write (even untracked);
   `allow:false` refuses it (even tracked). See
@@ -182,6 +182,6 @@ This lets a reader reconstruct which layer's rule produced the final answer.
 
 - `docs/design/tool-call.md` -- how an approval-requiring call is parked and
   resumed.
-- `docs/deferred/read-outside-workspace-approval.md` -- how a read outside the
+- `docs/design/read-approval.md` -- how a read outside the
   workspace becomes an approval request.
 - `docs/design/write-permission-type.md` -- the `write` type.

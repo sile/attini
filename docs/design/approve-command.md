@@ -11,7 +11,7 @@ The standalone `attini grant` / `attini grant-read` subcommands described below 
 write path is `attini approve --grant`. `--grant` covers **commands** (persists an
 args-prefix), **reads** (persists a path), and **patches** (persists a `write` path); the
 pending call's kind decides what is written and `SCOPE` only decides the lifetime. The
-read side is described in `docs/deferred/grant-read-scope.md`, the patch side in
+read side is described in `docs/design/read-approval.md`, the patch side in
 `docs/design/patch-grant-scope.md`.
 
 ## The observation
@@ -79,9 +79,8 @@ attini approve [-s NAME]        # approve the session's pending tool call(s)
   reject. (The old `--skill` combination rule is moot: `--skill` itself has since been
   removed — context now enters only through the prompt or `--stdin`.)
 - Consider a matching `attini reject` for symmetry even though `--reject` was removed
-  (a fresh prompt already covers "reject + redirect"; see `docs/deferred/reject-flag.md`
-  for why `--reject` is redundant). Reject-by-flag is gone, but a read-only
-  `approve` command does not force a `reject` command to exist.
+  (a fresh prompt already covers "reject + redirect"). Reject-by-flag is gone, but a
+  read-only `approve` command does not force a `reject` command to exist.
 
 ## Second idea: one-shot `--grant SCOPE` on approve
 

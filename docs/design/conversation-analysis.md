@@ -71,6 +71,6 @@ only, never appended to `conversation.jsonl`.
 
 ## Deferred remaining half: interpretation guidance
 
-See `docs/deferred/` — guidance for interpreting `session analyze` output is
-still deferred. (Originally framed as a `-S` skill, but `--skill` has since
-been removed, so it can only live in the prompt now.)
+See `docs/deferred/conversation-analysis.md` — guidance for interpreting
+`attini logstats` output is still deferred. (Originally framed as a `-S` skill,
+but `--skill` has since been removed, so it can only live in the prompt now.)

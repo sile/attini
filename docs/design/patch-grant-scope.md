@@ -17,7 +17,7 @@ runs without a prompt. The payload is decided by the pending call's **kind**:
 - **patch** -> a `write` path rule.
 
 `SCOPE` keeps its one meaning everywhere: the lifetime (session or workspace).
-This mirrors the read side (`docs/deferred/grant-read-scope.md`); the file shape
+This mirrors the read side (`docs/design/read-approval.md`); the file shape
 is `docs/design/write-permission-type.md`.
 
 ## Where a patch grant can originate
