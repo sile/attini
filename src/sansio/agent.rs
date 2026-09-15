@@ -804,13 +804,40 @@ pub enum CommandOutputStream {
 const COMMAND_TAIL_CHARS: usize = 4 * 1024;
 
 impl ToolExecutionError {
+    /// Human-readable message describing the failure, without the
+    /// JSON envelope. The same string is embedded as the `message`
+    /// field of [`ToolExecutionError::to_json_string`]; the shell also
+    /// prints it directly to stderr so a human sees the same wording
+    /// the model does.
+    pub fn message(&self) -> String {
+        let (_code, message) = self.code_and_message();
+        message
+    }
+
     /// Compact JSON representation suitable for a `Tool` role message
     /// body: `{"error":"CODE","message":"...","hint":"..."}`. `hint`
     /// is `null` unless there is actionable remediation, and is meant
     /// to guide the model's retry. Fields are stable enough for the
     /// model to key on.
     pub fn to_json_string(&self) -> String {
-        let (code, message): (&str, String) = match self {
+        let (code, message) = self.code_and_message();
+        let hint: Option<&'static str> = match self {
+            Self::Patch(err) => err.to_hint(),
+            _ => None,
+        };
+        Json(ToolErrorJson {
+            code,
+            message: &message,
+            hint,
+        })
+        .to_string()
+    }
+
+    /// Shared source of the `(code, message)` pair used by both
+    /// [`ToolExecutionError::message`] and
+    /// [`ToolExecutionError::to_json_string`].
+    fn code_and_message(&self) -> (&'static str, String) {
+        match self {
             Self::OutsideWorkspace => (
                 "outside_workspace",
                 "path escapes the workspace root".to_string(),
@@ -842,17 +869,7 @@ impl ToolExecutionError {
             ),
             Self::Patch(err) => err.to_code_and_message(),
             Self::Command(err) => err.to_code_and_message(),
-        };
-        let hint: Option<&'static str> = match self {
-            Self::Patch(err) => err.to_hint(),
-            _ => None,
-        };
-        Json(ToolErrorJson {
-            code,
-            message: &message,
-            hint,
-        })
-        .to_string()
+        }
     }
 }
 
@@ -2891,6 +2908,22 @@ mod tests {
         let s = ToolExecutionError::OutsideWorkspace.to_json_string();
         assert!(s.contains(r#""error":"outside_workspace""#));
         assert!(s.contains(r#""message""#));
+    }
+
+    #[test]
+    fn tool_execution_error_message_is_human_readable_and_matches_json() {
+        // The stderr line prints `message()`; the model gets the same
+        // string in the JSON envelope. Pin both to the same wording so
+        // a human and the model never diverge on what went wrong.
+        let err = ToolExecutionError::OutsideWorkspace;
+        assert_eq!(err.message(), "path escapes the workspace root");
+        let json = err.to_json_string();
+        assert!(json.contains(err.message().as_str()), "got {json}");
+
+        let parse = ToolExecutionError::ArgumentsParseFailed("bad shape".to_string());
+        assert_eq!(parse.message(), "bad shape");
+        // No `Debug`-style wrapper leaks into the human-facing message.
+        assert!(!parse.message().contains("ArgumentsParseFailed"));
     }
 
     // -------------------------------------------------------------

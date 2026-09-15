@@ -11,8 +11,8 @@ use nojson::{DisplayJson, RawJson};
 use crate::curl::{self, ProgressSinks};
 use crate::permissions;
 use crate::sansio::agent::{
-    CommandError, CommandInvocation, PatchInvocation, PatchPreview, PatchTool, ReadOnlyTool,
-    ToolExecutionError, ToolOutcome,
+    CommandError, CommandInvocation, PatchError, PatchInvocation, PatchPreview, PatchTool,
+    ReadOnlyTool, ToolExecutionError, ToolOutcome,
 };
 use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{
@@ -1632,8 +1632,9 @@ fn dispatch_command(
         Ok(inv) => inv,
         Err(err) => {
             if !dry_run {
-                let content = tool_error_json("command_args", &format!("{err:?}"));
-                eprintln!("[command] parse err: {err:?}");
+                let msg = err.message();
+                let content = tool_error_json("command_args", &msg);
+                eprintln!("[command] parse err: {msg}");
                 counters.tool_errors += 1;
                 append_tool(session, messages, &tc.id, content)?;
             }
@@ -2046,14 +2047,14 @@ fn run_read_only(tc: &ToolCall, executor: &ToolExecutor) -> ReadOnlyDispatch {
                     }
                 }
                 ToolOutcome::Err(err) => ReadOnlyDispatch::Done {
-                    summary: format!("[{args_summary}] err: {}", short_err(&err)),
+                    summary: format!("[{args_summary}] err: {}", err.message()),
                     content: tool_error_json_from(&err),
                     errored: true,
                 },
             }
         }
         Err(err) => ReadOnlyDispatch::Done {
-            summary: format!("[{}] parse err: {}", tc.function_name, short_err(&err)),
+            summary: format!("[{}] parse err: {}", tc.function_name, err.message()),
             content: tool_error_json_from(&err),
             errored: true,
         },
@@ -2248,15 +2249,6 @@ fn read_content_preview(payload: &str) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-fn short_err(err: &ToolExecutionError) -> String {
-    let full = format!("{err:?}");
-    if let Some(idx) = full.find(['(', ' ']) {
-        full[..idx].to_string()
-    } else {
-        full
-    }
-}
-
 enum PatchDispatch {
     /// The call needs human approval; carries the parked pending.
     Awaiting(Pending),
@@ -2295,8 +2287,9 @@ fn dispatch_patch_unapproved(
         Ok(inv) => inv,
         Err(err) => {
             if !dry_run {
-                let content = tool_error_json("patch_args", &format!("{err:?}"));
-                eprintln!("[patch] parse err: {err:?}");
+                let msg = err.message();
+                let content = tool_error_json("patch_args", &msg);
+                eprintln!("[patch] parse err: {msg}");
                 counters.tool_errors += 1;
                 append_tool(session, messages, &tc.id, content)?;
             }
@@ -2307,8 +2300,9 @@ fn dispatch_patch_unapproved(
         Ok(x) => x,
         Err(e) => {
             if !dry_run {
-                let content = tool_error_json("patch_preview", &format!("{e:?}"));
-                eprintln!("[patch] preview err: {e:?}");
+                let (code, msg) = e.to_code_and_message();
+                let content = tool_error_json(code, &msg);
+                eprintln!("[patch] preview err: {msg}");
                 counters.tool_errors += 1;
                 append_tool(session, messages, &tc.id, content)?;
             }
@@ -2343,8 +2337,9 @@ fn dispatch_patch_unapproved(
                     append_tool(session, messages, &tc.id, patch_result_json(&paths))?;
                 }
                 Err(e) => {
-                    let content = tool_error_json("patch_apply", &format!("{e:?}"));
-                    eprintln!("[patch] apply err: {e:?}");
+                    let (code, msg) = e.to_code_and_message();
+                    let content = tool_error_json(code, &msg);
+                    eprintln!("[patch] apply err: {msg}");
                     counters.tool_errors += 1;
                     append_tool(session, messages, &tc.id, content)?;
                 }
@@ -2480,15 +2475,15 @@ fn execute_pending(
             // partially-executed pending set behind.
             let inv = match PatchInvocation::parse(&pending.arguments_json) {
                 Ok(inv) => inv,
-                Err(e) => return Ok(tool_error_json("patch_args", &format!("{e:?}"))),
+                Err(e) => return Ok(tool_error_json("patch_args", &e.message())),
             };
             let (preview_content, _preview) = match executor.preview_patch(&inv) {
                 Ok(x) => x,
-                Err(e) => return Ok(tool_error_json("patch_preview", &format!("{e:?}"))),
+                Err(e) => return Ok(tool_error_json_from_patch(&e)),
             };
             match executor.apply_patch(&inv, &preview_content) {
                 Ok(paths) => Ok(patch_result_json(&paths)),
-                Err(e) => Ok(tool_error_json("patch_apply", &format!("{e:?}"))),
+                Err(e) => Ok(tool_error_json_from_patch(&e)),
             }
         }
         PendingToolKind::Command => {
@@ -2742,7 +2737,12 @@ fn load_pending_or_err(session: &Session) -> io::Result<Vec<Pending>> {
 }
 
 fn tool_error_json_from(err: &ToolExecutionError) -> String {
-    tool_error_json("execution_error", &format!("{err:?}"))
+    tool_error_json("execution_error", &err.message())
+}
+
+fn tool_error_json_from_patch(err: &PatchError) -> String {
+    let (code, message) = err.to_code_and_message();
+    tool_error_json(code, &message)
 }
 
 fn tool_error_json(code: &str, message: &str) -> String {
