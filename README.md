@@ -97,6 +97,14 @@ was bad, or just not built yet?" — for these, deliberately:
 - **`--local-only` mode and rule attributes (`readonly` / `network`).**
   Removed, along with the `Mode` axis. Approval is a single, flat thing: a rule
   is allow or deny, or absent (which falls through to a pending approval).
+- **Convenience tools that duplicate what the model already has** (`search`
+  regex, a `sed`-style replace tool, a cross-file replace tool). Not added.
+  `patch` already replaces unique substrings across multiple files, `command`
+  already runs `grep`/`sed` under permission control, and literal `search`
+  stays literal — a regex engine would add a dependency and a hang risk for
+  little measured gain. Adding tools raises the permission/approval surface;
+  see the rationale in
+  [the extended list](docs/design/intentionally-not-supported.md).
 
 The common thread: implicit, convention-based context or delegation that
 attini cannot see or control. attini's answer to each is "be explicit" — put

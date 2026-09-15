@@ -130,6 +130,37 @@ can distinguish "not implemented yet" from "intentionally not there".
   written up in
   [`docs/guides/cross-repo-handoff.md`](../guides/cross-repo-handoff.md).
 
+### 10. New convenience tools (`search` regex, `sed`-style replace, cross-file replace)
+
+- **What:** three candidate "missing tools" considered after an audit of a
+  real session's tool usage: (a) letting `search` accept a regular expression,
+  (b) a dedicated `sed`-style find/replace tool, (c) a tool for find/replace
+  that spans multiple files.
+- **Status:** not implemented, and intentionally not planned. The audit
+  (`attini logstats -s main`) is the input; the decision is to add no tool.
+- **Why not:** each candidate is already expressible with the existing tools,
+  and each would raise attini's core costs (permission management, approval
+  flow, boundary checks) without demonstrated necessity.
+  - **`search` regex:** `search` is deliberately a *literal* substring match.
+    Its measured cost is small (1878 calls / 1.4 MB, max 8.9 KB per call), so
+    there is little to save. A regex engine would add a dependency (against
+    the recent direction of *removing* dependencies, e.g. `sha2`), and regex
+    can hang the walk on catastrophic backtracking. The model already reaches
+    for regex via `command` (`grep -rn` appears in the logs); that literal
+    `search` / regex `grep` split is a healthy division of labour.
+  - **`sed`-style replace:** `patch` already is this — a unique-substring
+    `before`/`after` replacement. A second replace tool would duplicate the
+    four-layer write guard, the `write`-rule evaluation, and the approval
+    flow. `command` already offers `sed -i` under permission control; a
+    dedicated tool adds a parallel path for no gain.
+  - **Cross-file replace:** `patch` already handles multiple files in one
+    call (its `patches[]` array; distinct paths are required, which is simply
+    the reverse side of the same-call duplicate-path guard). No cross-file
+    replacement pattern shows up in the measured command families. A
+    dedicated tool would have to match N paths against the rules and leave
+    `--grant` unable to decide which path to persist — the same ambiguity
+    `patch` already refuses with an error, only more frequent.
+
 ## The common thread
 
 All are the same shape: **implicit, convention-based context or delegation
@@ -146,7 +177,13 @@ The README's design philosophy bullets describe *principles* (context is
 requested, state changes surfaced, no silent side effects). This note is a
 *concrete list of removals and non-goals*. It answers a different question:
 "if you look for feature X, is it gone because it was bad, or just not built
-yet?" The answer for these seven is "bad, deliberately".
+yet?" The answer for every item here is "deliberately not there".
+
+Item 10 is a different shape from the rest. Items 1–9 are removals or
+long-standing non-goals; item 10 is a *standing decision against adding* new
+convenience tools, recorded when they were audited. It belongs in this list
+because the answer to "why isn't there a `sed` tool?" is "by policy, not by
+omission".
 
 ## How to revive
 
