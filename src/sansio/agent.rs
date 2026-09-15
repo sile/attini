@@ -287,8 +287,11 @@ impl PatchInvocation {
                           an update (replace a unique substring). All edits \
                           in one call must target distinct paths. Patches \
                           that only update git-tracked files are applied \
-                          immediately; any add or non-tracked edit requires \
-                          user approval before it touches the filesystem."
+                          immediately; any add, non-tracked edit, or target \
+                          outside the workspace requires user approval before \
+                          it touches the filesystem. A path outside the \
+                          workspace is given either as an absolute path or as \
+                          a relative path that escapes with `..`."
                 .to_string(),
             parameters_json: PATCH_PARAMS_SCHEMA.to_string(),
         }
@@ -546,8 +549,6 @@ pub enum PatchError {
     ParentDirMissing { path: String },
     /// `Update` target does not exist at apply time.
     UpdateOnMissingFile { path: String },
-    /// The resolved canonical path escapes the workspace root.
-    OutsideWorkspace { path: String },
     /// Layer 1 hardcoded reject: the target is a runtime-critical file
     /// (`.git/**`, `.attini/*/{LOCK,conversation.jsonl,...}`,
     /// `.attini/permissions.jsonl`) regardless of git
@@ -608,10 +609,6 @@ impl PatchError {
             Self::UpdateOnMissingFile { path } => (
                 "patch_update_on_missing_file",
                 format!("cannot update: file does not exist at {path}"),
-            ),
-            Self::OutsideWorkspace { path } => (
-                "patch_outside_workspace",
-                format!("target path {path} escapes the workspace root"),
             ),
             Self::ExcludedPath { path, reason } => (
                 "patch_excluded_path",
@@ -751,11 +748,13 @@ pub struct PatchPreview {
     /// workspace's git repository, so the shell may apply the patch
     /// without an approval prompt (git makes the change revertible).
     pub auto_approve: bool,
-    /// When set, at least one target cannot be reverted with `git
-    /// checkout` after the write (the path is outside git control, or
-    /// the workspace is not a git repository). Holds a short human
-    /// reason shown in the approval preview. `None` when every target
-    /// is either git-tracked or covered by an explicit `write` rule.
+    /// When set, at least one target is not safe to auto-apply and the
+    /// human should see it first: the path is untracked (so not
+    /// revertible with `git checkout`), the workspace is not a git
+    /// repository, or the target is outside the workspace. Holds a
+    /// short human reason rendered as a `NOTE:` line in the approval
+    /// preview. `None` when every target is either git-tracked or
+    /// covered by an explicit `write` rule.
     pub not_revertible: Option<String>,
 }
 

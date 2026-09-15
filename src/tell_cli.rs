@@ -2127,15 +2127,23 @@ fn patch_write_verdict(
 ) -> WriteVerdict {
     let mut all_allowed = true;
     for edit in &inv.edits {
-        let Some(rel) = workspace_relative_write_target(edit.path(), workspace_root) else {
-            // A path we cannot reduce to a workspace-relative form (an
-            // absolute path the executor would reject anyway, or one
-            // that does not canonicalise) cannot be covered by a
-            // workspace-relative `write` rule.
-            all_allowed = false;
-            continue;
+        // In-workspace targets are compared as workspace-relative
+        // paths; outside-workspace targets as absolute canonical
+        // paths, mirroring how the executor's Layer 3 evaluates them
+        // and how `--grant` persists an outside rule.
+        let target = match workspace_relative_write_target(edit.path(), workspace_root) {
+            Some(rel) => PathBuf::from(rel),
+            None => match canonical_write_target(edit.path(), workspace_root) {
+                Some(abs) => abs,
+                // A path that does not canonicalise cannot be covered
+                // by any rule; fall back to the git-tracking heuristic.
+                None => {
+                    all_allowed = false;
+                    continue;
+                }
+            },
         };
-        match evaluate_write(permission_layers, Path::new(&rel), authorization) {
+        match evaluate_write(permission_layers, &target, authorization) {
             Judgment::AutoDeny(_) => return WriteVerdict::Denied,
             Judgment::AutoApprove(_) => {}
             Judgment::Pending => all_allowed = false,
@@ -2161,6 +2169,20 @@ fn workspace_relative_write_target(target: &str, workspace_root: &Path) -> Optio
     let root = workspace_root.canonicalize().ok()?;
     let rel = canon.strip_prefix(&root).ok()?;
     Some(rel.to_string_lossy().into_owned())
+}
+
+/// Canonical absolute form of a patch edit's target, used to compare an
+/// outside-workspace target against `write` rules (which are written as
+/// absolute paths for outside targets, mirroring `read` rules). Returns
+/// `None` when the path does not exist on disk and cannot be
+/// canonicalised.
+fn canonical_write_target(target: &str, workspace_root: &Path) -> Option<PathBuf> {
+    let candidate = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace_root.join(target)
+    };
+    candidate.canonicalize().ok()
 }
 
 fn summarize_read_only(inv: &ReadOnlyTool) -> String {
@@ -2371,7 +2393,7 @@ fn render_patch_preview_text(p: &PatchPreview, inv: &PatchInvocation) -> String 
         out.push_str(path);
     }
     if let Some(reason) = &p.not_revertible {
-        out.push_str("\n  NOTE: cannot be reverted with `git checkout`: ");
+        out.push_str("\n  NOTE: ");
         out.push_str(reason);
     }
     out.push('\n');

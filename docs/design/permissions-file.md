@@ -56,6 +56,9 @@ file uses JSON double quotes.
 {'type':'write','allow':true,'path':'src'}
 # never touch generated output
 {'type':'write','allow':false,'path':'dist'}
+# allow writing a file outside the workspace (write rules use absolute
+# paths for outside targets, mirroring read rules)
+{'type':'write','allow':true,'path':'/home/me/other-repo/notes.md'}
 ```
 
 - `type` (string, required): one of `command`, `read`, or `write`. See
@@ -149,9 +152,10 @@ All kinds of rule are enforced:
   granted root) is parked as a one-shot approval request. See
   `docs/design/read-approval.md`.
 - A `write` rule is consulted by the patch tool's write guard, before the
-  git-tracking heuristic. `allow:true` permits the write (even untracked);
-  `allow:false` refuses it (even tracked). See
-  `docs/design/write-permission-type.md`.
+  git-tracking heuristic. `allow:true` permits the write (even untracked, or
+  outside the workspace); `allow:false` refuses it (even tracked). A write
+  outside the workspace with no matching rule is parked as a one-shot approval
+  request, mirroring `read`. See `docs/design/write-permission-type.md`.
 
 ## Why read has no deny
 

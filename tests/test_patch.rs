@@ -216,12 +216,16 @@ fn preview_update_on_missing_rejects() {
 }
 
 #[test]
-fn preview_outside_workspace_rejects() {
+fn preview_outside_workspace_parks_for_approval() {
+    // An `Add` outside the workspace no longer errors; it previews
+    // successfully with `auto_approve=false` and a `not_revertible`
+    // reason so the shell can park it for human approval.
     let root = TempRoot::new("preview-outside");
-    let err = exec(&root)
+    let (_, preview) = exec(&root)
         .preview_patch(&inv(vec![add("../escape.txt", "x")]))
-        .expect_err("outside rejected");
-    assert!(matches!(err, PatchError::OutsideWorkspace { .. }));
+        .expect("outside preview succeeds");
+    assert!(!preview.auto_approve);
+    assert!(preview.not_revertible.is_some());
 }
 
 // -----------------------------------------------------------------
@@ -335,11 +339,12 @@ fn apply_add_on_existing_rejects_at_phase1() {
 // -----------------------------------------------------------------
 
 #[test]
-fn patch_add_absolute_path_inside_extra_read_root_is_rejected() {
-    // extra_read_roots grant read-only access. Patch (write) must
-    // NOT resolve them — write to an absolute path outside the
-    // workspace has to fail even if the target lives under an
-    // extra_read_root.
+fn patch_add_absolute_path_inside_extra_read_root_parks_for_approval() {
+    // extra_read_roots grant read-only access; they do not open a
+    // write path. An absolute write target outside the workspace is
+    // not refused outright any more — it parks for one-shot human
+    // approval — but the preview must not create anything. The point
+    // of this test is that extra_read_roots confer no write privilege.
     let root = TempRoot::new("patch-abs-extra-root");
     let extra = TempRoot::new("patch-abs-extra-source");
     let extra_canon = extra.path().canonicalize().expect("canon");
@@ -351,24 +356,22 @@ fn patch_add_absolute_path_inside_extra_read_root_is_rejected() {
         .to_string_lossy()
         .into_owned();
     let invocation = inv(vec![add(&target, "gotcha")]);
-    let err = executor
+    let (_, preview) = executor
         .preview_patch(&invocation)
-        .expect_err("absolute add must be rejected");
-    assert!(
-        matches!(err, PatchError::OutsideWorkspace { .. }),
-        "expected OutsideWorkspace, got {err:?}"
-    );
+        .expect("absolute add previews (parks for approval)");
+    assert!(!preview.auto_approve, "outside write must not auto-approve");
     assert!(
         !extra.path().join("hijack.md").exists(),
-        "patch must not have created the file"
+        "preview must not have created the file"
     );
 }
 
 #[test]
-fn patch_update_relative_traversal_into_extra_read_root_is_rejected() {
-    // A relative path with `..` that lands under an extra_read_root
-    // must also be rejected for write. resolve_within stays
-    // single-root; extra_read_roots do not open a write path.
+fn patch_update_relative_traversal_outside_workspace_parks_for_approval() {
+    // A relative path with `..` that resolves outside the workspace
+    // now previews and parks for approval (mirroring `read`), rather
+    // than being refused. A matching `write` rule would need an
+    // absolute path; with no rule the write waits for the human.
     let root = TempRoot::new("patch-traversal-workspace");
     let extra_parent = TempRoot::new("patch-traversal-parent");
     extra_parent.write("victim.md", b"original\n");
@@ -379,13 +382,10 @@ fn patch_update_relative_traversal_into_extra_read_root_is_rejected() {
     let workspace_canon = root.path().canonicalize().expect("workspace canon");
     let rel_to_victim = pathdiff_naive(&workspace_canon, &extra_parent.path().join("victim.md"));
     let invocation = inv(vec![update(&rel_to_victim, "original\n", "hijacked\n")]);
-    let err = executor
+    let (_, preview) = executor
         .preview_patch(&invocation)
-        .expect_err("traversal update must be rejected");
-    assert!(
-        matches!(err, PatchError::OutsideWorkspace { .. }),
-        "expected OutsideWorkspace, got {err:?}"
-    );
+        .expect("traversal update previews (parks for approval)");
+    assert!(!preview.auto_approve, "outside write must not auto-approve");
     assert_eq!(extra_parent.read("victim.md"), b"original\n");
 }
 
@@ -511,16 +511,17 @@ fn layer2_syntactic_bypass_does_not_leak_side_effect_outside_scratchpad() {
     // and the Add falls through to Layer 3.
     let root = TempRoot::new("layer2-syntactic-bypass");
     let executor = exec_with_git(&root, &[]);
-    let outcome = executor.preview_patch(&inv(vec![add(
+    // The path normalises to `malicious/foo.md` (inside the
+    // workspace), so it falls through to Layer 3 and previews as a
+    // normal Add. Whatever the outcome, Layer 2's pre-create must
+    // not have run for the scratchpad-looking prefix.
+    let _ = executor.preview_patch(&inv(vec![add(
         ".attini/test/scratchpad/../../../malicious/foo.md",
         "gotcha",
     )]));
-    let err = outcome.expect_err("bypass must be rejected");
-    // Either OutsideWorkspace or IgnoredParent — the
-    // point is the side effect must not have created a directory.
     assert!(
         !root.path().join("malicious").exists(),
-        "Layer 2 pre-create leaked outside scratchpad ({err:?})"
+        "Layer 2 pre-create leaked outside scratchpad"
     );
 }
 

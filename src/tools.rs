@@ -351,76 +351,60 @@ impl ToolExecutor {
 
     fn resolve_add_target(&self, rel: &str) -> Result<(PathBuf, WriteGuard), PatchError> {
         // For Add, the file itself does not exist yet. Resolve the
-        // parent directory with the read-only path resolver, then
-        // append the final component.
+        // parent directory (which must exist), then append the final
+        // component. Unlike `resolve_within`, absolute paths and
+        // relative paths that escape the workspace with `..` are
+        // accepted; an outside target is parked for approval by
+        // `check_patch_write` rather than refused here.
         let rel_path = Path::new(rel);
-        if rel_path.is_absolute() {
-            return Err(PatchError::OutsideWorkspace {
-                path: rel.to_string(),
-            });
-        }
         let parent = rel_path
             .parent()
-            .ok_or_else(|| PatchError::OutsideWorkspace {
+            .ok_or_else(|| PatchError::ParentDirMissing {
                 path: rel.to_string(),
             })?;
         let file_name = rel_path
             .file_name()
-            .ok_or_else(|| PatchError::OutsideWorkspace {
+            .ok_or_else(|| PatchError::ParentDirMissing {
                 path: rel.to_string(),
             })?;
         // Layer 2 subdir pre-create (chicken-and-egg resolution):
         // if the target textually lives under this session's
         // scratchpad, create any missing parent directories before
-        // `resolve_within` tries to canonicalise. Layer 2 is
-        // re-verified in canonical form after resolve_within so
-        // symlink-based escapes still fail. Paths whose syntactic
-        // normalisation does not stay under scratchpad get no
-        // pre-create side effect.
+        // the parent is canonicalised. Layer 2 is re-verified in
+        // canonical form after resolution so symlink-based escapes
+        // still fail. Paths whose syntactic normalisation does not
+        // stay under scratchpad get no pre-create side effect.
         self.maybe_pre_create_scratchpad_parent(rel_path)?;
-        // Parent may itself be "" (root of workspace). resolve_within
-        // handles "." as workspace root; adapt "" the same way.
+        // Parent may itself be "" (root of workspace). `"."`
+        // expresses that for both workspace-relative and absolute
+        // resolution (an absolute path always has a parent).
         let parent_str = if parent.as_os_str().is_empty() {
             "."
         } else {
             parent
                 .to_str()
-                .ok_or_else(|| PatchError::OutsideWorkspace {
+                .ok_or_else(|| PatchError::ParentDirMissing {
                     path: rel.to_string(),
                 })?
         };
-        let parent_resolved = match resolve_within(&self.root, parent_str) {
-            Ok(p) => p,
-            Err(ToolExecutionError::OutsideWorkspace) => {
-                return Err(PatchError::OutsideWorkspace {
-                    path: rel.to_string(),
-                });
+        let parent_resolved = resolve_for_patch(&self.root, parent_str).map_err(|_| {
+            PatchError::ParentDirMissing {
+                path: rel.to_string(),
             }
-            Err(_) => {
-                return Err(PatchError::ParentDirMissing {
-                    path: rel.to_string(),
-                });
-            }
-        };
+        })?;
         let target = parent_resolved.join(file_name);
         let guard = self.check_patch_write(&target, rel, PatchOp::Add)?;
         Ok((target, guard))
     }
 
     fn resolve_update_target(&self, rel: &str) -> Result<(PathBuf, WriteGuard), PatchError> {
-        let rel_path = Path::new(rel);
-        if rel_path.is_absolute() {
-            return Err(PatchError::OutsideWorkspace {
-                path: rel.to_string(),
-            });
-        }
-        let resolved = match resolve_within(&self.root, rel) {
+        // Unlike `resolve_within`, this accepts absolute paths and
+        // relative paths that escape the workspace with `..`. The
+        // target is canonicalised whether or not it lands inside the
+        // workspace; an outside target is not refused outright but
+        // routes to `check_patch_write`, which parks it for approval.
+        let resolved = match resolve_for_patch(&self.root, rel) {
             Ok(p) => p,
-            Err(ToolExecutionError::OutsideWorkspace) => {
-                return Err(PatchError::OutsideWorkspace {
-                    path: rel.to_string(),
-                });
-            }
             Err(_) => {
                 return Err(PatchError::UpdateOnMissingFile {
                     path: rel.to_string(),
@@ -434,8 +418,8 @@ impl ToolExecutor {
     /// If `rel_path` syntactically normalises to a location under this
     /// session's scratchpad, create any missing parent directories.
     /// Otherwise do nothing (no side effect, no error). Called from
-    /// `resolve_add_target` before `resolve_within` would fail on
-    /// missing parents.
+    /// `resolve_add_target` before the parent is canonicalised, so a
+    /// missing scratchpad parent does not fail resolution.
     fn maybe_pre_create_scratchpad_parent(&self, rel_path: &Path) -> Result<(), PatchError> {
         let sp_rel = Path::new(".attini")
             .join(&self.session_name)
@@ -768,23 +752,44 @@ fn scratchpad_root(root: &Path, session_name: &str) -> PathBuf {
 
 impl ToolExecutor {
     /// Check whether an already-canonical absolute `canon` path is
-    /// allowed for patch write. Called after `resolve_within` has
-    /// verified the workspace boundary. Returns `Ok(())` on allow;
-    /// otherwise returns the specific `PatchError` variant that
-    /// caller should surface.
+    /// allowed for patch write. Called after `resolve_for_patch` has
+    /// canonicalised the target, which may lie inside or outside the
+    /// workspace. Returns a `WriteGuard` (allow, or park for approval);
+    /// hard rejections come back as the specific `PatchError` variant
+    /// the caller should surface.
     fn check_patch_write(
         &self,
         canon: &Path,
-        rel_hint: &str,
+        _rel_hint: &str,
         op: PatchOp,
     ) -> Result<WriteGuard, PatchError> {
-        let rel = match workspace_relative_canonical(canon, &self.root) {
-            Some(r) => r,
-            None => {
-                return Err(PatchError::OutsideWorkspace {
-                    path: rel_hint.to_string(),
-                });
-            }
+        // Explicit `write` rules take precedence over the git-tracking
+        // heuristic. A winning `allow:true` rule permits the write even
+        // when Layer 3 would reject it (untracked / not-a-repo); a
+        // winning `allow:false` rule refuses it even when git tracking
+        // would allow. With no matching rule, fall through to Layer 3/4.
+        // The rules are held flattened; the scope tag is only cosmetic
+        // for the decision record, so a single workspace-labelled layer
+        // is enough for matching here.
+        let layers: [ScopedRules<'_>; 1] = [(RuleScope::Workspace, self.write_rules.as_slice())];
+        let Some(rel) = workspace_relative_canonical(canon, &self.root) else {
+            // Target is outside the workspace. Layer 1 (runtime-critical
+            // `.git`/`.attini` paths) and the git-tracking heuristic are
+            // both workspace-relative concepts and do not apply. An
+            // explicit `write` rule may still match, using the absolute
+            // canonical path (outside-workspace write rules are written
+            // as absolute paths, mirroring `read` rules). Otherwise the
+            // write is parked for one-shot human approval.
+            return match evaluate_write(&layers, canon, &Authorization::PerTool) {
+                Judgment::AutoApprove(_) => Ok(WriteGuard::Allow),
+                Judgment::AutoDeny(_) => Err(PatchError::ExcludedPath {
+                    path: canon.to_string_lossy().into_owned(),
+                    reason: "denied by a write rule".to_string(),
+                }),
+                Judgment::Pending => Ok(WriteGuard::NeedsApproval {
+                    reason: "the target is outside the workspace".to_string(),
+                }),
+            };
         };
         // Layer 1
         if let Some(reason) = layer1_reject_reason(&rel) {
@@ -802,15 +807,6 @@ impl ToolExecutor {
         {
             return Ok(WriteGuard::Allow);
         }
-        // Explicit `write` rules take precedence over the git-tracking
-        // heuristic. A winning `allow:true` rule permits the write even
-        // when Layer 3 would reject it (untracked / not-a-repo); a
-        // winning `allow:false` rule refuses it even when git tracking
-        // would allow. With no matching rule, fall through to Layer 3/4.
-        // The rules are held flattened; the scope tag is only cosmetic
-        // for the decision record, so a single workspace-labelled layer
-        // is enough for matching here.
-        let layers: [ScopedRules<'_>; 1] = [(RuleScope::Workspace, self.write_rules.as_slice())];
         match evaluate_write(&layers, &rel, &Authorization::PerTool) {
             Judgment::AutoApprove(_) => return Ok(WriteGuard::Allow),
             Judgment::AutoDeny(_) => {
@@ -828,7 +824,9 @@ impl ToolExecutor {
         // merely "irrecoverable with git checkout".
         match &self.git_state {
             GitState::NotARepo => Ok(WriteGuard::NeedsApproval {
-                reason: "the workspace is not a git repository".to_string(),
+                reason: "the workspace is not a git repository, so this change cannot be \
+                         reverted with `git checkout`"
+                    .to_string(),
             }),
             GitState::Repo { tracked } => match op {
                 PatchOp::Update => {
@@ -836,7 +834,9 @@ impl ToolExecutor {
                         Ok(WriteGuard::Allow)
                     } else {
                         Ok(WriteGuard::NeedsApproval {
-                            reason: "the target is not tracked by git".to_string(),
+                            reason: "the target is not tracked by git, so this change cannot \
+                                     be reverted with `git checkout`"
+                                .to_string(),
                         })
                     }
                 }
@@ -912,22 +912,22 @@ fn is_gitignored(root: &Path, candidate: &Path) -> bool {
     }
 }
 
-fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, ToolExecutionError> {
-    // Reject absolute paths and paths that syntactically escape (`..`
-    // beyond root) before touching the filesystem; canonicalize on
-    // absolute paths would silently jump out of the workspace.
+/// Patch-tool path resolver. Unlike `resolve_within`, it accepts
+/// absolute paths and relative paths that escape the workspace with
+/// `..`. The result is canonicalised whether or not it lands inside
+/// the workspace; the caller (`check_patch_write`) decides whether an
+/// outside target is parked for approval. A path that cannot be
+/// canonicalised (e.g. the file does not exist) is an error.
+fn resolve_for_patch(root: &Path, rel: &str) -> Result<PathBuf, ToolExecutionError> {
     let rel_path = Path::new(rel);
-    if rel_path.is_absolute() {
-        return Err(ToolExecutionError::OutsideWorkspace);
-    }
-    let joined = root.join(rel_path);
-    let canon = joined
+    let candidate = if rel_path.is_absolute() {
+        rel_path.to_path_buf()
+    } else {
+        root.join(rel_path)
+    };
+    candidate
         .canonicalize()
-        .map_err(|e| ToolExecutionError::IoError(format!("{rel}: {e}")))?;
-    if !canon.starts_with(root) {
-        return Err(ToolExecutionError::OutsideWorkspace);
-    }
-    Ok(canon)
+        .map_err(|e| ToolExecutionError::IoError(format!("{rel}: {e}")))
 }
 
 /// Read-only resolver that accepts paths under `workspace_root` or
@@ -939,8 +939,9 @@ fn resolve_within(root: &Path, rel: &str) -> Result<PathBuf, ToolExecutionError>
 /// - Absolute `input` is canonicalised directly and accepted if it
 ///   ends up inside any of the roots (workspace or extra).
 ///
-/// Patch (write) tool must not use this helper — it stays on the
-/// single-root `resolve_within`.
+/// Patch (write) resolution lives in `resolve_for_patch`, which accepts
+/// any canonicalisable path and lets `check_patch_write` decide whether
+/// an outside target parks for approval.
 fn resolve_within_any(
     workspace_root: &Path,
     extra_read_roots: &[PathBuf],

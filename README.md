@@ -46,11 +46,12 @@ than letting the agent infer or guess:
   in-flight intent is observable via `attini ask` / `attini status`; and a
   one-line status is printed to stderr so you always know which session/model
   is advancing. Diagnostic output never pollutes stdout.
-- **No silent side effects.** The workspace boundary is enforced on every read
-  and write, destructive operations require explicit confirmation, and a
-  non-tracked file never silently overwrites a tracked one. Where a behaviour
-  is too risky to do safely, attini refuses rather than guesses — for example
-  rejecting multiple edits to the same path in one `patch`.
+- **No silent side effects.** Reaching outside the workspace — a read or a
+  write — always requires explicit human approval, destructive operations
+  require explicit confirmation, and a non-tracked file never silently
+  overwrites a tracked one. Where a behaviour is too risky to do safely, attini
+  refuses rather than guesses — for example rejecting multiple edits to the
+  same path in one `patch`.
 - **The model's own space is gated too.** The model can work freely in its own
   scratchpad, but every write there still passes through approval.
 - **Tools amplify understanding; they do not replace it.** The agent already
@@ -312,12 +313,15 @@ workspace one.
 {"type":"write","allow":true,"path":"src"}
 # never touch generated output
 {"type":"write","allow":false,"path":"dist"}
+# allow writing a file outside the workspace (absolute path)
+{"type":"write","allow":true,"path":"/home/me/other-repo/notes.md"}
 ```
 
 A `write` rule governs `patch` edit targets before the git-tracking heuristic: a
-winning `allow:true` rule permits a write even to an untracked file; a winning
-`allow:false` rule refuses one even to a tracked file. See the `patch` row in
-*Agent tools* below.
+winning `allow:true` rule permits a write even to an untracked file (or one
+outside the workspace); a winning `allow:false` rule refuses one even to a
+tracked file. A write outside the workspace with no matching rule is parked for
+one-shot approval, mirroring `read`. See the `patch` row in *Agent tools* below.
 
 A `read` rule **widens** the roots a `read`/`list`/`search` may reach; it is not
 a gate. There is no `read` deny, and `allow:false` on a `read` rule is a load
@@ -340,7 +344,7 @@ giving.
 | `list` | List files and directories under a workspace-relative path | `max_entries` limit (default 200) |
 | `read` | Read a UTF-8 text file | Up to 1 MiB; optional `line_range` |
 | `search` | Literal substring search (no regex) | `max_results` limit (default 50) |
-| `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files, or covered by a `write` `allow:true` rule, are auto-applied; any add or non-tracked edit not covered by a rule needs approval. `before` must match exactly once; workspace-boundary check |
+| `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files, or covered by a `write` `allow:true` rule, are auto-applied; any add, non-tracked edit, or target outside the workspace not covered by a rule needs approval. `before` must match exactly once |
 
 `patch` first presents a preview (file names + a diff body) and is applied only
 after approval, unless every edit is auto-approvable (git-tracked, or allowed by
