@@ -1,9 +1,14 @@
 [package]
 name = "attini"
 version = "0.0.1"
+description = "CLI coding agent that aims to be as autonomous as it can be, without ever leaving your control"
+homepage = "https://github.com/sile/attini"
+repository = "https://github.com/sile/attini"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools"]
+license = "MIT"
 edition = "2024"
 rust-version = "1.93"
-publish = false
 
 [dependencies]
 libc = "0.2"

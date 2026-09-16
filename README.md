@@ -1,6 +1,10 @@
 attini
 ======
 
+[![attini](https://img.shields.io/crates/v/attini.svg)](https://crates.io/crates/attini)
+[![Actions Status](https://github.com/sile/attini/workflows/CI/badge.svg)](https://github.com/sile/attini/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **WIP**
 
 A CLI coding agent that aims to be as autonomous as it can be, without ever
