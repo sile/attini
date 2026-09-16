@@ -276,7 +276,8 @@ pub enum Continuation {
     /// session's `pending.json` if there is one; otherwise re-issue the
     /// identical request when the previous invocation ended in a
     /// retryable transport failure ([`Continuation::Retry`]); otherwise
-    /// continue with a fixed continuation message ([`RESUME_PROMPT`]).
+    /// continue with a reason-aware continuation message (see
+    /// [`resume_prompt_for`]: a run cut off at `max_turns` is told why).
     Approve,
     /// Internal only: re-run the loop against the conversation exactly
     /// as it stands, without appending any new user record. Produced by
@@ -288,12 +289,38 @@ pub enum Continuation {
 }
 
 /// Fixed user message appended when `attini approve` is run on a session
-/// that has no pending tool call (i.e. it stopped at `max_turns`). It
+/// that has no pending tool call and the previous run stopped for a
+/// reason that carries no built-in hint (e.g. a clean completion). It
 /// deliberately carries no new instruction: approving a stop means "keep
-/// going", while a new instruction goes through `attini tell`. The model
-/// already has its own last turn in context, so a bare continuation is
-/// enough to pick the work back up.
+/// going", while a new instruction goes through `attini tell`. Prefer
+/// [`resume_prompt_for`], which picks a reason-specific message.
 pub const RESUME_PROMPT: &str = "Continue from where you left off.";
+
+/// Firmer continuation appended by the empty-resume guard in [`drive`]
+/// when an `attini approve` is answered with no content and no tool
+/// calls. It states explicitly that the previous turn was interrupted
+/// mid-task and that the model must resume it, because a bare
+/// [`RESUME_PROMPT`] demonstrably does not always elicit a resumption.
+pub const RESUME_NUDGE_PROMPT: &str = "Your previous turn ended without any output, which means the work was left unfinished. \
+     Resuming now: continue with the task you were in the middle of, using a tool call if the \
+     next step requires one. Do not reply with an empty message.";
+
+/// The continuation message appended by a pending-free `attini approve`,
+/// chosen from the reason the previous invocation ended. Unlike a bare
+/// [`RESUME_PROMPT`], a run that stopped at `max_turns` is told *why* it
+/// was cut off, so the model picks the work back up instead of replying
+/// with an empty completion (the "approve advanced nothing" symptom).
+/// Pure so the mapping can be unit-tested without a session.
+pub fn resume_prompt_for(last: Option<InvocationEndReason>) -> &'static str {
+    match last {
+        Some(InvocationEndReason::MaxTurns) => {
+            "Your previous turn was cut off because the tool-call loop hit its turn limit. \
+             Continue the work you were doing when you were interrupted; do not ask for \
+             confirmation unless something is genuinely ambiguous."
+        }
+        _ => RESUME_PROMPT,
+    }
+}
 
 /// Terminal outcome of one `tell_cli::run` invocation.
 #[derive(Debug)]
@@ -361,6 +388,7 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
         Ok(Driven::SessionToolCallExhausted) => {
             (InvocationEndReason::SessionToolCallExhausted, EXIT_ERROR)
         }
+        Ok(Driven::MaxTurnsExhausted) => (InvocationEndReason::MaxTurns, EXIT_ERROR),
         Ok(Driven::TransportFailed(_)) => (InvocationEndReason::TransportError, EXIT_ERROR),
         Err(_) => (InvocationEndReason::Error, EXIT_ERROR),
     };
@@ -376,6 +404,10 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let _ = session.append(&SessionRecord::InvocationEnd { ts: end_ts, reason });
 
     match outcome {
+        Ok(Driven::MaxTurnsExhausted) => {
+            eprintln!("attini: {}", max_turns_error(cfg.max_turns));
+            Ok(TellOutcome::Exit(ExitCode::from(EXIT_ERROR)))
+        }
         Ok(Driven::TransportFailed(message)) => {
             eprintln!("attini: {message}");
             eprintln!(
@@ -411,6 +443,12 @@ enum Driven {
     /// Invocation-scope tool-call backstop tripped
     /// ([`TellConfig::session_tool_call_max`]).
     SessionToolCallExhausted,
+    /// The `tell` loop used all of `TellConfig::max_turns` without the
+    /// model producing a final assistant message. Recorded as
+    /// [`InvocationEndReason::MaxTurns`] so a later `attini approve` can
+    /// tell "ran out of turns, resume the work" apart from a genuine
+    /// failure, and tell the model *why* the previous run stopped.
+    MaxTurnsExhausted,
     /// A model call failed at the transport layer before any assistant
     /// output for the turn was recorded. Recorded as
     /// [`InvocationEndReason::TransportError`] so a later `attini
@@ -498,7 +536,7 @@ fn normalise_pending_free_approve(last: Option<InvocationEndReason>) -> Continua
     if last == Some(InvocationEndReason::TransportError) {
         Continuation::Retry
     } else {
-        Continuation::Prompt(RESUME_PROMPT.to_string())
+        Continuation::Prompt(resume_prompt_for(last).to_string())
     }
 }
 
@@ -536,13 +574,20 @@ fn drive(
     // prompt and trigger compaction (the "summarising..." then
     // "skipping" noise, or a real extra model call).
     let started_by_prompt = runs_pre_prompt_compaction(&cont);
+    // Whether this invocation was started by `attini approve` (as opposed
+    // to `attini tell` / an internal retry). Used by the empty-resume
+    // guard below: an approve that the model answers with no content and
+    // no tool calls has "advanced nothing", so it is nudged once.
+    let started_by_approve = matches!(cont, Continuation::Approve);
     // `Approve` resumes a stopped session. Normalise the no-pending
     // cases here so the rest of `drive` stays single-path:
     //   1. pending tool call present  -> approve + execute (unchanged).
     //   2. else, previous invocation ended in a retryable transport
     //      failure -> re-issue the identical request
     //      ([`Continuation::Retry`]); nothing new is appended.
-    //   3. else (stopped at `max_turns`) -> fixed continuation message.
+    //   3. else -> a reason-aware continuation message (see
+    //      [`resume_prompt_for`] / [`RESUME_PROMPT`]); a run that
+    //      stopped at `max_turns` is told *why* it was cut off.
     let cont = match cont {
         Continuation::Approve if session.load_pending()?.is_some() => Continuation::Approve,
         Continuation::Approve => {
@@ -650,6 +695,13 @@ fn drive(
     ];
     let mut gate = ToolCallGate::new(cfg);
 
+    // Empty-resume guard: an `attini approve` whose resumed turn comes
+    // back with no content *and* no tool calls has nothing to show and
+    // moved the work nowhere (the "approve advanced nothing" symptom).
+    // Nudge the model once with a firmer, explicit continuation request;
+    // if the retry is empty too, we give up and warn rather than loop.
+    let mut resume_retried = false;
+
     for _ in 0..cfg.max_turns {
         gate.begin_turn();
         let request = ChatRequest::new(cfg.model.clone(), messages.clone())
@@ -713,6 +765,29 @@ fn drive(
         messages.push(assistant);
 
         if call_result.tool_calls.is_empty() {
+            // An approve-originated run that produced neither content nor a
+            // tool call advanced nothing. Nudge once with an explicit
+            // request before giving up; a fresh `tell` prompt is left alone
+            // (an empty answer there is the user's business).
+            let empty = call_result.content.trim().is_empty();
+            if started_by_approve && empty && !resume_retried {
+                resume_retried = true;
+                eprintln!(
+                    "[approve] model returned no content or tool calls; requesting continuation once more"
+                );
+                session.append(&SessionRecord::User {
+                    ts: now_unix_millis(),
+                    text: RESUME_NUDGE_PROMPT.to_string(),
+                })?;
+                messages.push(ChatMessage::User(RESUME_NUDGE_PROMPT.to_string()));
+                continue;
+            }
+            if started_by_approve && empty {
+                eprintln!(
+                    "[approve] model again returned no content or tool calls; nothing to continue. \
+                     Give an explicit instruction with: attini tell '...'"
+                );
+            }
             return Ok(Driven::Completed);
         }
 
@@ -864,7 +939,7 @@ fn drive(
         }
     }
 
-    Err(io::Error::other(max_turns_error(cfg.max_turns)))
+    Ok(Driven::MaxTurnsExhausted)
 }
 
 /// Build the error message shown when `tell` runs out of turns. The
@@ -3812,6 +3887,25 @@ mod tests {
                     panic!("expected Prompt for {last:?}, got Approve")
                 }
             }
+        }
+    }
+
+    #[test]
+    fn pending_free_approve_after_max_turns_names_the_turn_limit() {
+        // A run cut off by the turn cap must tell the model *why*, so it
+        // resumes the interrupted work instead of answering an empty
+        // continuation with nothing (the "approve advanced nothing"
+        // symptom). It is still a `Prompt` (never a `Retry`), and it is
+        // no longer the bare `RESUME_PROMPT`.
+        let cont = normalise_pending_free_approve(Some(InvocationEndReason::MaxTurns));
+        match cont {
+            Continuation::Prompt(text) => {
+                assert_eq!(text, resume_prompt_for(Some(InvocationEndReason::MaxTurns)));
+                assert_ne!(text, RESUME_PROMPT);
+                assert!(text.contains("turn limit"));
+            }
+            Continuation::Retry => panic!("expected Prompt, got Retry"),
+            Continuation::Approve => panic!("expected Prompt, got Approve"),
         }
     }
 

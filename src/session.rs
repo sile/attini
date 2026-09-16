@@ -818,6 +818,12 @@ pub enum InvocationEndReason {
     /// (`TellConfig::session_tool_call_max`) tripped and the loop
     /// stopped without a final assistant message.
     SessionToolCallExhausted,
+    /// The `tell` loop used all of `TellConfig::max_turns` without the
+    /// model producing a final assistant message. Distinct from
+    /// [`Self::Error`] so that a later `attini approve` can tell "ran out
+    /// of turns, resume the work" apart from a genuine failure, and tell
+    /// the model *why* the previous run stopped.
+    MaxTurns,
 }
 
 impl InvocationEndReason {
@@ -828,6 +834,7 @@ impl InvocationEndReason {
             Self::Error => "error",
             Self::TransportError => "transport_error",
             Self::SessionToolCallExhausted => "session_tool_call_exhausted",
+            Self::MaxTurns => "max_turns",
         }
     }
 }
@@ -1190,6 +1197,7 @@ fn parse_invocation_end_reason(line: &str) -> Result<Option<InvocationEndReason>
         "error" => InvocationEndReason::Error,
         "transport_error" => InvocationEndReason::TransportError,
         "session_tool_call_exhausted" => InvocationEndReason::SessionToolCallExhausted,
+        "max_turns" => InvocationEndReason::MaxTurns,
         other => return Err(format!("unknown invocation_end.reason {other:?}")),
     };
     Ok(Some(parsed))
@@ -1572,6 +1580,7 @@ fn parse_session_record_line(line: &str) -> Result<Option<SessionRecord>, String
                 "error" => InvocationEndReason::Error,
                 "transport_error" => InvocationEndReason::TransportError,
                 "session_tool_call_exhausted" => InvocationEndReason::SessionToolCallExhausted,
+                "max_turns" => InvocationEndReason::MaxTurns,
                 other => return Err(format!("unknown invocation_end.reason {other:?}")),
             };
             Ok(Some(SessionRecord::InvocationEnd { ts, reason }))
@@ -2389,6 +2398,7 @@ mod tests {
             InvocationEndReason::SessionToolCallExhausted.as_str(),
             "session_tool_call_exhausted"
         );
+        assert_eq!(InvocationEndReason::MaxTurns.as_str(), "max_turns");
     }
 
     #[test]
