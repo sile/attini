@@ -1,6 +1,8 @@
 attini
 ======
 
+**WIP**
+
 A CLI coding agent that aims to be as autonomous as it can be, without ever
 leaving your control.
 
@@ -14,8 +16,6 @@ The name comes from the Attini tribe of ants — leaf-cutter ants that do not ea
 the leaves they gather, but cultivate a fungus with them. attini follows the
 same idea: the agent gathers changes, but nothing becomes real until the human
 cultivates it through approval.
-
-> This README is a work-in-progress draft. Keep it in sync with the implementation.
 
 ## Overview
 
