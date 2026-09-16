@@ -502,6 +502,22 @@ fn normalise_pending_free_approve(last: Option<InvocationEndReason>) -> Continua
     }
 }
 
+/// Whether the pre-prompt auto-compaction pass should run for a
+/// continuation *as originally requested*, before any normalisation.
+///
+/// Compaction is a `tell`-only step: it summarises an oversized history
+/// before a fresh user prompt is appended. `attini approve` resumes a
+/// session that is already running and must not spend a summariser
+/// model call the human did not ask for, so it never compacts — not even
+/// when it later normalises into a `Prompt(RESUME_PROMPT)`. Evaluating
+/// this against the *original* continuation (rather than the normalised
+/// one) is the whole point: after normalisation an `Approve` is
+/// indistinguishable from a `tell`. Pure so the rule can be unit-tested
+/// without a session.
+fn runs_pre_prompt_compaction(cont: &Continuation) -> bool {
+    matches!(cont, Continuation::Prompt(_))
+}
+
 fn drive(
     session: &mut Session,
     executor: &ToolExecutor,
@@ -509,6 +525,17 @@ fn drive(
     cont: Continuation,
     counters: &mut Counters,
 ) -> io::Result<Driven> {
+    // Whether this invocation was started by a *fresh* user prompt
+    // (`attini tell`) rather than by `attini approve`. Auto-compaction
+    // is a pre-`tell` step: `attini approve` resumes an already-running
+    // session and must never spend a summariser model call the human
+    // did not ask for. The `Approve` branch below rewrites the
+    // continuation (into `Prompt(RESUME_PROMPT)` or `Retry`), so the
+    // original kind has to be captured *before* normalisation —
+    // otherwise a pending-free approve would masquerade as a fresh
+    // prompt and trigger compaction (the "summarising..." then
+    // "skipping" noise, or a real extra model call).
+    let started_by_prompt = runs_pre_prompt_compaction(&cont);
     // `Approve` resumes a stopped session. Normalise the no-pending
     // cases here so the rest of `drive` stays single-path:
     //   1. pending tool call present  -> approve + execute (unchanged).
@@ -530,7 +557,12 @@ fn drive(
         other => other,
     };
 
-    if matches!(cont, Continuation::Prompt(_)) {
+    // Compact only for a genuine `attini tell`. An `attini approve` that
+    // normalised into a continuation message (or a `Retry`) leaves the
+    // history as-is: see `docs/design/compaction.md`, which states
+    // compaction fires "only on a fresh `Continuation::Prompt` (never on
+    // `--approve`)".
+    if started_by_prompt {
         try_auto_compact(session, &cfg.model, counters, cfg.max_tokens)?;
     }
 
@@ -3781,6 +3813,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------
+    // runs_pre_prompt_compaction
+    // -------------------------------------------------------------
+
+    #[test]
+    fn pre_prompt_compaction_runs_only_for_a_fresh_prompt() {
+        assert!(runs_pre_prompt_compaction(&Continuation::Prompt(
+            "hello".to_string()
+        )));
+        assert!(!runs_pre_prompt_compaction(&Continuation::Approve));
+        assert!(!runs_pre_prompt_compaction(&Continuation::Retry));
+    }
+
+    #[test]
+    fn pending_free_approve_that_becomes_a_prompt_does_not_compact() {
+        // The pending-free `Approve` normalises into `Prompt(RESUME_PROMPT)`
+        // (max_turns case). The compaction gate must look at the *original*
+        // continuation, not the normalised one, or `attini approve` would
+        // trigger a summariser call. This pins the invariant from
+        // docs/design/compaction.md: compaction never fires on `--approve`.
+        let normalised = normalise_pending_free_approve(Some(InvocationEndReason::Error));
+        assert!(matches!(normalised, Continuation::Prompt(_)));
+        // The gate is evaluated on the pre-normalisation `Approve`, so even
+        // though the normalised form is a `Prompt`, compaction must not run.
+        assert!(!runs_pre_prompt_compaction(&Continuation::Approve));
     }
 
     // -------------------------------------------------------------

@@ -84,8 +84,15 @@ the model during compaction.
 
 ## Guards
 
-- `try_auto_compact` returns early when `pending.json` exists, so it fires
-  only on a fresh `Continuation::Prompt` (never on `--approve`).
+- `try_auto_compact` is gated on the continuation **as originally
+  requested**, before `drive` normalises an `Approve` into a
+  continuation (`runs_pre_prompt_compaction`). It therefore fires only
+  for a fresh `attini tell` prompt and never for `attini approve`.
+  Relying on the `pending.json` check alone was not enough: a
+  pending-free `approve` (the `max_turns` case) normalises into
+  `Prompt(RESUME_PROMPT)` and would otherwise look identical to a
+  `tell` by the time the gate runs, triggering a summariser call the
+  human never asked for.
 - It fires on the first turn of a resumed session only; after compaction the
   summary replaces the huge history so a second pass sees a small total.
 - Compaction is automatic only; there is no manual `compact` subcommand. The
