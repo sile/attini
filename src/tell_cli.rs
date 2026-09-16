@@ -49,10 +49,11 @@ pub struct Counters {
     pub completion_tokens_total: u64,
     pub prompt_cache_hit_tokens_total: u64,
     pub prompt_cache_miss_tokens_total: u64,
-    /// Number of times `try_auto_compact` invoked `compact_conversation`.
-    /// (Total number of times it fired past the threshold; counted as 1
+    /// Number of times a compaction pass invoked `compact_conversation`:
+    /// the size-triggered `try_auto_compact` on `tell`, or the
+    /// model-planned `run_compaction` on `compact`. Counted as 1
     /// whether it ends in an internal skip, a summariser success, or any
-    /// of the various `Err` outcomes.)
+    /// of the various `Err` outcomes.
     pub compaction_attempts: u64,
     /// Number of times `compact_conversation` returned `Err`.
     /// (Aggregates `Err` arising from `load_records_since_last_summary`,
@@ -228,6 +229,13 @@ pub struct TellConfig {
     /// the approved command's argv-prefix after the approval succeeds.
     /// `None` for every other entry point.
     pub grant_request: GrantRequest,
+    /// Whether the model used for this invocation should follow the
+    /// session's most recent `invocation_start.model` rather than the
+    /// `model` field above. Set by `attini approve` (whose plan and
+    /// summariser calls must run on the same model the session has been
+    /// using); `false` for every other entry point, where `model` is
+    /// authoritative.
+    pub follow_session_model: bool,
     /// Wall-clock cap on a single `command` tool call, in seconds. The
     /// child runs in its own process group and is killed (SIGTERM, then
     /// SIGKILL) when the cap elapses; the result sets `termination_reason`
@@ -278,6 +286,9 @@ pub enum Continuation {
     /// retryable transport failure ([`Continuation::Retry`]); otherwise
     /// continue with a reason-aware continuation message (see
     /// [`resume_prompt_for`]: a run cut off at `max_turns` is told why).
+    /// `approve` never compacts: intentional, model-planned compaction
+    /// is its own `attini compact` command (`run_compact`), so a plain
+    /// approve stays a single model call.
     Approve,
     /// Internal only: re-run the loop against the conversation exactly
     /// as it stands, without appending any new user record. Produced by
@@ -331,6 +342,16 @@ pub enum TellOutcome {
 
 pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     let mut session = Session::open(&cfg.session_name)?;
+    let mut cfg = cfg;
+    // `attini approve` follows the session's own model so its plan and
+    // summariser calls run on the same model the conversation has been
+    // using; `--model` is not accepted for approve. `tell`/others leave
+    // `follow_session_model` false and keep the configured model.
+    if cfg.follow_session_model
+        && let Some(model) = session.last_invocation_model()?
+    {
+        cfg.model = model;
+    }
     // Canonicalise the persistent extra_read_paths (from
     // permissions.jsonl) and hand the resulting Vec to the
     // ToolExecutor. Any path that fails
@@ -423,6 +444,31 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
             Ok(TellOutcome::Exit(ExitCode::from(EXIT_ERROR)))
         }
     }
+}
+
+/// Run one intentional, model-planned compaction pass against a session
+/// and exit. This backs the `attini compact` subcommand.
+///
+/// Unlike the automatic `tell` path there is no size gate and no
+/// conversational turn: the human explicitly asked to fold the history,
+/// so the model plans the fold (`run_compaction_planner`) and the
+/// summariser applies it. The session's own model is followed, exactly
+/// like `approve`, so compaction runs on the model the conversation has
+/// been using; `--model` is deliberately not accepted.
+///
+/// The step is best-effort: a planner or summariser failure warns and
+/// leaves the history in place rather than failing the command.
+pub fn run_compact(cfg: TellConfig) -> io::Result<()> {
+    let mut session = Session::open(&cfg.session_name)?;
+    let mut model = cfg.model.clone();
+    if cfg.follow_session_model
+        && let Some(session_model) = session.last_invocation_model()?
+    {
+        model = session_model;
+    }
+    let mut counters = Counters::default();
+    run_compaction(&mut session, &model, &mut counters, cfg.max_tokens);
+    Ok(())
 }
 
 /// Render the single-line start-of-invocation breadcrumb written to stderr
@@ -1067,6 +1113,36 @@ Aim for ~500 words of plain prose. Do not include markdown code fences \
 unless quoting a short critical excerpt. Do not comment on the \
 summarization itself; produce only the summary.";
 
+const COMPACT_PLANNER_SYSTEM_PROMPT: &str = "You are planning how to compact a long coding-agent conversation. \
+You will be shown a prose transcript of the conversation so far. Decide \
+what must survive compaction so the agent can continue its work.\n\
+\n\
+Return ONLY a single JSON object (no prose, no code fences) with these \
+keys:\n\
+- \"keep_recent\": integer >= 1. How many of the MOST RECENT records \
+  should be kept verbatim (not summarised).\n\
+- \"focus\": string. A short instruction to the summariser describing \
+  which information is still needed for the work to continue.\n\
+- \"keep_verbatim\": array of strings. Short excerpts (a line, a path, \
+  a snippet, a decision) that MUST appear in the summary. May be empty.\n\
+\n\
+Reply with exactly one JSON object and nothing else.";
+
+/// A compaction plan proposed by the model before an `attini approve`
+/// summarisation pass. Parsed leniently: any missing/invalid field
+/// yields `None` and the caller falls back to plain compaction (no
+/// plan) rather than failing the whole approve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactPlan {
+    /// How many trailing records the model wants kept verbatim. Always
+    /// clamped against the safe-boundary machinery before use.
+    pub keep_recent: usize,
+    /// Instruction threaded into the summariser system prompt.
+    pub focus: String,
+    /// Excerpts that must survive; appended to the summariser prompt.
+    pub keep_verbatim: Vec<String>,
+}
+
 /// Decide whether to auto-compact before a `Prompt` invocation.
 ///
 /// Returns `true` when at least one of two independent signals says
@@ -1082,6 +1158,46 @@ summarization itself; produce only the summary.";
 /// would overflow the next main call.
 fn should_auto_compact(latest: u64, total_chars: usize) -> bool {
     latest >= COMPACTION_TRIGGER_TOKENS || total_chars > RECORDS_TOTAL_MAX_CHARS
+}
+
+/// The intentional compaction run by `attini compact`: ask the model for
+/// a plan, then summarise with that plan. Unlike the automatic path
+/// there is no size gate — the human asked to compact the session, so we
+/// always attempt the plan. Every step is best-effort: a planner
+/// transport failure falls back to plain compaction, and a summariser
+/// failure just warns and leaves the full history in place.
+///
+/// The plan call and the summariser call append nothing to the
+/// conversation and record no `invocation_start`; the only record that
+/// can be written is the resulting `SessionRecord::Summary`.
+fn run_compaction(
+    session: &mut Session,
+    model: &str,
+    counters: &mut Counters,
+    max_tokens: Option<u64>,
+) {
+    let Ok(records) = session.load_records_since_last_summary() else {
+        return;
+    };
+    if records.is_empty() {
+        return;
+    }
+    // Physical pruning is size-driven and independent of summarisation.
+    if let Err(e) = maybe_prune_conversation(session) {
+        eprintln!("[prune] skipped: {e}");
+    }
+    // Ask the model how to fold the history. A planner failure (transport
+    // or unparseable JSON) yields `None`, and `compact_conversation` then
+    // behaves exactly as the automatic path (no plan).
+    let plan = run_compaction_planner(model, &records, max_tokens);
+    if plan.is_none() {
+        eprintln!("[compaction] no usable plan from the model; falling back to a plain summary");
+    }
+    counters.compaction_attempts += 1;
+    if let Err(e) = compact_conversation(session, model, max_tokens, plan.as_ref()) {
+        counters.compaction_failures += 1;
+        eprintln!("[compaction] failed, continuing with full history: {e}");
+    }
 }
 
 fn try_auto_compact(
@@ -1130,7 +1246,7 @@ fn try_auto_compact(
         );
     }
     counters.compaction_attempts += 1;
-    if let Err(e) = compact_conversation(session, model, max_tokens) {
+    if let Err(e) = compact_conversation(session, model, max_tokens, None) {
         counters.compaction_failures += 1;
         eprintln!("[compaction] failed, continuing with full history: {e}");
     }
@@ -1145,17 +1261,27 @@ fn try_auto_compact(
 /// Called by the auto-compaction path (`try_auto_compact`). Callers are
 /// expected to have already checked that the session is idle (no LOCK
 /// holder, no `pending.json`).
+///
+/// `plan` is an optional, model-authored instruction from the `attini
+/// approve` path. When present, its `keep_recent` (clamped against the
+/// safe-boundary machinery) sets the tail to keep, and its `focus` /
+/// `keep_verbatim` are threaded into the summariser prompt. When `None`
+/// behaviour is unchanged (the auto-compaction path passes `None`).
 pub fn compact_conversation(
     session: &mut Session,
     model: &str,
     max_tokens: Option<u64>,
+    plan: Option<&CompactPlan>,
 ) -> io::Result<()> {
     let records = session.load_records_since_last_summary()?;
-    let Some(keep_start) = compaction_cutoff(
-        &records,
-        KEEP_RECENT_RECORDS_TARGET,
-        RETAINED_TAIL_MAX_CHARS,
-    ) else {
+    // The model's `keep_recent` is a hint, clamped by the same
+    // safe-boundary logic used by the automatic path: it can only move
+    // the target, never split an `assistant -> tool` pair or exceed the
+    // retained-tail byte budget.
+    let target_keep = plan
+        .map(|p| p.keep_recent)
+        .unwrap_or(KEEP_RECENT_RECORDS_TARGET);
+    let Some(keep_start) = compaction_cutoff(&records, target_keep, RETAINED_TAIL_MAX_CHARS) else {
         eprintln!("[compaction] no records eligible for summarisation. skipping.");
         return Ok(());
     };
@@ -1176,7 +1302,7 @@ pub fn compact_conversation(
         .map(|r| r.ts)
         .expect("to_summarise is non-empty");
 
-    let text = run_summariser(model, to_summarise, max_tokens)?;
+    let text = run_summariser(model, to_summarise, max_tokens, plan)?;
     let words = text.split_whitespace().count();
 
     session.append(&SessionRecord::Summary {
@@ -1532,10 +1658,98 @@ fn call_summariser_messages(
     pick_summary_text(&result).ok_or_else(|| io::Error::other("summariser returned empty content"))
 }
 
+/// Parse a model-authored compaction plan out of `text`.
+///
+/// The model is instructed to return a bare JSON object, but it may
+/// wrap it in prose or a fenced code block. We extract the first
+/// `{ ... }` span and parse it; any failure (no object, bad JSON,
+/// missing/ill-typed fields) returns `None` so the caller falls back to
+/// plain compaction rather than failing the whole `attini approve`.
+fn parse_compact_plan(text: &str) -> Option<CompactPlan> {
+    let json_text = extract_json_object(text)?;
+    let json = RawJson::parse(&json_text).ok()?;
+    let value = json.value();
+
+    let keep_recent = value
+        .to_member("keep_recent")
+        .ok()
+        .and_then(|m| m.required().ok())
+        .and_then(|m| m.try_into().ok())
+        .filter(|n: &usize| *n >= 1)?;
+
+    let focus = value
+        .to_member("focus")
+        .ok()
+        .and_then(|m| m.required().ok())
+        .and_then(|m| m.to_unquoted_string_str().ok())
+        .map(|s| s.into_owned())
+        .unwrap_or_default();
+
+    let mut keep_verbatim: Vec<String> = Vec::new();
+    if let Ok(Some(member)) = value.to_member("keep_verbatim").map(|m| m.optional())
+        && let Ok(array) = member.to_array()
+    {
+        for item in array {
+            if let Ok(s) = item.to_unquoted_string_str() {
+                keep_verbatim.push(s.into_owned());
+            }
+        }
+    }
+
+    Some(CompactPlan {
+        keep_recent,
+        focus,
+        keep_verbatim,
+    })
+}
+
+/// Return the first balanced `{ ... }` span in `text`, or `None`.
+/// Tracks brace depth but is not string-literal aware; that is
+/// sufficient for the well-formed JSON we ask the model to emit, and a
+/// mis-slice simply fails to parse and triggers the plain-compaction
+/// fallback.
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    for (i, ch) in text[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..start + i + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Ask the model to propose a compaction plan for the given records.
+///
+/// Read-only: appends nothing to the session and records no
+/// `invocation_start`. Any transport/parse failure yields `None` so the
+/// caller falls back to plain compaction.
+fn run_compaction_planner(
+    model: &str,
+    records: &[ChatMessageWithTs],
+    max_tokens: Option<u64>,
+) -> Option<CompactPlan> {
+    let transcript = render_summary_transcript(records);
+    let messages = vec![
+        ChatMessage::System(COMPACT_PLANNER_SYSTEM_PROMPT.to_string()),
+        ChatMessage::User(transcript),
+    ];
+    let text = call_summariser_messages(model, messages, max_tokens).ok()?;
+    parse_compact_plan(&text)
+}
+
 fn run_summariser(
     model: &str,
     records: Vec<ChatMessageWithTs>,
     max_tokens: Option<u64>,
+    plan: Option<&CompactPlan>,
 ) -> io::Result<String> {
     // Render the records as a bounded prose transcript rather than
     // sending the raw ChatMessages. Raw messages include the full
@@ -1545,10 +1759,26 @@ fn run_summariser(
     // semantic thread (assistant conclusions, decisions, file/symbol
     // mentions) while keeping each tool result to a short line.
     let transcript = render_summary_transcript(&records);
-    let messages = vec![
-        ChatMessage::System(SUMMARIZER_SYSTEM_PROMPT.to_string()),
-        ChatMessage::User(transcript),
-    ];
+    let mut system = SUMMARIZER_SYSTEM_PROMPT.to_string();
+    if let Some(plan) = plan {
+        if !plan.focus.trim().is_empty() {
+            system.push_str(
+                "\n\nThe agent must still be able to continue the work. Prioritise the \
+                 following information:\n",
+            );
+            system.push_str(plan.focus.trim());
+            system.push('\n');
+        }
+        if !plan.keep_verbatim.is_empty() {
+            system.push_str("\nThe following excerpts MUST appear verbatim in the summary:\n");
+            for excerpt in &plan.keep_verbatim {
+                system.push_str("- ");
+                system.push_str(excerpt);
+                system.push('\n');
+            }
+        }
+    }
+    let messages = vec![ChatMessage::System(system), ChatMessage::User(transcript)];
     call_summariser_messages(model, messages, max_tokens)
 }
 
@@ -3373,6 +3603,7 @@ mod tests {
             temperature: None,
             grant_request: GrantRequest::None,
             command_timeout_seconds: None,
+            follow_session_model: false,
         }
     }
 
@@ -3934,6 +4165,63 @@ mod tests {
         // The gate is evaluated on the pre-normalisation `Approve`, so even
         // though the normalised form is a `Prompt`, compaction must not run.
         assert!(!runs_pre_prompt_compaction(&Continuation::Approve));
+    }
+
+    // -------------------------------------------------------------
+    // parse_compact_plan / extract_json_object
+    // -------------------------------------------------------------
+
+    #[test]
+    fn extract_json_object_pulls_the_first_balanced_span() {
+        assert_eq!(
+            extract_json_object("prefix {\"a\": 1} suffix").as_deref(),
+            Some("{\"a\": 1}")
+        );
+        assert_eq!(
+            extract_json_object("```json\n{\"a\": {\"b\": 2}}\n```").as_deref(),
+            Some("{\"a\": {\"b\": 2}}")
+        );
+        assert_eq!(extract_json_object("no object here"), None);
+        assert_eq!(extract_json_object("{\"unterminated\": "), None);
+    }
+
+    #[test]
+    fn parse_compact_plan_reads_all_fields() {
+        let plan = parse_compact_plan(
+            r#"{"keep_recent": 12, "focus": "finish the parser", "keep_verbatim": ["src/x.rs", "fn main"]}"#,
+        )
+        .expect("well-formed plan should parse");
+        assert_eq!(plan.keep_recent, 12);
+        assert_eq!(plan.focus, "finish the parser");
+        assert_eq!(plan.keep_verbatim, vec!["src/x.rs", "fn main"]);
+    }
+
+    #[test]
+    fn parse_compact_plan_tolerates_surrounding_prose_and_fences() {
+        let plan = parse_compact_plan(
+            "Here is the plan:\n```json\n{\"keep_recent\": 5, \"focus\": \"x\", \"keep_verbatim\": []}\n```",
+        )
+        .expect("fenced plan should parse");
+        assert_eq!(plan.keep_recent, 5);
+        assert!(plan.keep_verbatim.is_empty());
+    }
+
+    #[test]
+    fn parse_compact_plan_defaults_optional_fields() {
+        // `focus` and `keep_verbatim` are optional; only `keep_recent`
+        // gates a usable plan.
+        let plan = parse_compact_plan(r#"{"keep_recent": 3}"#).expect("minimal plan parses");
+        assert_eq!(plan.keep_recent, 3);
+        assert_eq!(plan.focus, "");
+        assert!(plan.keep_verbatim.is_empty());
+    }
+
+    #[test]
+    fn parse_compact_plan_rejects_garbage_and_bad_keep_recent() {
+        assert_eq!(parse_compact_plan("not json at all"), None);
+        assert_eq!(parse_compact_plan(r#"{"focus": "x"}"#), None);
+        assert_eq!(parse_compact_plan(r#"{"keep_recent": 0}"#), None);
+        assert_eq!(parse_compact_plan(r#"{"keep_recent": "lots"}"#), None);
     }
 
     // -------------------------------------------------------------

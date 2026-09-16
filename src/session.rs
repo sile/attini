@@ -213,6 +213,38 @@ impl Session {
         Ok(latest)
     }
 
+    /// Model name recorded by the most recent `invocation_start` record,
+    /// or `None` when the conversation has none yet (a fresh session).
+    ///
+    /// `attini approve` uses this to follow the session's own model
+    /// rather than accept a `--model` flag: the plan and summariser
+    /// calls must run on the same model the session has been using.
+    pub fn last_invocation_model(&self) -> io::Result<Option<String>> {
+        let file = match File::open(&self.conversation_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut latest: Option<String> = None;
+        for (i, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse_invocation_start_model(&line) {
+                Ok(Some(model)) => latest = Some(model),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "malformed conversation record at line {}: {e}",
+                        i + 1
+                    )));
+                }
+            }
+        }
+        Ok(latest)
+    }
+
     pub fn conversation_path(&self) -> &Path {
         &self.conversation_path
     }
@@ -1201,6 +1233,29 @@ fn parse_invocation_end_reason(line: &str) -> Result<Option<InvocationEndReason>
         other => return Err(format!("unknown invocation_end.reason {other:?}")),
     };
     Ok(Some(parsed))
+}
+
+/// Pull `model` from an `invocation_start` line. Returns `Ok(None)` for
+/// any other record kind, so a full-file scan can look for the last one.
+fn parse_invocation_start_model(line: &str) -> Result<Option<String>, String> {
+    let json = RawJson::parse(line).map_err(|e| e.to_string())?;
+    let value = json.value();
+    let kind = value
+        .to_member("kind")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    if kind != "invocation_start" {
+        return Ok(None);
+    }
+    let model = value
+        .to_member("model")
+        .and_then(|m| m.required())
+        .and_then(|m| m.to_unquoted_string_str())
+        .map_err(|e| e.to_string())?
+        .into_owned();
+    Ok(Some(model))
 }
 
 /// Histogram of one slice of the conversation log: how many records
@@ -2603,6 +2658,31 @@ mod tests {
         let line = nojson::Json(&record).to_string();
         assert!(
             parse_invocation_end_reason(&line)
+                .expect("parse ok")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_invocation_start_model_extracts_and_filters() {
+        let start = SessionRecord::InvocationStart {
+            ts: 7,
+            attini_version: "9.9.9".to_string(),
+            model: "deepseek-flash".to_string(),
+        };
+        let line = nojson::Json(&start).to_string();
+        assert_eq!(
+            parse_invocation_start_model(&line).expect("parse ok"),
+            Some("deepseek-flash".to_string())
+        );
+        // Any other kind is ignored so a full-file scan finds the last one.
+        let other = SessionRecord::User {
+            ts: 1,
+            text: "hi".to_string(),
+        };
+        let line = nojson::Json(&other).to_string();
+        assert!(
+            parse_invocation_start_model(&line)
                 .expect("parse ok")
                 .is_none()
         );

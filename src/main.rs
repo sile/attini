@@ -170,6 +170,17 @@ fn run() -> Result<RunOutcome, RunError> {
             return Ok(RunOutcome::Ok);
         }
     }
+    match try_run_compact(&mut args)? {
+        CommandOutcome::NotHandled => {}
+        CommandOutcome::Done => return Ok(RunOutcome::Ok),
+        CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
+        CommandOutcome::Help => {
+            if let Some(help) = args.finish()? {
+                print!("{help}");
+            }
+            return Ok(RunOutcome::Ok);
+        }
+    }
     match try_run_ask(&mut args)? {
         CommandOutcome::NotHandled => {}
         CommandOutcome::Done => return Ok(RunOutcome::Ok),
@@ -346,6 +357,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         temperature,
         grant_request: tell_cli::GrantRequest::None,
         command_timeout_seconds,
+        follow_session_model: false,
     };
     match tell_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
         tell_cli::TellOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
@@ -389,13 +401,9 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .env(SESSION_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
-    let model: String = noargs::opt("model")
-        .ty("NAME")
-        .doc("Model name")
-        .default(DEFAULT_MODEL)
-        .env(MODEL_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
+    // `approve` follows the session's own model (its plan and summariser
+    // calls must match the model the conversation has been using), so
+    // there is deliberately no `--model` option here.
     // --grant <SCOPE>: fold a persistent auto-approve rule into the
     // approval, so the rule is written without editing permissions.jsonl.
     let grant: tell_cli::GrantRequest = match noargs::opt("grant")
@@ -442,7 +450,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
     let cfg = TellConfig {
         session_name,
-        model,
+        model: DEFAULT_MODEL.to_string(),
         max_tokens: None,
         workspace_root,
         system_prompt: None,
@@ -456,10 +464,78 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         temperature: None,
         grant_request: grant,
         command_timeout_seconds,
+        follow_session_model: true,
     };
     match tell_cli::run(cfg, Continuation::Approve).map_err(|e| RunError::Runtime(e.to_string()))? {
         tell_cli::TellOutcome::Exit(code) => Ok(CommandOutcome::Exit(code)),
     }
+}
+
+// -------------------------------------------------------------------
+// `attini compact` command
+// -------------------------------------------------------------------
+
+/// Intentionally fold a session's history: the model proposes a plan for
+/// what to keep, the older records are summarised with that plan, and a
+/// single `summary` record replaces them.
+///
+/// This is a deliberate, separate command rather than something
+/// `attini approve` does implicitly. Approving a pending tool call or
+/// resuming a stopped session is one model call; folding history is a
+/// distinct intent the human asks for explicitly, so a plain approve
+/// never spends the planner/summariser calls.
+///
+/// The session's own model is followed (its most recent
+/// `invocation_start.model`), matching `approve`; `--model` is not
+/// accepted here.
+fn try_run_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
+    if !noargs::cmd("compact")
+        .doc(
+            "Fold a session's history: the model plans what to keep, then the older records are summarised",
+        )
+        .take(args)
+        .is_present()
+    {
+        return Ok(CommandOutcome::NotHandled);
+    }
+    let session_name: String = noargs::opt("session")
+        .short('s')
+        .ty("NAME")
+        .doc("Session name; directory is .attini/<NAME>/")
+        .default("main")
+        .env(SESSION_ENV)
+        .take(args)
+        .then(|o| o.value().parse())?;
+
+    if args.metadata().help_mode {
+        return Ok(CommandOutcome::Help);
+    }
+    // No positional: an unknown token is a hard error, not silently
+    // absorbed.
+    check_unconsumed_args(args)?;
+
+    let workspace_root = std::env::current_dir()
+        .map_err(|e| RunError::Runtime(format!("failed to read current dir: {e}")))?;
+    let cfg = TellConfig {
+        session_name,
+        model: DEFAULT_MODEL.to_string(),
+        max_tokens: None,
+        workspace_root,
+        system_prompt: None,
+        max_turns: DEFAULT_MAX_TURNS,
+        turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
+            .parse()
+            .map_err(|e| RunError::Runtime(format!("bad default turn limit: {e}")))?,
+        tool_call_rate: parse_tool_call_rate(DEFAULT_TOOL_CALL_RATE_STR)?,
+        session_tool_call_max: parse_session_tool_call_max(DEFAULT_SESSION_TOOL_CALL_MAX_STR)?,
+        authorization: attini::sansio::permissions::Authorization::PerTool,
+        temperature: None,
+        grant_request: tell_cli::GrantRequest::None,
+        command_timeout_seconds: None,
+        follow_session_model: true,
+    };
+    tell_cli::run_compact(cfg).map_err(|e| RunError::Runtime(e.to_string()))?;
+    Ok(CommandOutcome::Done)
 }
 
 // -------------------------------------------------------------------

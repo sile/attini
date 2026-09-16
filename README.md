@@ -147,6 +147,8 @@ export DEEPSEEK_API_KEY=sk-...
 attini tell [--system-prompt TEXT] [--max-tokens N] [--temperature N] [--command-timeout N] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace] [--command-timeout N]
+
+attini compact [-s NAME]
 ```
 
 `--stdin` reads standard input (until EOF) and appends it to the prompt as a
@@ -277,6 +279,33 @@ stderr (never stdout, so streamed content and `| jq`/redirects stay clean):
 the **current** conversation size (the last recorded `prompt_tokens`, not the
 cumulative billed total) — so you can see how close the session is to
 compaction before it runs. `ATTINI_STATUS_LINE=0` disables the line.
+
+### Intentional compaction (`attini compact`)
+
+```sh
+attini compact [-s NAME]
+```
+
+`compact` folds a session's history on demand. Ordinary `tell` runs compact
+**automatically** once the conversation grows past the token threshold, but a
+long session can still accumulate context you want gone before that fires; and
+a plain `approve` never compacts. `compact` is the explicit "fold this now"
+action:
+
+1. The model is shown the conversation and asked, read-only, for a compaction
+   plan — how many recent records to keep verbatim, what to focus the summary
+   on, and any excerpts that must survive.
+2. The older records are summarised with that plan and replaced by a single
+   `summary` record.
+
+There are no tuning flags: the model proposes the fold, and the number of
+records it keeps is clamped by the same safe-boundary logic as automatic
+compaction (it can never split an `assistant -> tool` pair or exceed the
+retained-tail budget). The command follows the session's own model (its most
+recent `invocation_start.model`), so `--model` is not accepted. The plan and
+summariser calls do not touch the conversation; only the resulting `summary`
+record is written. If the planner or summariser fails, the history is left
+intact and a warning is printed.
 
 ### Inspecting sessions
 

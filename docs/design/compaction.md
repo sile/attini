@@ -87,7 +87,8 @@ the model during compaction.
 - `try_auto_compact` is gated on the continuation **as originally
   requested**, before `drive` normalises an `Approve` into a
   continuation (`runs_pre_prompt_compaction`). It therefore fires only
-  for a fresh `attini tell` prompt and never for `attini approve`.
+  for a fresh `attini tell` prompt and never for `attini approve` or
+  `attini compact`.
   Relying on the `pending.json` check alone was not enough: a
   pending-free `approve` (the `max_turns` case) normalises into
   `Prompt(RESUME_PROMPT)` and would otherwise look identical to a
@@ -95,8 +96,39 @@ the model during compaction.
   human never asked for.
 - It fires on the first turn of a resumed session only; after compaction the
   summary replaces the huge history so a second pass sees a small total.
-- Compaction is automatic only; there is no manual `compact` subcommand. The
-  log is bounded by automatic pruning, described in [pruning.md](pruning.md).
+
+## Intentional compaction on `attini compact`
+
+`attini compact` does its own compaction, but it is **model-planned**
+rather than size-triggered (`run_compaction`):
+
+1. **Plan call** (read-only): the model is shown the same bounded prose
+transcript and asked (`COMPACT_PLANNER_SYSTEM_PROMPT`) for a JSON plan:
+`{"keep_recent": N, "focus": "...", "keep_verbatim": [...]}`.
+2. **Summarise**: `compact_conversation` runs with the plan. `keep_recent`
+is clamped by `compaction_cutoff` / `safe_tail_start` /
+`RETAINED_TAIL_MAX_CHARS` — the model's number can move the target but never
+split an `assistant -> tool` pair or exceed the tail budget; `focus` and
+`keep_verbatim` are appended to the summariser instruction.
+
+Neither the plan call nor the summariser call appends an `invocation_start`
+record, so they do not perturb the conversation or the "latest model". A
+planner failure (transport error, or non-JSON reply) falls back to plain
+compaction with no plan; a summariser failure just warns and keeps the full
+history.
+
+`compact` follows the session's own model (its most recent
+`invocation_start.model`), exactly like `approve`; `--model` is not accepted.
+It takes no other tunables — the model proposes the fold, and only the safe
+boundary machinery can override it.
+
+`attini approve` never compacts. Approving a pending tool call, resuming
+after `max_turns`, or re-issuing a transport failure is one model call;
+the human asks for intentional compaction explicitly with `attini compact`.
+
+The automatic `tell` path is unchanged and still size-triggered with no plan.
+The log is additionally bounded by automatic pruning, described
+in [pruning.md](pruning.md).
 
 ## Related
 
