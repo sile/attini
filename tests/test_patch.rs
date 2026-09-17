@@ -492,15 +492,23 @@ fn layer1_rejects_workspace_permissions() {
 }
 
 #[test]
-fn layer2_allows_scratchpad_add_with_subdir_auto_create() {
+fn layer2_scratchpad_add_is_writable_with_subdir_auto_create() {
+    // The scratchpad is a gitignored region the user has opted into,
+    // so an Add there is not the usual `IgnoredParent` hard-reject: it
+    // resolves (creating the subdir) but is parked for approval.
     let root = TempRoot::new("layer2-scratchpad-subdir");
     let executor = exec_with_git(&root, &[]);
-    executor
+    let (_, preview) = executor
         .preview_patch(&inv(vec![add(
             ".attini/test/scratchpad/plans/2026-08-05.md",
             "# plan\n",
         )]))
         .expect("scratchpad subdir Add ok");
+    assert!(!preview.auto_approve, "scratchpad writes require approval");
+    assert!(
+        preview.not_revertible.is_some(),
+        "untracked → not revertible"
+    );
 }
 
 #[test]
@@ -527,10 +535,11 @@ fn layer2_syntactic_bypass_does_not_leak_side_effect_outside_scratchpad() {
 
 #[test]
 fn layer2_other_session_scratchpad_is_not_layer2() {
-    // Layer 2 covers only the current session's scratchpad. Other
-    // session's scratchpad falls through to Layer 3, which sees the
-    // path as untracked and therefore requires approval (`NeedsApproval`)
-    // rather than a hard rejection.
+    // Only the current session's scratchpad gets the Layer-2 treatment
+    // (writable-but-approval-gated is identical here, but the point is
+    // that another session's scratchpad is not specially handled). It
+    // falls through to Layer 3, which sees the path as untracked and
+    // requires approval (`NeedsApproval`), not a hard rejection.
     let root = TempRoot::new("layer2-other-session-scratchpad");
     fs::create_dir_all(root.path().join(".attini/other/scratchpad"))
         .expect("mkdir other scratchpad");
@@ -613,7 +622,7 @@ fn layer3_in_invocation_add_then_update_is_allowed() {
 }
 
 #[test]
-fn layer4_not_in_git_repo_needs_approval_but_allows_scratchpad() {
+fn layer4_not_in_git_repo_needs_approval_for_all_writes() {
     // No git init here — Layer 4 fallback kicks in.
     let root = TempRoot::new("layer4-not-a-repo");
     fs::create_dir_all(root.path().join(".attini/test/scratchpad")).expect("mkdir scratchpad");
@@ -626,12 +635,16 @@ fn layer4_not_in_git_repo_needs_approval_but_allows_scratchpad() {
         .expect("non-scratchpad write previews but needs approval");
     assert!(!preview.auto_approve);
     assert!(preview.not_revertible.is_some());
-    // Scratchpad is Layer 2 (git-independent): no git-tracking concern,
-    // so it is not flagged as unrevertible.
+    // Scratchpad outside a repo is writable (not hard-rejected) but,
+    // like every non-tracked write, requires approval.
     let (_, sp_preview) = executor
         .preview_patch(&inv(vec![add(".attini/test/scratchpad/note.md", "hi")]))
-        .expect("scratchpad ok even without git");
-    assert!(sp_preview.not_revertible.is_none());
+        .expect("scratchpad write ok even without git");
+    assert!(
+        !sp_preview.auto_approve,
+        "scratchpad writes require approval"
+    );
+    assert!(sp_preview.not_revertible.is_some());
 }
 
 // ---------------------------------------------------------------
@@ -656,6 +669,33 @@ fn write_allow_rule_permits_untracked_update() {
         )
         .expect("apply under write allow");
     assert_eq!(root.read("notes/draft.md"), b"after\n");
+}
+
+#[test]
+fn write_allow_rule_permits_scratchpad_write() {
+    // Without a rule the scratchpad is approval-gated. A `write`
+    // `allow:true` rule is the escape hatch: it auto-approves the
+    // scratchpad write (the Layer-2 region is consulted by the rule,
+    // not hard-allowed on its own).
+    let root = TempRoot::new("write-allow-scratchpad");
+    fs::create_dir_all(root.path().join(".attini/test/scratchpad")).expect("mkdir scratchpad");
+    root.write(".attini/test/scratchpad/notes.md", b"prev\n");
+    let mut executor = exec_with_git(&root, &[]);
+    executor.set_write_rules(vec![Rule::write(
+        true,
+        ".attini/test/scratchpad".to_string(),
+    )]);
+    let (_, preview) = executor
+        .preview_patch(&inv(vec![update(
+            ".attini/test/scratchpad/notes.md",
+            "prev\n",
+            "next\n",
+        )]))
+        .expect("scratchpad Update under write allow");
+    assert!(
+        preview.auto_approve,
+        "write allow rule auto-approves scratchpad Update"
+    );
 }
 
 #[test]

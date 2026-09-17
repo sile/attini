@@ -70,16 +70,17 @@ impl ToolExecutor {
     /// compare against a stable prefix; `extra_read_roots` are
     /// expected to already be canonicalised by the caller (paths
     /// that fail to canonicalise should be warned + skipped upstream).
-    /// `session_name` names the session directory that hosts the
-    /// scratchpad free-write zone for Layer 2.
+    /// `session_name` names the session directory whose scratchpad is
+    /// exempted from the `IgnoredParent` hard-reject in Layer 2 (it is
+    /// still approval-gated like any other non-tracked write).
     ///
     /// Also probes git state at startup for Layer 3/4 of the patch
     /// tool's write guards. When the workspace is inside a git
     /// working tree, `git ls-files` runs once and its output is
     /// normalised to workspace-relative canonical paths for O(1)
     /// tracked-file lookup during patch. When it is not, Layer 4
-    /// takes over: writes outside scratchpad are refused, and a
-    /// warning is emitted on stderr once at startup.
+    /// takes over: every write requires approval, and a warning is
+    /// emitted on stderr once at startup.
     pub fn new(
         root: impl AsRef<Path>,
         extra_read_roots: Vec<PathBuf>,
@@ -599,7 +600,8 @@ impl ToolExecutor {
 // Patch tool write guards: four-layer check.
 //
 // Layer 1: hardcoded runtime-critical always-reject (canonical-form)
-// Layer 2: scratchpad always-allow (with subdir auto-create)
+// Layer 2: scratchpad is writable-but-approval-gated (never hard-rejected;
+//          an explicit `write allow:true` rule may auto-approve it)
 // Layer 3: git tracking check (Update: tracked; Add: parent not ignored)
 // Layer 4: not-in-git-repo fallback (all Layer-3 candidates reject)
 // -------------------------------------------------------------------
@@ -618,7 +620,7 @@ fn probe_git_state(root: &Path) -> GitState {
         Ok(out) if out.status.success() => out,
         _ => {
             eprintln!(
-                "attini: workspace is not a git repository; patch tool will refuse writes outside scratchpad. Consider `git init` for full patch access."
+                "attini: workspace is not a git repository; patch writes will require approval. Consider `git init` for a smoother patch flow."
             );
             return GitState::NotARepo;
         }
@@ -629,7 +631,7 @@ fn probe_git_state(root: &Path) -> GitState {
     let toplevel_str = String::from_utf8_lossy(&toplevel.stdout);
     if toplevel_str.trim().is_empty() {
         eprintln!(
-            "attini: `git rev-parse --show-toplevel` returned empty; patch tool will refuse writes outside scratchpad."
+            "attini: `git rev-parse --show-toplevel` returned empty; patch writes will require approval."
         );
         return GitState::NotARepo;
     }
@@ -798,15 +800,21 @@ impl ToolExecutor {
                 reason: reason.to_string(),
             });
         }
-        // Layer 2 (canonical re-verification): if canon lives under
-        // this session's canonical scratchpad, allow unconditionally.
-        // Callers must have already ensured any needed subdir was
-        // created in the Add path (see resolve_add_target).
-        if let Ok(sp_canon) = scratchpad_root(&self.root, &self.session_name).canonicalize()
-            && canon.starts_with(&sp_canon)
-        {
-            return Ok(WriteGuard::Allow);
-        }
+        // Layer 2 (canonical re-verification): a path under this
+        // session's canonical scratchpad is not a hard-reject zone the
+        // way a gitignored region normally is. It is *writable*, but
+        // still requires approval (it is not git-tracked, so a write
+        // cannot be undone with `git checkout`). An explicit `write
+        // allow:true` rule evaluated just below may still auto-approve
+        // it; absent such a rule the scratchpad falls through to the
+        // same approval path as any other non-tracked write.
+        //
+        // The `IgnoredParent` hard-reject in Layer 3 does not apply
+        // here: `.attini` is gitignored, yet scratchpad files must
+        // remain creatable (with approval).
+        let in_scratchpad = scratchpad_root(&self.root, &self.session_name)
+            .canonicalize()
+            .is_ok_and(|sp_canon| canon.starts_with(&sp_canon));
         match evaluate_write(&layers, &rel, &Authorization::PerTool) {
             Judgment::AutoApprove(_) => return Ok(WriteGuard::Allow),
             Judgment::AutoDeny(_) => {
@@ -819,9 +827,10 @@ impl ToolExecutor {
         }
         // Layer 3 / 4. These no longer hard-reject the write; instead
         // they ask for human approval (decision D1). The `IgnoredParent`
-        // case stays a hard rejection: a gitignored region is an
-        // explicit user declaration that the path is out-of-scope, not
-        // merely "irrecoverable with git checkout".
+        // case stays a hard rejection *except* for the session
+        // scratchpad, which is a gitignored region the user has
+        // deliberately opted into: it is writable but still requires
+        // approval (`in_scratchpad`).
         match &self.git_state {
             GitState::NotARepo => Ok(WriteGuard::NeedsApproval {
                 reason: "the workspace is not a git repository, so this change cannot be \
@@ -832,6 +841,13 @@ impl ToolExecutor {
                 PatchOp::Update => {
                     if tracked.borrow().contains(&rel) {
                         Ok(WriteGuard::Allow)
+                    } else if in_scratchpad {
+                        Ok(WriteGuard::NeedsApproval {
+                            reason: "the target is in the session scratchpad, which is not \
+                                     tracked by git, so this change cannot be reverted with \
+                                     `git checkout`"
+                                .to_string(),
+                        })
                     } else {
                         Ok(WriteGuard::NeedsApproval {
                             reason: "the target is not tracked by git, so this change cannot \
@@ -842,7 +858,14 @@ impl ToolExecutor {
                 }
                 PatchOp::Add => {
                     let parent_rel = rel.parent().unwrap_or(Path::new(""));
-                    if is_gitignored(&self.root, parent_rel) {
+                    if in_scratchpad {
+                        Ok(WriteGuard::NeedsApproval {
+                            reason: "the target is in the session scratchpad, which is not \
+                                     tracked by git, so this change cannot be reverted with \
+                                     `git checkout`"
+                                .to_string(),
+                        })
+                    } else if is_gitignored(&self.root, parent_rel) {
                         Err(PatchError::IgnoredParent {
                             path: display_workspace_relative(&rel),
                         })
@@ -874,8 +897,8 @@ enum PatchOp {
 
 /// Outcome of the patch write guard (`check_patch_write`). `Allow`
 /// means the write may proceed without an approval prompt (a git-
-/// tracked Update, a Layer-2 scratchpad path, or a `write allow:true`
-/// rule). `NeedsApproval` means the write must be previewed for the
+/// tracked Update or a `write allow:true` rule). `NeedsApproval`
+/// means the write must be previewed for the
 /// human, carrying a short reason that explains why the change cannot
 /// be reverted with `git checkout`. Hard rejections (Layer 1 protected
 /// paths, `write allow:false` rules, gitignored parents, workspace

@@ -35,8 +35,11 @@ heuristic. The guard order is:
    runtime-critical paths (`.git/**`,
    `.attini/*/{LOCK,conversation.jsonl,pending.json,permissions.jsonl}`,
    `.attini/permissions.jsonl`). A `write` rule cannot override this.
-3. **Layer 2** -- this session's scratchpad always writes without a prompt.
-   A `write` rule is not reached here.
+3. **Layer 2** -- this session's scratchpad is writable but *always
+   approval-gated*: it is a gitignored region the user has opted into, so an
+   `Add` there is not the usual `IgnoredParent` hard-reject, but neither is it
+   auto-approved. A `write` rule is still consulted just below and may
+   auto-approve a scratchpad write.
 4. **`write` rules** -- last-match-wins over `[workspace] ++ [session]`:
    - a winning `allow:true` rule permits the write, *including* an untracked
      `Update`, an `Add`, a target outside the workspace, and even a non-git

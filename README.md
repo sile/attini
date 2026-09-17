@@ -256,10 +256,11 @@ are pending — is rejected up front. The argv-prefix is truncated the same way 
 the printed suggestion (first two elements, e.g. `cargo test`), so the two never
 disagree.
 
-A patch that touches a non-git-tracked path (including any non-scratchpad write
-in a non-git workspace) is still *writable*, but it is parked for approval with a
-`NOTE:` line explaining that `git checkout` cannot undo it. `approve --grant` is
-the way to auto-approve such a write without hand-editing `permissions.jsonl`.
+A patch that touches a non-git-tracked path (including any scratchpad write, and
+any write in a non-git workspace) is still *writable*, but it is parked for
+approval with a `NOTE:` line explaining that `git checkout` cannot undo it.
+`approve --grant` is the way to auto-approve such a write without hand-editing
+`permissions.jsonl`.
 The only hard refusal left is an `Add` into a gitignored region, which must be
 lifted by a hand-written `write` rule (see the permissions section), not by
 `--grant`.
