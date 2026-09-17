@@ -20,9 +20,6 @@ const MAX_TOKENS_ENV: &str = "ATTINI_MAX_TOKENS";
 /// Environment variable that supplies a default sampling temperature when
 /// `--temperature` is omitted.
 const TEMPERATURE_ENV: &str = "ATTINI_TEMPERATURE";
-/// Environment variable that supplies a default system prompt when
-/// `--system-prompt` is omitted.
-const SYSTEM_PROMPT_ENV: &str = "ATTINI_SYSTEM_PROMPT";
 /// Environment variable that supplies a default `command` tool timeout
 /// (seconds) when `--command-timeout` is omitted.
 const COMMAND_TIMEOUT_ENV: &str = "ATTINI_COMMAND_TIMEOUT_SECONDS";
@@ -228,12 +225,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .env(MODEL_ENV)
         .take(args)
         .then(|o| o.value().parse())?;
-    let system: Option<String> = noargs::opt("system-prompt")
-        .ty("TEXT")
-        .doc("Optional system prompt prepended to the conversation")
-        .env(SYSTEM_PROMPT_ENV)
-        .take(args)
-        .present_and_then(|o| o.value().parse())?;
     let session_name: String = noargs::opt("session")
         .short('s')
         .ty("NAME")
@@ -348,7 +339,6 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         model,
         max_tokens,
         workspace_root,
-        system_prompt: system,
         max_turns: DEFAULT_MAX_TURNS,
         turn_tool_call_limit,
         tool_call_rate,
@@ -453,7 +443,6 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         model: DEFAULT_MODEL.to_string(),
         max_tokens: None,
         workspace_root,
-        system_prompt: None,
         max_turns: DEFAULT_MAX_TURNS,
         turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
             .parse()
@@ -521,7 +510,6 @@ fn try_run_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         model: DEFAULT_MODEL.to_string(),
         max_tokens: None,
         workspace_root,
-        system_prompt: None,
         max_turns: DEFAULT_MAX_TURNS,
         turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
             .parse()

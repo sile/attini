@@ -3,7 +3,7 @@
 **Status:** Implemented. This document records how attini handles a single
 assistant turn that emits multiple tool calls — how each call is dispatched,
 what happens when one needs approval, and how unanswered calls are repaired
-on resume. It also records the system-prompt note added to steer the model
+on resume. It also records the system-message note added to steer the model
 away from a known corner of the design.
 
 ## Overview
@@ -80,7 +80,7 @@ dispatch order.
 ## Mitigation: the tool-batching note
 
 Rather than reorder dispatch (which risks breaking the assistant→tool
-pairing), attini nudges the model with a system-prompt note,
+pairing), attini nudges the model with a system-message note,
 `render_tool_batching_note`, injected once in `build_initial_messages`
 alongside the scratchpad note. The header is `# Tool call batching` and the
 gist is:
@@ -99,7 +99,7 @@ run after a pending one) would break the assistant→tool continuity: a `tool`
 result must immediately follow the assistant `tool_calls` it answers, and a
 suspended turn has not produced its approval-requiring result yet. Running
 and appending a read-only result first would interleave the answers. The
-system-prompt note avoids that without touching the message-pairing
+system-message note avoids that without touching the message-pairing
 invariants.
 
 ## How to revisit

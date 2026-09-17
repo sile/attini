@@ -144,7 +144,7 @@ export DEEPSEEK_API_KEY=sk-...
 ### Tell CLI (`attini tell`)
 
 ```sh
-attini tell [--system-prompt TEXT] [--max-tokens N] [--temperature N] [--command-timeout N] [--stdin] "<PROMPT>"
+attini tell [--max-tokens N] [--temperature N] [--command-timeout N] [--stdin] "<PROMPT>"
 
 attini approve [-s NAME] [--grant oneshot|session|workspace] [--command-timeout N]
 
@@ -167,10 +167,6 @@ run. When omitted the model's own default is used.
 `--temperature N` / `-t N` sets the sampling temperature for model calls.
 Default is 0 (deterministic), which DeepSeek recommends for coding/math. It
 can also be set via `ATTINI_TEMPERATURE`.
-
-`--system-prompt TEXT` prepends a system message to the conversation. It can
-also be set via `ATTINI_SYSTEM_PROMPT`; precedence is CLI flag, then env var,
-then none.
 
 `--command-timeout N` caps how long a single `command` tool call may run, in
 seconds (default 180). The child runs in its own process group and is killed
@@ -442,6 +438,5 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_MODEL_NAME` | Default model name when `--model` is omitted. Precedence: CLI flag, then this env var, then the built-in default. |
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
 | `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). |
-| `ATTINI_SYSTEM_PROMPT` | Default system prompt when `--system-prompt` is omitted. Precedence: CLI flag, then this env var, then none. |
 | `ATTINI_COMMAND_TIMEOUT_SECONDS` | Default `command` tool timeout in seconds when `--command-timeout` is omitted. Precedence: CLI flag, then this env var, then 180. `0` disables the cap. |
 | `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line status that `attini tell` prints to stderr at invocation start. Unset (or any other value) keeps it on. |

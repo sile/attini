@@ -202,7 +202,6 @@ pub struct TellConfig {
     /// model's own default; `Some(n)` caps response size / cost.
     pub max_tokens: Option<u64>,
     pub workspace_root: PathBuf,
-    pub system_prompt: Option<String>,
     pub max_turns: usize,
     /// Maximum tool calls admitted in a single model turn. Extras in
     /// the same response get a synthetic error result and the loop
@@ -1042,9 +1041,6 @@ fn build_initial_messages(session: &Session, cfg: &TellConfig) -> io::Result<Vec
             "# Prior conversation summary\n\n".to_string()
         };
         messages.push(ChatMessage::System(format!("{header}{}", summary.text)));
-    }
-    if let Some(sys) = &cfg.system_prompt {
-        messages.push(ChatMessage::System(sys.clone()));
     }
     messages.push(ChatMessage::System(render_scratchpad_note(
         &cfg.session_name,
@@ -3594,7 +3590,6 @@ mod tests {
             model: String::new(),
             max_tokens: None,
             workspace_root: PathBuf::new(),
-            system_prompt: None,
             max_turns: 0,
             turn_tool_call_limit: turn_limit,
             tool_call_rate: rate,
