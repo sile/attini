@@ -287,6 +287,22 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
 
+    // No `.env()` here on purpose: the env var
+    // (`ATTINI_COMPACTION_TRIGGER_TOKENS_KB`) is read separately by
+    // `resolve_compaction_trigger_tokens`, which *warns and falls back*
+    // on a bad value rather than aborting. Routing it through noargs'
+    // `.env()` would make a typo a hard usage error, which is the right
+    // call for the flag but not for the environment.
+    let compaction_trigger_kb: Option<u64> = noargs::opt("compaction-trigger-kb")
+        .ty("N")
+        .doc(
+            "Auto-compaction threshold in kilobytes (1 KB = 1024 tokens); when the previous \
+             prompt exceeds it the next turn summarises first. Default 16 (16384 tokens). \
+             Overrides ATTINI_COMPACTION_TRIGGER_TOKENS_KB.",
+        )
+        .take(args)
+        .present_and_then(|o| o.value().parse::<u64>())?;
+
     let use_stdin = noargs::flag("stdin")
         .short('I')
         .doc(
@@ -347,6 +363,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         temperature,
         grant_request: tell_cli::GrantRequest::None,
         command_timeout_seconds,
+        compaction_trigger_kb,
         follow_session_model: false,
     };
     match tell_cli::run(cfg, cont).map_err(|e| RunError::Runtime(e.to_string()))? {
@@ -453,6 +470,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         temperature: None,
         grant_request: grant,
         command_timeout_seconds,
+        compaction_trigger_kb: None,
         follow_session_model: true,
     };
     match tell_cli::run(cfg, Continuation::Approve).map_err(|e| RunError::Runtime(e.to_string()))? {
@@ -520,6 +538,7 @@ fn try_run_compact(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         temperature: None,
         grant_request: tell_cli::GrantRequest::None,
         command_timeout_seconds: None,
+        compaction_trigger_kb: None,
         follow_session_model: true,
     };
     tell_cli::run_compact(cfg).map_err(|e| RunError::Runtime(e.to_string()))?;

@@ -21,21 +21,42 @@ Two independent pieces work together:
 
 `try_auto_compact` (`src/tell_cli.rs`) judges the need to compact from two
 independent signals via the pure helper
-`should_auto_compact(latest, total_chars)`:
+`should_auto_compact(latest, total_chars, threshold)`:
 
 ```rust
-fn should_auto_compact(latest: u64, total_chars: usize) -> bool {
-    latest >= COMPACTION_TRIGGER_TOKENS || total_chars > RECORDS_TOTAL_MAX_CHARS
+fn should_auto_compact(latest: u64, total_chars: usize, threshold: u64) -> bool {
+    latest >= threshold || total_chars > RECORDS_TOTAL_MAX_CHARS
 }
 ```
 
 - `latest` is the last successful turn's `prompt_tokens`
-  (`session.latest_prompt_tokens()`), compared against
-  `COMPACTION_TRIGGER_TOKENS` (`16_384`).
+  (`session.latest_prompt_tokens()`), compared against `threshold`, the
+  resolved trigger (default `COMPACTION_TRIGGER_TOKENS`, `16_384`).
 - `total_chars` is the raw character size of the real records since the last
   summary, compared against `RECORDS_TOTAL_MAX_CHARS` (`250_000`). It is
-  computed only when `latest < COMPACTION_TRIGGER_TOKENS` (so a normal-size
+  computed only when `latest < threshold` (so a normal-size
   history does not pay the extra scan cost).
+
+### Tuning the trigger threshold
+
+The token threshold is configurable per invocation. `try_auto_compact` takes
+the resolved `threshold` as an argument, resolved once by
+`resolve_compaction_trigger_tokens(&cfg)`:
+
+- CLI flag `--compaction-trigger-kb N` (carried on
+  `TellConfig::compaction_trigger_kb`) wins, and is validated at parse time
+  (a non-integer is a usage error).
+- otherwise the env var `ATTINI_COMPACTION_TRIGGER_TOKENS_KB`;
+- otherwise the built-in default `COMPACTION_TRIGGER_TOKENS_KB` (`16`).
+
+Values are in **kilobytes**, with `1 KB = 1024 tokens` (the same convention
+that makes the default `64 × 1024 / 4 = 16_384`). So `--compaction-trigger-kb
+8` means an 8192-token trigger, i.e. compaction fires earlier. A present but
+unparseable env value is **ignored with a warning** rather than aborting
+startup, since the env is not validated interactively; the CLI flag is strict
+so a typo on the command line is a clear usage error. Only the `tell` entry
+point sets the flag; `approve` and `compact` leave it unset and use the
+default.
 
 ### Why two signals (the stale-token hole)
 

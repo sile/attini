@@ -175,6 +175,15 @@ result then reports `termination_reason: "timeout"`. `0` disables the cap. It
 can also be set via `ATTINI_COMMAND_TIMEOUT_SECONDS`; precedence is CLI flag,
 then env var, then the 180-second default.
 
+`--compaction-trigger-kb N` sets the auto-compaction threshold, in kilobytes
+(`1 KB = 1024 tokens`). When the previous turn's prompt exceeded it, the next
+`attini tell` summarises the older history before calling the model. Default
+is 16 (16384 tokens, one quarter of DeepSeek's 64 K context). Lower it to
+compact earlier, raise it to keep more history. It can also be set via
+`ATTINI_COMPACTION_TRIGGER_TOKENS_KB`; precedence is CLI flag, then env var,
+then the 16 KB default. A bad CLI value is a usage error; a bad env value is
+ignored with a warning and the default is used.
+
 DeepSeek thinking mode is always **disabled**: attini sends
 `{"thinking":{"type":"disabled"}}` on every request and offers no way to
 enable chain-of-thought. The human is the final gate, so a private exploration
@@ -440,4 +449,5 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
 | `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). |
 | `ATTINI_COMMAND_TIMEOUT_SECONDS` | Default `command` tool timeout in seconds when `--command-timeout` is omitted. Precedence: CLI flag, then this env var, then 180. `0` disables the cap. |
+| `ATTINI_COMPACTION_TRIGGER_TOKENS_KB` | Auto-compaction trigger in kilobytes (`1 KB = 1024 tokens`) when `--compaction-trigger-kb` is omitted. Precedence: CLI flag, then this env var, then 16 (16384 tokens). A value that is not a positive integer is ignored with a warning and the default is used. |
 | `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line status that `attini tell` prints to stderr at invocation start. Unset (or any other value) keeps it on. |

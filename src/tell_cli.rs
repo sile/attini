@@ -125,12 +125,28 @@ impl Counters {
     }
 }
 
-/// `prompt_tokens` threshold above which the next `Continuation::Prompt`
-/// invocation summarises before making the model call. Set to 1/4 of
-/// the DeepSeek 64 K context (`64 × 1024 / 4 = 16384`) so compaction
-/// leaves room for the next turn's growth plus the memory tier, tool
+/// Default `prompt_tokens` threshold above which the next
+/// `Continuation::Prompt` invocation summarises before making the model
+/// call, expressed in kilobytes (1 KB = 1024 tokens). Set to 1/4 of the
+/// DeepSeek 64 K context (`64 × 1024 / 4 = 16384`) so compaction leaves
+/// room for the next turn's growth plus the memory tier, tool
 /// definitions, and the summarizer's own input.
-pub const COMPACTION_TRIGGER_TOKENS: u64 = 16_384;
+///
+/// Overridable via `--compaction-trigger-kb` or
+/// `ATTINI_COMPACTION_TRIGGER_TOKENS_KB`; see
+/// [`resolve_compaction_trigger_tokens`].
+pub const COMPACTION_TRIGGER_TOKENS_KB: u64 = 16;
+
+/// Environment variable that overrides [`COMPACTION_TRIGGER_TOKENS_KB`].
+/// The value is in kilobytes (1 KB = 1024 tokens). A value that does not
+/// parse as a positive integer is ignored with a warning (the built-in
+/// default is used), so a stray env value cannot break startup.
+pub const COMPACTION_TRIGGER_TOKENS_ENV: &str = "ATTINI_COMPACTION_TRIGGER_TOKENS_KB";
+
+/// Token threshold this build uses when neither the flag nor the env var
+/// is set. Derived from [`COMPACTION_TRIGGER_TOKENS_KB`] so the two stay
+/// in lockstep; historically the literal was `16_384`.
+pub const COMPACTION_TRIGGER_TOKENS: u64 = COMPACTION_TRIGGER_TOKENS_KB * 1024;
 
 /// Upper bound on the number of diff lines printed for a patch
 /// preview / auto-approved patch. Beyond this the rest is collapsed
@@ -241,6 +257,12 @@ pub struct TellConfig {
     /// to `timeout`. `None` disables the cap. `Some(0)` is treated as
     /// disabled too, so `--command-timeout 0` opts out.
     pub command_timeout_seconds: Option<u64>,
+    /// Auto-compaction trigger threshold in kilobytes (1 KB = 1024
+    /// tokens), from `--compaction-trigger-kb` or
+    /// `ATTINI_COMPACTION_TRIGGER_TOKENS_KB`. `None` uses the built-in
+    /// [`COMPACTION_TRIGGER_TOKENS_KB`] default. Only the `tell` entry
+    /// point sets this; `approve` and `compact` leave it `None`.
+    pub compaction_trigger_kb: Option<u64>,
 }
 
 /// Default `command` tool timeout in seconds, used when neither
@@ -653,7 +675,14 @@ fn drive(
     // compaction fires "only on a fresh `Continuation::Prompt` (never on
     // `--approve`)".
     if started_by_prompt {
-        try_auto_compact(session, &cfg.model, counters, cfg.max_tokens)?;
+        let trigger_tokens = resolve_compaction_trigger_tokens(cfg);
+        try_auto_compact(
+            session,
+            &cfg.model,
+            counters,
+            cfg.max_tokens,
+            trigger_tokens,
+        )?;
     }
 
     let is_prompt = matches!(cont, Continuation::Prompt(_));
@@ -1139,8 +1168,8 @@ pub struct CompactPlan {
 ///
 /// Returns `true` when at least one of two independent signals says
 /// the real history is too large:
-///   * the last successful turn recorded `>= COMPACTION_TRIGGER_TOKENS`
-///     prompt tokens (`latest`);
+///   * the last successful turn recorded `>= threshold` prompt tokens
+///     (`latest`);
 ///   * the raw character size of the real records since the last
 ///     summary (`total_chars`) exceeds `RECORDS_TOTAL_MAX_CHARS`.
 ///
@@ -1148,8 +1177,81 @@ pub struct CompactPlan {
 /// recording its `token_usage`: `latest` is then stale/small, but the
 /// actual records (e.g. a huge tool result) are still enormous and
 /// would overflow the next main call.
-fn should_auto_compact(latest: u64, total_chars: usize) -> bool {
-    latest >= COMPACTION_TRIGGER_TOKENS || total_chars > RECORDS_TOTAL_MAX_CHARS
+///
+/// `threshold` is resolved once per invocation by
+/// [`resolve_compaction_trigger_tokens`] so this stays a pure function.
+fn should_auto_compact(latest: u64, total_chars: usize, threshold: u64) -> bool {
+    latest >= threshold || total_chars > RECORDS_TOTAL_MAX_CHARS
+}
+
+/// Parse a kilobytes value for the auto-compaction trigger. Returns
+/// `None` for anything that is not a base-10 `u64` `> 0`, so callers can
+/// apply the appropriate fallback (warn+default for the env var). Split
+/// out from [`resolve_compaction_trigger_tokens`] so the parse rule is
+/// unit-testable without touching process env.
+fn parse_compaction_trigger_kb(raw: &str) -> Option<u64> {
+    match raw.trim().parse::<u64>() {
+        Ok(kb) if kb > 0 => Some(kb),
+        _ => None,
+    }
+}
+
+/// Convert a resolved kilobytes value (or `None` for "unset") into the
+/// token threshold, falling back to [`COMPACTION_TRIGGER_TOKENS`]. `1 KB
+/// = 1024 tokens`, matching the 64 K-context assumption behind the
+/// default.
+fn compaction_trigger_tokens_from_kb(kb: Option<u64>) -> u64 {
+    kb.map(|kb| kb.saturating_mul(1024))
+        .unwrap_or(COMPACTION_TRIGGER_TOKENS)
+}
+
+/// Resolve the trigger threshold from the already-read inputs: the CLI
+/// flag value (`flag_kb`) and the raw env-var value (`env_raw`, `None`
+/// when unset). Split out from [`resolve_compaction_trigger_tokens`] so
+/// the precedence and fallback rules are unit-testable without mutating
+/// the process env (which this crate forbids: `#![deny(unsafe_code)]`,
+/// and `set_var` is unsafe in edition 2024).
+///
+/// Precedence: flag > env > default. A present-but-unparseable env value
+/// warns and falls back to the default.
+fn resolve_trigger_tokens_from(flag_kb: Option<u64>, env_raw: Option<&str>) -> u64 {
+    if let Some(kb) = flag_kb {
+        return compaction_trigger_tokens_from_kb(Some(kb));
+    }
+    match env_raw {
+        Some(raw) => match parse_compaction_trigger_kb(raw) {
+            Some(kb) => compaction_trigger_tokens_from_kb(Some(kb)),
+            None => {
+                eprintln!(
+                    "[compaction] ignoring {COMPACTION_TRIGGER_TOKENS_ENV}={raw:?}: expected a \
+                     positive integer number of kilobytes; using default \
+                     {COMPACTION_TRIGGER_TOKENS_KB} KB"
+                );
+                COMPACTION_TRIGGER_TOKENS
+            }
+        },
+        None => COMPACTION_TRIGGER_TOKENS,
+    }
+}
+
+/// Resolve the auto-compaction trigger threshold in tokens for this
+/// invocation.
+///
+/// Precedence: the `--compaction-trigger-kb` CLI flag (carried on
+/// `cfg.compaction_trigger_kb`, already validated non-zero at parse
+/// time) overrides the `ATTINI_COMPACTION_TRIGGER_TOKENS_KB` env var,
+/// which in turn overrides the built-in [`COMPACTION_TRIGGER_TOKENS_KB`]
+/// default. A value of `N` kilobytes means `N * 1024` tokens (1 KB ≈ 1024
+/// tokens, matching the 64 K-context assumption behind the default).
+///
+/// An env var that is present but does not parse as a positive integer
+/// is ignored with a warning rather than aborting startup: the env is
+/// not validated interactively, so a typo should fall back to the
+/// default, not brick every invocation. (The CLI flag, by contrast, is
+/// rejected with a usage error, matching `--command-timeout`.)
+pub fn resolve_compaction_trigger_tokens(cfg: &TellConfig) -> u64 {
+    let env_raw = std::env::var(COMPACTION_TRIGGER_TOKENS_ENV).ok();
+    resolve_trigger_tokens_from(cfg.compaction_trigger_kb, env_raw.as_deref())
 }
 
 /// The intentional compaction run by `attini compact`: ask the model for
@@ -1197,6 +1299,7 @@ fn try_auto_compact(
     model: &str,
     counters: &mut Counters,
     max_tokens: Option<u64>,
+    trigger_tokens: u64,
 ) -> io::Result<()> {
     if session.load_pending()?.is_some() {
         return Ok(());
@@ -1216,7 +1319,7 @@ fn try_auto_compact(
     //     small `latest`).
     let latest = session.latest_prompt_tokens()?.unwrap_or(0);
     let records = session.load_records_since_last_summary()?;
-    let total_chars = if latest < COMPACTION_TRIGGER_TOKENS {
+    let total_chars = if latest < trigger_tokens {
         records
             .iter()
             .map(|r| message_raw_char_len(&r.message) + 1)
@@ -1224,7 +1327,7 @@ fn try_auto_compact(
     } else {
         0
     };
-    if !should_auto_compact(latest, total_chars) {
+    if !should_auto_compact(latest, total_chars, trigger_tokens) {
         return Ok(());
     }
     // The token threshold is judged from `latest`, which reflects the last
@@ -1243,14 +1346,14 @@ fn try_auto_compact(
     {
         return Ok(());
     }
-    if latest < COMPACTION_TRIGGER_TOKENS {
+    if latest < trigger_tokens {
         eprintln!(
             "[compaction] previous prompt was {latest} tokens (below threshold) but records are \
              {total_chars} chars, summarising..."
         );
     } else {
         eprintln!(
-            "[compaction] previous prompt was {latest} tokens (threshold {COMPACTION_TRIGGER_TOKENS}), summarising..."
+            "[compaction] previous prompt was {latest} tokens (threshold {trigger_tokens}), summarising..."
         );
     }
     counters.compaction_attempts += 1;
@@ -3443,8 +3546,16 @@ mod tests {
     fn should_auto_compact_fires_on_token_threshold() {
         // Last successful turn was large enough: compact on the token
         // threshold alone, even if the recorded size is tiny.
-        assert!(should_auto_compact(COMPACTION_TRIGGER_TOKENS, 0));
-        assert!(should_auto_compact(COMPACTION_TRIGGER_TOKENS + 1, 100));
+        assert!(should_auto_compact(
+            COMPACTION_TRIGGER_TOKENS,
+            0,
+            COMPACTION_TRIGGER_TOKENS
+        ));
+        assert!(should_auto_compact(
+            COMPACTION_TRIGGER_TOKENS + 1,
+            100,
+            COMPACTION_TRIGGER_TOKENS
+        ));
     }
 
     #[test]
@@ -3452,15 +3563,116 @@ mod tests {
         // The trigger hole: the token count is stale/small because the
         // previous turn suspended, but the real records are huge. The
         // size guard must fire even below the token threshold.
-        assert!(should_auto_compact(0, RECORDS_TOTAL_MAX_CHARS + 1));
-        assert!(should_auto_compact(1000, RECORDS_TOTAL_MAX_CHARS + 1));
+        assert!(should_auto_compact(
+            0,
+            RECORDS_TOTAL_MAX_CHARS + 1,
+            COMPACTION_TRIGGER_TOKENS
+        ));
+        assert!(should_auto_compact(
+            1000,
+            RECORDS_TOTAL_MAX_CHARS + 1,
+            COMPACTION_TRIGGER_TOKENS
+        ));
     }
 
     #[test]
     fn should_auto_compact_stays_quiet_when_everything_is_small() {
         // Both signals below their thresholds: no compaction.
-        assert!(!should_auto_compact(0, RECORDS_TOTAL_MAX_CHARS));
-        assert!(!should_auto_compact(COMPACTION_TRIGGER_TOKENS - 1, 10));
+        assert!(!should_auto_compact(
+            0,
+            RECORDS_TOTAL_MAX_CHARS,
+            COMPACTION_TRIGGER_TOKENS
+        ));
+        assert!(!should_auto_compact(
+            COMPACTION_TRIGGER_TOKENS - 1,
+            10,
+            COMPACTION_TRIGGER_TOKENS
+        ));
+    }
+
+    #[test]
+    fn should_auto_compact_honours_custom_threshold() {
+        // A caller-supplied threshold moves the trigger point: 8 KB = 8192
+        // tokens fires on a 9000-token prompt that the 16 KB default
+        // would ignore.
+        let low = 8 * 1024;
+        assert!(should_auto_compact(9000, 0, low));
+        assert!(!should_auto_compact(9000, 0, COMPACTION_TRIGGER_TOKENS));
+    }
+
+    #[test]
+    fn parse_compaction_trigger_kb_accepts_positive_integers() {
+        assert_eq!(parse_compaction_trigger_kb("8"), Some(8));
+        assert_eq!(parse_compaction_trigger_kb("  16 "), Some(16));
+        assert_eq!(parse_compaction_trigger_kb("1024"), Some(1024));
+    }
+
+    #[test]
+    fn parse_compaction_trigger_kb_rejects_bad_values() {
+        // Zero, negative, non-numeric, and empty all fall back.
+        assert_eq!(parse_compaction_trigger_kb("0"), None);
+        assert_eq!(parse_compaction_trigger_kb("-4"), None);
+        assert_eq!(parse_compaction_trigger_kb("16k"), None);
+        assert_eq!(parse_compaction_trigger_kb(""), None);
+        assert_eq!(parse_compaction_trigger_kb("abc"), None);
+    }
+
+    #[test]
+    fn compaction_trigger_tokens_from_kb_uses_default_when_unset() {
+        assert_eq!(
+            compaction_trigger_tokens_from_kb(None),
+            COMPACTION_TRIGGER_TOKENS
+        );
+        assert_eq!(
+            compaction_trigger_tokens_from_kb(Some(8)),
+            8 * 1024,
+            "8 KB should mean 8192 tokens"
+        );
+    }
+
+    #[test]
+    fn resolve_compaction_trigger_tokens_prefers_flag() {
+        // The CLI flag wins over the built-in default without reading env.
+        let mut cfg = test_config();
+        cfg.compaction_trigger_kb = Some(4);
+        assert_eq!(resolve_compaction_trigger_tokens(&cfg), 4 * 1024);
+    }
+
+    #[test]
+    fn resolve_trigger_tokens_from_flag_beats_env() {
+        // Flag wins even when a valid env value is present.
+        assert_eq!(resolve_trigger_tokens_from(Some(4), Some("99")), 4 * 1024);
+    }
+
+    #[test]
+    fn resolve_trigger_tokens_from_env_when_no_flag() {
+        assert_eq!(resolve_trigger_tokens_from(None, Some("2")), 2 * 1024);
+        assert_eq!(resolve_trigger_tokens_from(None, Some("  8 ")), 8 * 1024);
+    }
+
+    #[test]
+    fn resolve_trigger_tokens_from_default_when_both_unset() {
+        assert_eq!(
+            resolve_trigger_tokens_from(None, None),
+            COMPACTION_TRIGGER_TOKENS
+        );
+    }
+
+    #[test]
+    fn resolve_trigger_tokens_from_bad_env_falls_back() {
+        // A present-but-unparseable env value warns and uses the default.
+        assert_eq!(
+            resolve_trigger_tokens_from(None, Some("nonsense")),
+            COMPACTION_TRIGGER_TOKENS
+        );
+        assert_eq!(
+            resolve_trigger_tokens_from(None, Some("0")),
+            COMPACTION_TRIGGER_TOKENS
+        );
+        assert_eq!(
+            resolve_trigger_tokens_from(None, Some("")),
+            COMPACTION_TRIGGER_TOKENS
+        );
     }
 
     #[test]
@@ -3638,8 +3850,15 @@ mod tests {
             temperature: None,
             grant_request: GrantRequest::None,
             command_timeout_seconds: None,
+            compaction_trigger_kb: None,
             follow_session_model: false,
         }
+    }
+
+    /// A minimal `TellConfig` for unit tests that only care about a
+    /// couple of fields; callers override via `..`-style mutation.
+    fn test_config() -> TellConfig {
+        gate_config(1, None, None)
     }
 
     #[test]
