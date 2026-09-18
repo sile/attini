@@ -143,6 +143,15 @@ impl Session {
         Ok(summaries)
     }
 
+    /// Return the newest summary, or `None` when the conversation has
+    /// none yet. Compaction is cumulative: each new summary folds in
+    /// the previous one, and the prompt builder sends only this newest
+    /// summary, so older summary fragments are dead weight that must
+    /// not be re-sent.
+    pub fn latest_summary(&self) -> io::Result<Option<SummaryRecord>> {
+        Ok(self.load_summaries()?.into_iter().last())
+    }
+
     /// Return the real records (`user` / `assistant` / `tool`)
     /// whose `ts` is greater than the `cutoff_ts` of the newest
     /// summary. When there is no summary, every real record is

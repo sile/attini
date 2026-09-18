@@ -1028,19 +1028,15 @@ fn canonicalise_extra_read_roots(
 
 fn build_initial_messages(session: &Session, cfg: &TellConfig) -> io::Result<Vec<ChatMessage>> {
     let mut messages = Vec::new();
-    let summaries = session.load_summaries()?;
-    let total = summaries.len();
-    for (i, summary) in summaries.into_iter().enumerate() {
-        let header = if total > 1 {
-            format!(
-                "# Prior conversation summary (part {} of {})\n\n",
-                i + 1,
-                total
-            )
-        } else {
-            "# Prior conversation summary\n\n".to_string()
-        };
-        messages.push(ChatMessage::System(format!("{header}{}", summary.text)));
+    // Compaction is cumulative: the newest summary already folds in every
+    // older one, so only it is sent. Sending every summary ever written
+    // made the prompt grow without bound (~86k tokens of stale fragments on
+    // a mature session) and defeated the whole point of compaction.
+    if let Some(summary) = session.latest_summary()? {
+        messages.push(ChatMessage::System(format!(
+            "# Prior conversation summary\n\n{}",
+            summary.text
+        )));
     }
     messages.push(ChatMessage::System(render_scratchpad_note(
         &cfg.session_name,
@@ -1219,8 +1215,8 @@ fn try_auto_compact(
     //     `token_usage` (leaving a huge tool result behind but a stale,
     //     small `latest`).
     let latest = session.latest_prompt_tokens()?.unwrap_or(0);
+    let records = session.load_records_since_last_summary()?;
     let total_chars = if latest < COMPACTION_TRIGGER_TOKENS {
-        let records = session.load_records_since_last_summary()?;
         records
             .iter()
             .map(|r| message_raw_char_len(&r.message) + 1)
@@ -1229,6 +1225,22 @@ fn try_auto_compact(
         0
     };
     if !should_auto_compact(latest, total_chars) {
+        return Ok(());
+    }
+    // The token threshold is judged from `latest`, which reflects the last
+    // *prompt* -- not the size of the records that would be folded. On a
+    // session whose summaries have already caught up to the present, the
+    // records since the last summary are few, so there is nothing to fold;
+    // the threshold stays above its trigger for as long as a fresh record
+    // keeps the last prompt large. Bail before logging so the no-op does
+    // not print the same two lines on every turn.
+    if compaction_cutoff(
+        &records,
+        KEEP_RECENT_RECORDS_TARGET,
+        RETAINED_TAIL_MAX_CHARS,
+    )
+    .is_none()
+    {
         return Ok(());
     }
     if latest < COMPACTION_TRIGGER_TOKENS {
@@ -1254,12 +1266,17 @@ fn try_auto_compact(
 /// `assistant -> tool` pair is split, sends the older records to
 /// the summarizer, and appends a `SessionRecord::Summary`.
 ///
-/// Called by the auto-compaction path (`try_auto_compact`). Callers are
-/// expected to have already checked that the session is idle (no LOCK
-/// holder, no `pending.json`).
+/// The summary is cumulative: the previous summary is folded in (passed
+/// to `run_summariser` as `prior`), so the newest summary stands for the
+/// whole conversation and `build_initial_messages` can send only it.
+///
+/// Called by the auto-compaction path (`try_auto_compact`) and by the
+/// manual `attini compact` path (`run_compaction`). Callers are expected
+/// to have already checked that the session is idle (no LOCK holder, no
+/// `pending.json`).
 ///
 /// `plan` is an optional, model-authored instruction from the `attini
-/// approve` path. When present, its `keep_recent` (clamped against the
+/// compact` path. When present, its `keep_recent` (clamped against the
 /// safe-boundary machinery) sets the tail to keep, and its `focus` /
 /// `keep_verbatim` are threaded into the summariser prompt. When `None`
 /// behaviour is unchanged (the auto-compaction path passes `None`).
@@ -1298,7 +1315,16 @@ pub fn compact_conversation(
         .map(|r| r.ts)
         .expect("to_summarise is non-empty");
 
-    let text = run_summariser(model, to_summarise, max_tokens, plan)?;
+    // The previous summary (if any) is folded into the new one so the
+    // newest summary always stands for the whole conversation.
+    let prior = session.latest_summary()?;
+    let text = run_summariser(
+        model,
+        to_summarise,
+        prior.as_ref().map(|s| s.text.as_str()),
+        max_tokens,
+        plan,
+    )?;
     let words = text.split_whitespace().count();
 
     session.append(&SessionRecord::Summary {
@@ -1744,6 +1770,7 @@ fn run_compaction_planner(
 fn run_summariser(
     model: &str,
     records: Vec<ChatMessageWithTs>,
+    prior: Option<&str>,
     max_tokens: Option<u64>,
     plan: Option<&CompactPlan>,
 ) -> io::Result<String> {
@@ -1756,6 +1783,19 @@ fn run_summariser(
     // mentions) while keeping each tool result to a short line.
     let transcript = render_summary_transcript(&records);
     let mut system = SUMMARIZER_SYSTEM_PROMPT.to_string();
+    // Compaction is cumulative: the previous summary stands in for every
+    // older record. Feed it back so the new summary subsumes it, and so the
+    // prompt builder can send only this new summary going forward.
+    if let Some(prior) = prior {
+        system.push_str(
+            "\n\nA summary of the OLDER part of this conversation is included below. \
+             Your new summary MUST fold in everything from it that is still relevant \
+             and read as a single continuous summary of the whole conversation, not \
+             as an update or a diff.\n\n--- BEGIN PREVIOUS SUMMARY ---\n\n",
+        );
+        system.push_str(prior);
+        system.push_str("\n\n--- END PREVIOUS SUMMARY ---\n");
+    }
     if let Some(plan) = plan {
         if !plan.focus.trim().is_empty() {
             system.push_str(

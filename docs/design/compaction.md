@@ -72,6 +72,38 @@ kept raw.
 
 `None` is returned only when the retained tail stays within budget.
 
+### Automated compaction stays quiet when it would fold nothing
+
+Once the summaries have caught up to the present, the records since the last
+summary are few (measured: four), so `compaction_cutoff` returns `None` —
+there is genuinely nothing to fold. `latest_prompt_tokens`, however, still
+reflects the *last full prompt*, which stays above `COMPACTION_TRIGGER_TOKENS`
+as long as a fresh record keeps a prompt large. Without a guard, every turn
+would therefore print `previous prompt was N tokens ... summarising...`
+followed by `no records eligible for summarisation. skipping.` and do
+nothing.
+
+`try_auto_compact` now peeks `compaction_cutoff(&records, ...)` *before*
+the log lines and returns silently when it is `None`. The trigger and the
+fold decision are the same call, so the two can no longer disagree in the
+log.
+
+## Cumulative summary (only the newest is sent)
+
+Each `summary` record is **cumulative**: it folds in the previous summary
+along with the newly folded records, so it reads as one continuous summary
+of the whole conversation (see the `prior` parameter of `run_summariser`, and
+the `latest_summary` accessor).
+
+`build_initial_messages` sends **only the newest summary** as a system
+message. Earlier summaries are dead weight — the newest one already stands
+for everything at or before its `cutoff_ts`. Sending every summary ever
+written made the prompt grow without bound: on a mature session that had
+accumulated 165 summaries, the summary block alone was ~342k chars (~86k
+tokens), and every `compact` *added* to it, so the prompt climbed
+`124450 -> 125675 -> 126793` tokens across three compactions. Dropping the
+older summaries is what actually makes `compact` shrink the prompt.
+
 ## Summary rendering
 
 The summariser sends a **bounded prose transcript** rather than raw
@@ -94,8 +126,11 @@ the model during compaction.
   `Prompt(RESUME_PROMPT)` and would otherwise look identical to a
   `tell` by the time the gate runs, triggering a summariser call the
   human never asked for.
-- It fires on the first turn of a resumed session only; after compaction the
-  summary replaces the huge history so a second pass sees a small total.
+- After a successful fold, the newest summary stands for the older history
+  and is the only summary sent, so the next prompt contains just that summary
+  plus the retained tail — a second pass then sees a small total. If the
+  trigger fires again but nothing is foldable, `try_auto_compact` bails
+  silently (see "Automated compaction stays quiet", above).
 
 ## Intentional compaction on `attini compact`
 
