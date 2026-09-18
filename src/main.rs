@@ -23,6 +23,9 @@ const TEMPERATURE_ENV: &str = "ATTINI_TEMPERATURE";
 /// Environment variable that supplies a default `command` tool timeout
 /// (seconds) when `--command-timeout` is omitted.
 const COMMAND_TIMEOUT_ENV: &str = "ATTINI_COMMAND_TIMEOUT_SECONDS";
+/// Environment variable that supplies the agent-loop turn cap when
+/// `--max-turns` is omitted.
+const MAX_TURNS_ENV: &str = "ATTINI_MAX_TURNS";
 
 /// Cap on how many bytes `--stdin` may contribute to the prompt, to avoid
 /// bloating the user message with an unbounded paste.
@@ -33,6 +36,8 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 // numeric constants in `attini::tell_cli` by
 // `default_string_constants_stay_in_sync`.
 const DEFAULT_TURN_TOOL_CALL_LIMIT_STR: &str = "20";
+// String form of `tell_cli::DEFAULT_MAX_TURNS`, for the same reason.
+const DEFAULT_MAX_TURNS_STR: &str = "20";
 const DEFAULT_TOOL_CALL_RATE_STR: &str = "60/60";
 const DEFAULT_SESSION_TOOL_CALL_MAX_STR: &str = "5000";
 
@@ -260,6 +265,16 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .default(DEFAULT_SESSION_TOOL_CALL_MAX_STR)
         .take(args)
         .then(|o| o.value().parse())?;
+    let max_turns: usize = noargs::opt("max-turns")
+        .ty("N")
+        .doc(
+            "Maximum agent-loop turns for this invocation. Reaching it stops the \
+             session so it can be resumed with `attini approve`.",
+        )
+        .default(DEFAULT_MAX_TURNS_STR)
+        .env(MAX_TURNS_ENV)
+        .take(args)
+        .then(|o| o.value().parse())?;
     let max_tokens: Option<u64> = noargs::opt("max-tokens")
         .ty("N")
         .doc("Maximum completion tokens per model call; `none` uses the model default")
@@ -355,7 +370,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         model,
         max_tokens,
         workspace_root,
-        max_turns: DEFAULT_MAX_TURNS,
+        max_turns,
         turn_tool_call_limit,
         tool_call_rate,
         session_tool_call_max,
@@ -445,6 +460,19 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         .env(COMMAND_TIMEOUT_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
+    // Resume honours the same turn cap as `tell` so a session cut off at
+    // `max_turns` and continued here uses the limit the user chose (flag,
+    // then `ATTINI_MAX_TURNS`, then the default).
+    let max_turns: usize = noargs::opt("max-turns")
+        .ty("N")
+        .doc(
+            "Maximum agent-loop turns for this invocation. Reaching it stops the \
+             session so it can be resumed with `attini approve`.",
+        )
+        .default(DEFAULT_MAX_TURNS_STR)
+        .env(MAX_TURNS_ENV)
+        .take(args)
+        .then(|o| o.value().parse())?;
 
     if args.metadata().help_mode {
         return Ok(CommandOutcome::Help);
@@ -460,7 +488,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
         model: DEFAULT_MODEL.to_string(),
         max_tokens: None,
         workspace_root,
-        max_turns: DEFAULT_MAX_TURNS,
+        max_turns,
         turn_tool_call_limit: DEFAULT_TURN_TOOL_CALL_LIMIT_STR
             .parse()
             .map_err(|e| RunError::Runtime(format!("bad default turn limit: {e}")))?,
@@ -720,7 +748,7 @@ fn try_run_logstats(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErr
 mod tests {
     use super::*;
     use attini::tell_cli::{
-        DEFAULT_SESSION_TOOL_CALL_MAX, DEFAULT_TOOL_CALL_RATE_CALLS,
+        DEFAULT_MAX_TURNS, DEFAULT_SESSION_TOOL_CALL_MAX, DEFAULT_TOOL_CALL_RATE_CALLS,
         DEFAULT_TOOL_CALL_RATE_WINDOW_SECS, DEFAULT_TURN_TOOL_CALL_LIMIT,
     };
 
@@ -745,6 +773,7 @@ mod tests {
             DEFAULT_SESSION_TOOL_CALL_MAX_STR,
             DEFAULT_SESSION_TOOL_CALL_MAX.to_string()
         );
+        assert_eq!(DEFAULT_MAX_TURNS_STR, DEFAULT_MAX_TURNS.to_string());
     }
 
     #[test]

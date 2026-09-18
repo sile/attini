@@ -29,6 +29,10 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
 pub const EXIT_AWAITING_APPROVAL: u8 = 10;
 
+/// Default cap on agent-loop turns per invocation, used when neither
+/// `--max-turns` nor `ATTINI_MAX_TURNS` is set. `attini tell` accepts
+/// `--max-turns N`; `attini approve` reads the same env var (so resuming
+/// a turn-capped session keeps the limit the user chose).
 pub const DEFAULT_MAX_TURNS: usize = 20;
 
 /// Counters collected during one invocation of `tell_cli::run` for

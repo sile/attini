@@ -175,6 +175,12 @@ result then reports `termination_reason: "timeout"`. `0` disables the cap. It
 can also be set via `ATTINI_COMMAND_TIMEOUT_SECONDS`; precedence is CLI flag,
 then env var, then the 180-second default.
 
+`--max-turns N` caps the agent loop for one invocation (default 20). Reaching
+it stops the session with reason `max_turns`; resume with `attini approve` (see
+below). It can also be set via `ATTINI_MAX_TURNS`; precedence is CLI flag, then
+env var, then the 20-turn default. `attini approve` accepts the same flag and
+env var, so continuing a turn-capped session keeps the limit you chose.
+
 `--compaction-trigger-kb N` sets the auto-compaction threshold, in kilobytes
 (`1 KB = 1024 tokens`). When the previous turn's prompt exceeded it, the next
 `attini tell` summarises the older history before calling the model. Default
@@ -449,5 +455,6 @@ attini ask -s main "What is the model currently working on?"
 | `ATTINI_MAX_TOKENS` | Default completion-token cap when `--max-tokens` is omitted. Precedence: CLI flag, then this env var, then the model's own default (no cap). |
 | `ATTINI_TEMPERATURE` | Default sampling temperature when `--temperature` is omitted. Precedence: CLI flag, then this env var, then 0 (deterministic). |
 | `ATTINI_COMMAND_TIMEOUT_SECONDS` | Default `command` tool timeout in seconds when `--command-timeout` is omitted. Precedence: CLI flag, then this env var, then 180. `0` disables the cap. |
+| `ATTINI_MAX_TURNS` | Default agent-loop turn cap when `--max-turns` is omitted. Precedence: CLI flag, then this env var, then 20. Read by both `tell` and `approve`. A value that does not parse as a non-negative integer is a usage error. |
 | `ATTINI_COMPACTION_TRIGGER_TOKENS_KB` | Auto-compaction trigger in kilobytes (`1 KB = 1024 tokens`) when `--compaction-trigger-kb` is omitted. Precedence: CLI flag, then this env var, then 16 (16384 tokens). A value that is not a positive integer is ignored with a warning and the default is used. |
 | `ATTINI_STATUS_LINE` | Set to `0` to suppress the one-line status that `attini tell` prints to stderr at invocation start. Unset (or any other value) keeps it on. |
