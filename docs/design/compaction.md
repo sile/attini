@@ -186,8 +186,30 @@ The automatic `tell` path is unchanged and still size-triggered with no plan.
 The log is additionally bounded by automatic pruning, described
 in [pruning.md](pruning.md).
 
+## The past is forgotten, not lost
+
+Compaction only shortens what is sent to the model: the prompt keeps the
+newest summary plus the retained tail, and older records stop being sent.
+The records themselves are **not deleted** — they stay in
+`.attini/<session>/conversation.jsonl` (pruning, which does drop them, runs
+only past 100 MB; see [pruning.md](pruning.md)). So "forgetting" is a
+per-call decision, not a destructive one: the model works from the summary,
+while a human can still read the full history on disk.
+
+Because the log is a plain, line-oriented text file, any tool that can read
+a file can inspect it: `read` the raw `conversation.jsonl` directly, or run
+`attini logstats <NAME>` for a deterministic breakdown. So a session that
+has lost some earlier detail to compaction can simply read its own log back
+— the records are still there — instead of relying on an export step or a
+special API. That is the simple payoff of a text-file base: the transcript
+the model has "forgotten" is still ordinary data a person (or another
+session) can open.
+
 ## Related
 
-- [pruning.md](pruning.md) — automatic physical pruning of the log.
+- [pruning.md](pruning.md) — automatic physical pruning of the log (the one
+  path that does discard older records).
+- [conversation-analysis.md](conversation-analysis.md) — `attini logstats`,
+  the deterministic reader for a session's log.
 - `docs/bug/conversation-log-bloat.md` — the investigation that motivated the
   bounded prose summariser and the retained-tail cap.
