@@ -55,8 +55,7 @@ that makes the default `64 × 1024 / 4 = 16_384`). So `--compaction-trigger-kb
 unparseable env value is **ignored with a warning** rather than aborting
 startup, since the env is not validated interactively; the CLI flag is strict
 so a typo on the command line is a clear usage error. Only the `tell` entry
-point sets the flag; `approve` and `compact` leave it unset and use the
-default.
+point sets the flag; `approve` leaves it unset and uses the default.
 
 ### Why two signals (the stale-token hole)
 
@@ -121,9 +120,9 @@ message. Earlier summaries are dead weight — the newest one already stands
 for everything at or before its `cutoff_ts`. Sending every summary ever
 written made the prompt grow without bound: on a mature session that had
 accumulated 165 summaries, the summary block alone was ~342k chars (~86k
-tokens), and every `compact` *added* to it, so the prompt climbed
-`124450 -> 125675 -> 126793` tokens across three compactions. Dropping the
-older summaries is what actually makes `compact` shrink the prompt.
+tokens), and every compaction pass *added* to it (each pass made the prompt
+climb `124450 -> 125675 -> 126793` tokens across three passes). Dropping the
+older summaries is what actually makes compaction shrink the prompt.
 
 ## Summary rendering
 
@@ -140,8 +139,7 @@ the model during compaction.
 - `try_auto_compact` is gated on the continuation **as originally
   requested**, before `drive` normalises an `Approve` into a
   continuation (`runs_pre_prompt_compaction`). It therefore fires only
-  for a fresh `attini tell` prompt and never for `attini approve` or
-  `attini compact`.
+  for a fresh `attini tell` prompt and never for `attini approve`.
   Relying on the `pending.json` check alone was not enough: a
   pending-free `approve` (the `max_turns` case) normalises into
   `Prompt(RESUME_PROMPT)` and would otherwise look identical to a
@@ -153,38 +151,17 @@ the model during compaction.
   trigger fires again but nothing is foldable, `try_auto_compact` bails
   silently (see "Automated compaction stays quiet", above).
 
-## Intentional compaction on `attini compact`
+## Compaction is automatic
 
-`attini compact` does its own compaction, but it is **model-planned**
-rather than size-triggered (`run_compaction`):
+The only compaction path is the size-triggered one on `attini tell`. A plain
+`attini approve` never compacts: approving a pending tool call, resuming after
+`max_turns`, or re-issuing a transport failure is one model call. There is no
+separate manual compaction command — the token threshold is configurable (see
+`--compaction-trigger-kb` / `ATTINI_COMPACTION_TRIGGER_TOKENS_KB`), which is
+what a manual step used to be for.
 
-1. **Plan call** (read-only): the model is shown the same bounded prose
-transcript and asked (`COMPACT_PLANNER_SYSTEM_PROMPT`) for a JSON plan:
-`{"keep_recent": N, "focus": "...", "keep_verbatim": [...]}`.
-2. **Summarise**: `compact_conversation` runs with the plan. `keep_recent`
-is clamped by `compaction_cutoff` / `safe_tail_start` /
-`RETAINED_TAIL_MAX_CHARS` — the model's number can move the target but never
-split an `assistant -> tool` pair or exceed the tail budget; `focus` and
-`keep_verbatim` are appended to the summariser instruction.
-
-Neither the plan call nor the summariser call appends an `invocation_start`
-record, so they do not perturb the conversation or the "latest model". A
-planner failure (transport error, or non-JSON reply) falls back to plain
-compaction with no plan; a summariser failure just warns and keeps the full
-history.
-
-`compact` follows the session's own model (its most recent
-`invocation_start.model`), exactly like `approve`; `--model` is not accepted.
-It takes no other tunables — the model proposes the fold, and only the safe
-boundary machinery can override it.
-
-`attini approve` never compacts. Approving a pending tool call, resuming
-after `max_turns`, or re-issuing a transport failure is one model call;
-the human asks for intentional compaction explicitly with `attini compact`.
-
-The automatic `tell` path is unchanged and still size-triggered with no plan.
-The log is additionally bounded by automatic pruning, described
-in [pruning.md](pruning.md).
+The automatic path is size-triggered with no plan, and the log is additionally
+bounded by automatic pruning, described in [pruning.md](pruning.md).
 
 ## The past is forgotten, not lost
 
