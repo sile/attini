@@ -309,7 +309,6 @@ tedious. None of them acquire the session `LOCK` or write to the conversation lo
 
 ```sh
 attini status   -s NAME [--json]   # lock + summary + pending calls + aggregate metrics
-attini logstats -s NAME [--json]   # record-kind histogram, bytes by tool/command family
 attini ask      -s NAME [QUESTION] # ask the model to summarise the current state
 ```
 

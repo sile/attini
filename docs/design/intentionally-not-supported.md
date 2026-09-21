@@ -136,8 +136,8 @@ can distinguish "not implemented yet" from "intentionally not there".
   real session's tool usage: (a) letting `search` accept a regular expression,
   (b) a dedicated `sed`-style find/replace tool, (c) a tool for find/replace
   that spans multiple files.
-- **Status:** not implemented, and intentionally not planned. The audit
-  (`attini logstats -s main`) is the input; the decision is to add no tool.
+- **Status:** not implemented, and intentionally not planned. The audit of a
+  real session's tool usage is the input; the decision is to add no tool.
 - **Why not:** each candidate is already expressible with the existing tools,
   and each would raise attini's core costs (permission management, approval
   flow, boundary checks) without demonstrated necessity.

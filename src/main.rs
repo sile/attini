@@ -183,17 +183,15 @@ fn run() -> Result<RunOutcome, RunError> {
             return Ok(RunOutcome::Ok);
         }
     }
-    for outcome in [try_run_status(&mut args)?, try_run_logstats(&mut args)?] {
-        match outcome {
-            CommandOutcome::NotHandled => {}
-            CommandOutcome::Done => return Ok(RunOutcome::Ok),
-            CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
-            CommandOutcome::Help => {
-                if let Some(help) = args.finish()? {
-                    print!("{help}");
-                }
-                return Ok(RunOutcome::Ok);
+    match try_run_status(&mut args)? {
+        CommandOutcome::NotHandled => {}
+        CommandOutcome::Done => return Ok(RunOutcome::Ok),
+        CommandOutcome::Exit(exit) => return Ok(RunOutcome::Exit(exit)),
+        CommandOutcome::Help => {
+            if let Some(help) = args.finish()? {
+                print!("{help}");
             }
+            return Ok(RunOutcome::Ok);
         }
     }
 
@@ -631,38 +629,6 @@ fn try_run_status(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError
         return Ok(CommandOutcome::Help);
     }
     session_cmd::run_status(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
-    Ok(CommandOutcome::Done)
-}
-
-fn try_run_logstats(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> {
-    if !noargs::cmd("logstats")
-        .doc(
-            "Summarise one session's conversation log: record-kind histogram, \
-             assistant payload split, tool-result bytes by function, read \
-             targets, command programs/families, token-usage totals. \
-             Read-only; never acquires the session LOCK.",
-        )
-        .take(args)
-        .is_present()
-    {
-        return Ok(CommandOutcome::NotHandled);
-    }
-    let name: String = noargs::opt("session")
-        .short('s')
-        .ty("NAME")
-        .doc("Session name; directory is .attini/<NAME>/")
-        .default("main")
-        .env(SESSION_ENV)
-        .take(args)
-        .then(|o| o.value().parse())?;
-    let json = noargs::flag("json")
-        .doc("Emit the full analysis (not just top-10) as a JSON object")
-        .take(args)
-        .is_present();
-    if args.metadata().help_mode {
-        return Ok(CommandOutcome::Help);
-    }
-    session_cmd::run_logstats(&name, json).map_err(|e| RunError::Runtime(e.to_string()))?;
     Ok(CommandOutcome::Done)
 }
 

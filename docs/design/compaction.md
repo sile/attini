@@ -174,19 +174,18 @@ per-call decision, not a destructive one: the model works from the summary,
 while a human can still read the full history on disk.
 
 Because the log is a plain, line-oriented text file, any tool that can read
-a file can inspect it: `read` the raw `conversation.jsonl` directly, or run
-`attini logstats <NAME>` for a deterministic breakdown. So a session that
-has lost some earlier detail to compaction can simply read its own log back
-— the records are still there — instead of relying on an export step or a
-special API. That is the simple payoff of a text-file base: the transcript
-the model has "forgotten" is still ordinary data a person (or another
-session) can open.
+a file can inspect it: `read` the raw `conversation.jsonl` directly (or use
+`attini status` for a summary). So a session that has lost some earlier
+detail to compaction can simply read its own log back — the records are
+still there — instead of relying on an export step or a special API. That is
+the simple payoff of a text-file base: the transcript the model has
+"forgotten" is still ordinary data a person (or another session) can open.
+An ad-hoc analysis of a session log is a one-off shell + `read` exercise,
+not a built-in command.
 
 ## Related
 
 - [pruning.md](pruning.md) — automatic physical pruning of the log (the one
   path that does discard older records).
-- [conversation-analysis.md](conversation-analysis.md) — `attini logstats`,
-  the deterministic reader for a session's log.
 - `docs/bug/conversation-log-bloat.md` — the investigation that motivated the
   bounded prose summariser and the retained-tail cap.
