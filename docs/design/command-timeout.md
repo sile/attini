@@ -9,15 +9,15 @@ SIGKILL after a one-second grace) and the tool result reports
 ## What it does
 
 The `command` tool runs `argv[0] argv[1..]` in the workspace via
-`child_output::run_streamed`. Before this feature that function blocked on
-`child.wait()` with no cap, so a hung command (network stall, waiting on a lock,
-`bash -c "sleep ..."`, an interactive prompt, a build blocked on a registry)
-stalled the entire session turn indefinitely; the only escape was a human
-pressing Ctrl+C.
-
-The timeout bounds the worst case: the child is torn down after the cap, its
-partial output is handed back to the model with `termination_reason: "timeout"`,
-and the session continues. This is the last agent tool that had unbounded
+`child_output::run_streamed`. The cap bounds the worst case: a hung command (a
+network stall, waiting on a lock, `bash -c "sleep ..."`, an interactive prompt,
+a build blocked on a registry) would otherwise stall the entire session turn
+indefinitely, escapable only by a human pressing Ctrl+C. The default bounds it
+without being tight enough to cut off legitimate work, and a command that needs
+longer can raise it — whereas a wedged session would have to be aborted by hand.
+On expiry the child is destroyed, its partial
+output is handed back to the model with `termination_reason: "timeout"`, and the
+session continues. This is the last agent tool that had unbounded
 runtime — `read` caps at 1 MiB, `search` caps results, and command output is
 both byte-capped (see [`docs/bug/command-max-stream-bytes.md`](../bug/command-max-stream-bytes.md))
 and display-rate-limited.
@@ -80,8 +80,8 @@ child releases the pipes promptly.
 3. otherwise -> `"signaled"`
 
 `command_result_json` needs no new fields; it already emits `termination_reason`.
-The `command` tool description now says the runtime is capped (default 180 s) and
-that a killed command reports `termination_reason: "timeout"`.
+The `command` tool description now says the runtime is capped (default 180 s)
+and that a killed command reports `termination_reason: "timeout"`.
 
 ## Tests
 

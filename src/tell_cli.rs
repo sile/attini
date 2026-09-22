@@ -254,8 +254,10 @@ pub struct TellConfig {
     /// Wall-clock cap on a single `command` tool call, in seconds. The
     /// child runs in its own process group and is killed (SIGTERM, then
     /// SIGKILL) when the cap elapses; the result sets `termination_reason`
-    /// to `timeout`. `None` disables the cap. `Some(0)` is treated as
-    /// disabled too, so `--command-timeout 0` opts out.
+    /// to `timeout`. Defaults to [`DEFAULT_COMMAND_TIMEOUT_SECONDS`] when
+    /// neither `--command-timeout` nor `ATTINI_COMMAND_TIMEOUT_SECONDS` is
+    /// set; `Some(0)` (and `None`, for entry points that never resolve the
+    /// flag) disables the cap, so `--command-timeout 0` opts out.
     pub command_timeout_seconds: Option<u64>,
     /// Auto-compaction trigger threshold in kilobytes (1 KB = 1024
     /// tokens), from `--compaction-trigger-kb` or
@@ -266,7 +268,12 @@ pub struct TellConfig {
 }
 
 /// Default `command` tool timeout in seconds, used when neither
-/// `--command-timeout` nor `ATTINI_COMMAND_TIMEOUT_SECONDS` is set.
+/// `--command-timeout` nor `ATTINI_COMMAND_TIMEOUT_SECONDS` is set. Bounds
+/// the worst case so a hung command — a network stall, a lock, an
+/// interactive prompt — cannot block the session turn forever: an unbounded
+/// default is worse than a cap, since a command that legitimately needs
+/// longer can raise it (or pass `0` to disable), whereas a wedged session
+/// would have to be aborted by hand. `0` disables the cap entirely.
 pub const DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 180;
 
 /// The `--grant SCOPE` value accepted by `attini approve`.

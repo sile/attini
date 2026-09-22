@@ -168,10 +168,12 @@ can also be set via `ATTINI_TEMPERATURE`.
 
 `--command-timeout N` caps how long a single `command` tool call may run, in
 seconds (default 180). The child runs in its own process group and is killed
-with SIGTERM (then SIGKILL after a one-second grace) on expiry; the tool
-result then reports `termination_reason: "timeout"`. `0` disables the cap. It
-can also be set via `ATTINI_COMMAND_TIMEOUT_SECONDS`; precedence is CLI flag,
-then env var, then the 180-second default.
+with SIGTERM (then SIGKILL after a one-second grace) on expiry; the tool result
+then reports `termination_reason: "timeout"`. The cap bounds a hung command (a
+network stall, a lock, an interactive prompt) so it cannot wedge the session
+turn; raise it for a longer build, or pass `0` to disable it entirely. It can
+also be set via `ATTINI_COMMAND_TIMEOUT_SECONDS`; precedence is CLI flag, then
+env var, then the 180-second default.
 
 `--max-turns N` caps the agent loop for one invocation (default 20). Reaching
 it stops the session with reason `max_turns`; resume with `attini approve` (see

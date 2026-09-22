@@ -38,6 +38,9 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const DEFAULT_TURN_TOOL_CALL_LIMIT_STR: &str = "20";
 // String form of `tell_cli::DEFAULT_MAX_TURNS`, for the same reason.
 const DEFAULT_MAX_TURNS_STR: &str = "100";
+// String form of `tell_cli::DEFAULT_COMMAND_TIMEOUT_SECONDS`, for the same
+// reason.
+const DEFAULT_COMMAND_TIMEOUT_STR: &str = "180";
 const DEFAULT_TOOL_CALL_RATE_STR: &str = "60/60";
 const DEFAULT_SESSION_TOOL_CALL_MAX_STR: &str = "5000";
 
@@ -285,6 +288,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
             "Wall-clock cap in seconds on a single `command` tool call; the child is killed \
              (SIGTERM, then SIGKILL) on expiry. Default 180. `0` disables the cap.",
         )
+        .default(DEFAULT_COMMAND_TIMEOUT_STR)
         .env(COMMAND_TIMEOUT_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
@@ -444,6 +448,7 @@ fn try_run_approve(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunErro
             "Wall-clock cap in seconds on a single `command` tool call; the child is killed \
              (SIGTERM, then SIGKILL) on expiry. Default 180. `0` disables the cap.",
         )
+        .default(DEFAULT_COMMAND_TIMEOUT_STR)
         .env(COMMAND_TIMEOUT_ENV)
         .take(args)
         .present_and_then(|o| o.value().parse::<u64>())?;
@@ -636,8 +641,9 @@ fn try_run_status(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError
 mod tests {
     use super::*;
     use attini::tell_cli::{
-        DEFAULT_MAX_TURNS, DEFAULT_SESSION_TOOL_CALL_MAX, DEFAULT_TOOL_CALL_RATE_CALLS,
-        DEFAULT_TOOL_CALL_RATE_WINDOW_SECS, DEFAULT_TURN_TOOL_CALL_LIMIT,
+        DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_MAX_TURNS, DEFAULT_SESSION_TOOL_CALL_MAX,
+        DEFAULT_TOOL_CALL_RATE_CALLS, DEFAULT_TOOL_CALL_RATE_WINDOW_SECS,
+        DEFAULT_TURN_TOOL_CALL_LIMIT,
     };
 
     #[test]
@@ -662,6 +668,10 @@ mod tests {
             DEFAULT_SESSION_TOOL_CALL_MAX.to_string()
         );
         assert_eq!(DEFAULT_MAX_TURNS_STR, DEFAULT_MAX_TURNS.to_string());
+        assert_eq!(
+            DEFAULT_COMMAND_TIMEOUT_STR,
+            DEFAULT_COMMAND_TIMEOUT_SECONDS.to_string()
+        );
     }
 
     #[test]
