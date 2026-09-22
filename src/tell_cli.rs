@@ -33,7 +33,7 @@ pub const EXIT_AWAITING_APPROVAL: u8 = 10;
 /// `--max-turns` nor `ATTINI_MAX_TURNS` is set. `attini tell` accepts
 /// `--max-turns N`; `attini approve` reads the same env var (so resuming
 /// a turn-capped session keeps the limit the user chose).
-pub const DEFAULT_MAX_TURNS: usize = 20;
+pub const DEFAULT_MAX_TURNS: usize = 100;
 
 /// Counters collected during one invocation of `tell_cli::run` for
 /// later persistence into `MetricsSnapshotBody::entries`. Shared by
@@ -130,15 +130,12 @@ impl Counters {
 
 /// Default `prompt_tokens` threshold above which the next
 /// `Continuation::Prompt` invocation summarises before making the model
-/// call, expressed in kilobytes (1 KB = 1024 tokens). Set to 1/4 of the
-/// DeepSeek 64 K context (`64 × 1024 / 4 = 16384`) so compaction leaves
-/// room for the next turn's growth plus the memory tier, tool
-/// definitions, and the summarizer's own input.
+/// call, expressed in kilobytes (1 KB = 1024 tokens).
 ///
 /// Overridable via `--compaction-trigger-kb` or
 /// `ATTINI_COMPACTION_TRIGGER_TOKENS_KB`; see
 /// [`resolve_compaction_trigger_tokens`].
-pub const COMPACTION_TRIGGER_TOKENS_KB: u64 = 16;
+pub const COMPACTION_TRIGGER_TOKENS_KB: u64 = 64;
 
 /// Environment variable that overrides [`COMPACTION_TRIGGER_TOKENS_KB`].
 /// The value is in kilobytes (1 KB = 1024 tokens). A value that does not
@@ -1145,8 +1142,7 @@ fn parse_compaction_trigger_kb(raw: &str) -> Option<u64> {
 
 /// Convert a resolved kilobytes value (or `None` for "unset") into the
 /// token threshold, falling back to [`COMPACTION_TRIGGER_TOKENS`]. `1 KB
-/// = 1024 tokens`, matching the 64 K-context assumption behind the
-/// default.
+/// = 1024 tokens`.
 fn compaction_trigger_tokens_from_kb(kb: Option<u64>) -> u64 {
     kb.map(|kb| kb.saturating_mul(1024))
         .unwrap_or(COMPACTION_TRIGGER_TOKENS)
@@ -1189,7 +1185,7 @@ fn resolve_trigger_tokens_from(flag_kb: Option<u64>, env_raw: Option<&str>) -> u
 /// time) overrides the `ATTINI_COMPACTION_TRIGGER_TOKENS_KB` env var,
 /// which in turn overrides the built-in [`COMPACTION_TRIGGER_TOKENS_KB`]
 /// default. A value of `N` kilobytes means `N * 1024` tokens (1 KB ≈ 1024
-/// tokens, matching the 64 K-context assumption behind the default).
+/// tokens).
 ///
 /// An env var that is present but does not parse as a positive integer
 /// is ignored with a warning rather than aborting startup: the env is
@@ -4121,8 +4117,8 @@ mod tests {
 
     #[test]
     fn max_turns_error_points_at_approve_and_tell() {
-        let msg = max_turns_error(20);
-        assert!(msg.contains("max_turns=20"));
+        let msg = max_turns_error(100);
+        assert!(msg.contains("max_turns=100"));
         // The continuation command sits on its own line, ready to copy,
         // and does not restate the (implicit) session name.
         assert!(msg.contains("\nattini approve  # or give a new instruction"));

@@ -37,7 +37,7 @@ const MAX_STDIN_BYTES: usize = 1024 * 1024;
 // `default_string_constants_stay_in_sync`.
 const DEFAULT_TURN_TOOL_CALL_LIMIT_STR: &str = "20";
 // String form of `tell_cli::DEFAULT_MAX_TURNS`, for the same reason.
-const DEFAULT_MAX_TURNS_STR: &str = "20";
+const DEFAULT_MAX_TURNS_STR: &str = "100";
 const DEFAULT_TOOL_CALL_RATE_STR: &str = "60/60";
 const DEFAULT_SESSION_TOOL_CALL_MAX_STR: &str = "5000";
 
@@ -299,7 +299,7 @@ fn try_run_tell(args: &mut noargs::RawArgs) -> Result<CommandOutcome, RunError> 
         .ty("N")
         .doc(
             "Auto-compaction threshold in kilobytes (1 KB = 1024 tokens); when the previous \
-             prompt exceeds it the next turn summarises first. Default 16 (16384 tokens). \
+             prompt exceeds it the next turn summarises first. Default 64 (65536 tokens). \
              Overrides ATTINI_COMPACTION_TRIGGER_TOKENS_KB.",
         )
         .take(args)
