@@ -460,3 +460,27 @@ fn relative_path_is_never_joined_against_extra_read_root() {
     // extra/notes.md.
     assert!(matches!(err, ToolExecutionError::IoError(_)));
 }
+
+#[test]
+fn set_extra_read_roots_widens_boundary_after_construction() {
+    // Regression: `attini approve --grant session|workspace` on a read
+    // appends a `read` rule mid-invocation, and the executor's roots are
+    // refreshed from it. This pins the mechanism: a path that is outside
+    // the workspace is rejected before the refresh and accepted after.
+    let root = TempRoot::new("set-extras-root");
+    let extra = TempRoot::new("set-extras-source");
+    extra.write("notes.md", b"external content\n");
+    let target = extra.path().join("notes.md").canonicalize().expect("canon");
+    let read = || ReadOnlyTool::Read {
+        path: target.to_string_lossy().into_owned(),
+        line_range: None,
+    };
+
+    let mut ex = executor(&root);
+    let err = err_kind(ex.execute(read()));
+    assert_eq!(err, ToolExecutionError::OutsideWorkspace);
+
+    ex.set_extra_read_roots(vec![extra.path().canonicalize().expect("canon extra")]);
+    let body = ok_body(ex.execute(read()));
+    assert!(body.contains("external content"));
+}

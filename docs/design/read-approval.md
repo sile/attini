@@ -49,8 +49,13 @@ target is stored as an absolute canonical path (which the executor accepts as a
 root).
 
 The read path is derived from the same `read_extra_root` helper the one-shot
-execution uses. Reads can also still be granted by hand -- edit
-`permissions.jsonl` and add a line:
+execution uses. The grant reloads the executor's `extra_read_roots`
+immediately after the rule is appended (`refresh_executor_permissions`), so a
+`read` of the granted path later in the **same** invocation already runs without
+a prompt -- not only from the next invocation on. (The one-shot path needs no
+such refresh: it hands the extra root to the single executed call directly
+rather than going through the executor's persisted roots.) Reads can also still
+be granted by hand -- edit `permissions.jsonl` and add a line:
 
 ```text
 {"type":"read","path":"../docs/"}

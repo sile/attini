@@ -105,6 +105,15 @@ impl ToolExecutor {
         self.write_rules = write_rules;
     }
 
+    /// Replace the `extra_read_roots` granted from `read` rules. Called
+    /// again after a grant appends a new `read` rule mid-invocation, so
+    /// the just-granted path is honoured for the remainder of the
+    /// current invocation rather than only from the next one. `roots`
+    /// are expected to be already canonicalised by the caller.
+    pub fn set_extra_read_roots(&mut self, roots: Vec<PathBuf>) {
+        self.extra_read_roots = roots;
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

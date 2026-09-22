@@ -380,27 +380,17 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
         cfg.model = model;
     }
     // Canonicalise the persistent extra_read_paths (from
-    // permissions.jsonl) and hand the resulting Vec to the
-    // ToolExecutor. Any path that fails
-    // to canonicalise is warned + skipped so a single bad entry does
-    // not disable the whole read-path list.
-    let loaded = permissions::load(&cfg.session_name)?;
-    let candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
-    let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
-    let mut executor = ToolExecutor::new(
-        &cfg.workspace_root,
-        extra_read_roots,
-        cfg.session_name.clone(),
-    )?;
-    // Hand the executor the flattened `write` rules (workspace layer
-    // first, then session layer) so `patch` writes can be authorised by
-    // an explicit rule before falling back to the git-tracking
-    // heuristic. Rules from both layers are concatenated; last-match-wins
-    // is preserved because `evaluate_write` walks the slice in order.
-    let mut write_rules: Vec<Rule> = Vec::new();
-    write_rules.extend(loaded.workspace.iter().cloned());
-    write_rules.extend(loaded.session.iter().cloned());
-    executor.set_write_rules(write_rules);
+    // Build the executor, then load the persistent permissions into it:
+    // the canonicalised extra read roots (from `read` rules) and the
+    // flattened `write` rules (workspace layer first, then session). Any
+    // path that fails to canonicalise is warned + skipped so a single bad
+    // entry does not disable the whole read-path list. The same refresh
+    // runs again after a grant appends a rule mid-invocation, so the new
+    // rule is honoured for the rest of this invocation rather than only
+    // from the next one.
+    let mut executor =
+        ToolExecutor::new(&cfg.workspace_root, Vec::new(), cfg.session_name.clone())?;
+    refresh_executor_permissions(&mut executor, &cfg)?;
 
     let start_ts = now_unix_millis();
     session.append(&SessionRecord::InvocationStart {
@@ -425,7 +415,7 @@ pub fn run(cfg: TellConfig, cont: Continuation) -> io::Result<TellOutcome> {
     }
 
     let mut counters = Counters::default();
-    let outcome = drive(&mut session, &executor, &cfg, cont, &mut counters);
+    let outcome = drive(&mut session, &mut executor, &cfg, cont, &mut counters);
 
     let (reason, exit_code) = match &outcome {
         Ok(Driven::Completed) => (InvocationEndReason::Completed, EXIT_OK),
@@ -606,7 +596,7 @@ fn runs_pre_prompt_compaction(cont: &Continuation) -> bool {
 
 fn drive(
     session: &mut Session,
-    executor: &ToolExecutor,
+    executor: &mut ToolExecutor,
     cfg: &TellConfig,
     cont: Continuation,
     counters: &mut Counters,
@@ -720,6 +710,18 @@ fn drive(
             // is a warning, not a rollback.
             if let Some(intent) = grant {
                 apply_grant(cfg, &intent);
+                // Reload the persistent permissions into the executor so a
+                // freshly granted `read` (or `write`) rule takes effect for
+                // the rest of this invocation. Without this the executor
+                // kept the snapshot taken before the grant, so an approved
+                // `--grant session|workspace` only applied from the *next*
+                // invocation — a later read of the very path just granted
+                // was still denied. (`--grant oneshot` was unaffected: it
+                // passes the extra root to the single executed call
+                // directly rather than through the executor's roots.)
+                if let Err(e) = refresh_executor_permissions(&mut *executor, cfg) {
+                    eprintln!("[approve] warning: could not reload permissions after grant: {e}");
+                }
             }
         }
         // Re-issue the identical request: append no new user record, just
@@ -1010,6 +1012,26 @@ fn max_turns_error(max_turns: usize) -> String {
          run the following command:\n\
          attini approve  # or give a new instruction with: attini tell '...'"
     )
+}
+
+/// Load the persistent permissions and (re)inject them into `executor`:
+/// the canonicalised extra read roots (from `read` rules) and the
+/// flattened `write` rules (workspace layer first, then session). Called
+/// once at startup and again after a `--grant` appends a rule, so a
+/// freshly granted `read`/`write` rule applies to the remainder of the
+/// current invocation rather than only from the next one. Rules from both
+/// layers are concatenated; last-match-wins is preserved because
+/// `evaluate_write` walks the slice in order.
+fn refresh_executor_permissions(executor: &mut ToolExecutor, cfg: &TellConfig) -> io::Result<()> {
+    let loaded = permissions::load(&cfg.session_name)?;
+    let candidates: Vec<PathBuf> = loaded.extra_read_paths.iter().map(PathBuf::from).collect();
+    let extra_read_roots = canonicalise_extra_read_roots(&cfg.workspace_root, candidates);
+    executor.set_extra_read_roots(extra_read_roots);
+    let mut write_rules: Vec<Rule> = Vec::new();
+    write_rules.extend(loaded.workspace.iter().cloned());
+    write_rules.extend(loaded.session.iter().cloned());
+    executor.set_write_rules(write_rules);
+    Ok(())
 }
 
 fn canonicalise_extra_read_roots(
