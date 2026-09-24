@@ -4688,16 +4688,39 @@ mod tests {
     }
 
     #[test]
-    fn builtin_parks_git_status_outside_workspace() {
+    fn builtin_approves_git_dash_c_inside_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("attini-builtin-gitdc-{}", std::process::id()));
+        let sub = workspace.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
+        // `git -C sub` retargets git at a subdirectory of the workspace;
+        // that directory resolves inside a root, so it is approved.
+        let dec = builtin_read_only_decision(&executor, &argv(&["git", "-C", "sub", "status"]))
+            .expect("git -C <inside> status is built-in safe");
+        assert_eq!(dec.scope, RuleScope::BuiltIn);
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn builtin_parks_git_dash_c_outside_workspace() {
         let workspace =
             std::env::temp_dir().join(format!("attini-builtin-git2-{}", std::process::id()));
         std::fs::create_dir_all(&workspace).unwrap();
         let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
-        // `git -C` retargets; the global option already fails closed in
-        // `safe_git`, so no decision is produced.
+        // `git -C` retargets; the directory is a path operand that must
+        // resolve inside a granted root, so an outside directory parks.
         assert!(
-            builtin_read_only_decision(&executor, &argv(&["git", "-C", "/tmp", "status"]))
+            builtin_read_only_decision(&executor, &argv(&["git", "-C", "/etc", "status"]))
                 .is_none()
+        );
+        // A `-C` directory that does not exist also fails closed.
+        assert!(
+            builtin_read_only_decision(
+                &executor,
+                &argv(&["git", "-C", "no-such-dir-xyz", "status"])
+            )
+            .is_none()
         );
         let _ = std::fs::remove_dir_all(&workspace);
     }

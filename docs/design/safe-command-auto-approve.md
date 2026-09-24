@@ -200,7 +200,7 @@ first cut and `safe_read_only` returns `NotSafe` for them today.
 
 | Program | Safe shapes | Fail-closed on |
 |---|---|---|
-| `git` **(implemented)** | `status`, `diff`, `log`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `describe`, `shortlog`, `blame`; `branch` only with pure-listing flags (`-a`/`-r`/`-v`/`--list`/`--show-current`/...); `remote`/`remote -v`/`remote show`/`remote get-url`; only tokens after a literal `--` are path-checked | any leading global option (`-C`, `--git-dir`, `--work-tree`, `-c`, `--exec-path`, `--namespace`); `branch -D/-d/-m/-M/--delete/--move/...` or any positional; `remote add/remove/prune/...`; any unknown flag; an outside/non-existent path |
+| `git` **(implemented)** | `status`, `diff`, `log`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `describe`, `shortlog`, `blame`; `branch` only with pure-listing flags (`-a`/`-r`/`-v`/`--list`/`--show-current`/...); `remote`/`remote -v`/`remote show`/`remote get-url`; a single leading `-C <dir>` or `--git-dir=<dir>` (the directory is itself a path operand); only tokens after a literal `--` are otherwise path-checked | any *other* leading global option (`--work-tree`, `--namespace`, `-c`, `--exec-path`), a second/repeated retarget, a run-together `-C<dir>`, `-C` with an option-looking value or no value, empty `--git-dir=`; `branch -D/-d/-m/-M/--delete/--move/...` or any positional; `remote add/remove/prune/...`; any unknown flag; an outside/non-existent path |
 | `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `nl` | in-workspace path args | any outside path; no arg (reads stdin) |
 | `grep`, `rg` | in-workspace path/`-r` root; pattern | outside path; `--pre`/`--hostname-bin`; unknown flag |
 | `diff`, `cmp` | in-workspace paths | outside path |
@@ -254,15 +254,17 @@ the whole design. The code after that is small.
 1. ~~**`git`** (highest usage in development): land the safe
    subcommand/flag vocabulary and the fail-closed handling of
    `-C`/`--git-dir`/`--work-tree`.~~ **Done**
-   (`src/sansio/safe_command.rs`). `-C` is deliberately out of scope for
-   now: any leading global option fails closed (parks), rather than
-   being resolved against the roots.
-2. **Plain readers**: `cat`/`head`/`tail`/`wc`/`grep`/`rg` with the
+   (`src/sansio/safe_command.rs`).
+2. ~~**`git -C <dir>`**: resolve the retarget directory against the roots
+   instead of failing closed.~~ **Done**: a single leading `-C <dir>`
+   or `--git-dir=<dir>` is accepted and its directory is folded into the
+   path operands the caller canonicalises, so it rides the same
+   inside-a-root test as any other path. `--work-tree`/`--namespace` and
+   repeated/malformed prefixes stay fail-closed.
+3. **Plain readers**: `cat`/`head`/`tail`/`wc`/`grep`/`rg` with the
    in-workspace-path rule.
-3. **Remaining first-cut set**: `ls`/`diff`/`cmp`/`pwd`/`date`/... as needed.
-4. **Config disable knob**, only if the auditability need materialises.
-5. **`-C` handling** (later): resolve `git -C <dir>` against the roots
-   instead of failing closed.
+4. **Remaining first-cut set**: `ls`/`diff`/`cmp`/`pwd`/`date`/... as needed.
+5. **Config disable knob**, only if the auditability need materialises.
 
 ## Related
 

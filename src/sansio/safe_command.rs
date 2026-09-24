@@ -46,24 +46,71 @@ pub fn safe_read_only(argv: &[String]) -> Safety {
     }
 }
 
-/// `git` with the subcommand already stripped from `args`.
+/// `git` with the program name already stripped from `args`.
+///
+/// A leading `-C <dir>` / `--git-dir=<dir>` is allowed: it retargets git
+/// at another repository, but that directory becomes a *path operand* we
+/// hand to the caller, which canonicalises it and requires it to sit
+/// inside a granted root. So `git -C /etc status` is `Safe { paths:
+/// ["/etc"] }` at this layer and the caller parks it, exactly as it
+/// parks `git diff -- /etc/passwd`.
+///
+/// Every other leading global option stays fail-closed. `--work-tree`
+/// and `--namespace` move *what* git reads independently of the `-C`
+/// directory, so a path check on one directory cannot bound them; `-c` /
+/// `--exec-path` can run hooks; repeated or malformed prefixes are
+/// rejected rather than combined.
 fn safe_git(args: &[String]) -> Safety {
-    let Some(first) = args.first() else {
+    let mut paths: Vec<String> = Vec::new();
+    let mut rest = args;
+    // At most one leading retarget option, and only in the separated
+    // `-C <dir>` or joined `--git-dir=<dir>` forms.
+    match rest.first().map(String::as_str) {
+        Some("-C") => {
+            let Some(dir) = rest.get(1) else {
+                return Safety::NotSafe;
+            };
+            // A value that looks like another option is not a directory.
+            if dir.starts_with('-') {
+                return Safety::NotSafe;
+            }
+            paths.push(dir.clone());
+            rest = &rest[2..];
+        }
+        Some(flag) if flag.starts_with("--git-dir=") => {
+            let dir = &flag["--git-dir=".len()..];
+            if dir.is_empty() {
+                return Safety::NotSafe;
+            }
+            paths.push(dir.to_string());
+            rest = &rest[1..];
+        }
+        _ => {}
+    }
+    let Some(first) = rest.first() else {
         return Safety::NotSafe;
     };
-    // Any global option before the subcommand is a fail-closed case:
-    // `-C`/`--git-dir`/`--work-tree` retarget git, `-c`/`--exec-path`
-    // can run hooks, `--namespace` moves the ref namespace.
+    // Any remaining leading option (a second `-C`, `--work-tree`,
+    // `--namespace`, `-c`, a `-C<dir>` run-together, ...) fails closed.
     if first.starts_with('-') {
         return Safety::NotSafe;
     }
-    let rest = &args[1..];
-    match first.as_str() {
+    let sub = &rest[1..];
+    let tail = match first.as_str() {
         "status" | "diff" | "log" | "show" | "ls-files" | "ls-tree" | "rev-parse" | "describe"
-        | "shortlog" | "blame" => safe_git_read(rest),
-        "branch" => safe_git_branch(rest),
-        "remote" => safe_git_remote(rest),
-        _ => Safety::NotSafe,
+        | "shortlog" | "blame" => safe_git_read(sub),
+        "branch" => safe_git_branch(sub),
+        "remote" => safe_git_remote(sub),
+        _ => return Safety::NotSafe,
+    };
+    // Fold the retarget directory in with the subcommand's own path
+    // operands: every one must resolve inside a granted root.
+    match tail {
+        Safety::Safe { paths: mut inner } => {
+            paths.append(&mut inner);
+            Safety::Safe { paths }
+        }
+        Safety::NotSafe => Safety::NotSafe,
     }
 }
 
@@ -227,10 +274,51 @@ mod tests {
     }
 
     #[test]
+    fn git_dash_c_contributes_a_path() {
+        // `-C` retargets git, so its directory is a path operand the
+        // caller must resolve; at this layer the invocation is Safe and
+        // the directory is reported.
+        assert_eq!(
+            paths(&["git", "-C", "src", "status"]),
+            Some(vec!["src".to_string()])
+        );
+        assert_eq!(
+            paths(&["git", "-C", "/etc", "status"]),
+            Some(vec!["/etc".to_string()])
+        );
+        assert_eq!(
+            paths(&["git", "-C", "sub", "diff", "--", "f.rs"]),
+            Some(vec!["sub".to_string(), "f.rs".to_string()])
+        );
+    }
+
+    #[test]
+    fn git_git_dir_equals_contributes_a_path() {
+        assert_eq!(
+            paths(&["git", "--git-dir=.git", "log"]),
+            Some(vec![".git".to_string()])
+        );
+    }
+
+    #[test]
     fn git_global_options_fail_closed() {
-        assert_eq!(paths(&["git", "-C", "/tmp", "status"]), None);
-        assert_eq!(paths(&["git", "--git-dir=/x", "status"]), None);
+        // `--work-tree` / `--namespace` move the read scope independently
+        // of any one directory, so they stay fail-closed.
         assert_eq!(paths(&["git", "--work-tree", "/x", "status"]), None);
+        assert_eq!(paths(&["git", "--work-tree=/x", "status"]), None);
+        assert_eq!(paths(&["git", "--namespace=ns", "log"]), None);
+        // A second retarget option is not combined.
+        assert_eq!(paths(&["git", "-C", ".", "-C", "src", "status"]), None);
+        // Malformed prefixes: a `-C` value that looks like another option,
+        // a run-together `-C<dir>`, an empty `--git-dir=`, and a trailing
+        // `-C` with no value.
+        assert_eq!(paths(&["git", "-C", "-p", "status"]), None);
+        assert_eq!(paths(&["git", "-Csrc", "status"]), None);
+        assert_eq!(paths(&["git", "--git-dir=", "status"]), None);
+        assert_eq!(paths(&["git", "-C"]), None);
+        assert_eq!(paths(&["git", "--git-dir=src"]), None, "no subcommand");
+        // A leading global we never bless.
+        assert_eq!(paths(&["git", "-c", "core.x=y", "status"]), None);
     }
 
     #[test]

@@ -374,12 +374,15 @@ The check inspects the whole argv, not just the program name, and fails closed:
 anything it cannot positively prove safe is parked as usual. Currently only
 `git` is recognised — `git status`, `git diff`, `git log`, `git show`,
 `git ls-files`, `git ls-tree`, `git rev-parse`, `git branch` (listing only),
-`git remote -v`, and the like. A leading global option such as `git -C <dir>`,
-`git --git-dir`, or `git --work-tree` is **not** auto-approved, because it
-retargets git outside the workspace; `git branch -D`, `git remote add`, and any
-unrecognised flag are likewise left for approval. When a read subcommand names
-files, every one of them must resolve inside the workspace or a granted `read`
-root, so `git diff -- /etc/passwd` still parks.
+`git remote -v`, and the like. A single leading `git -C <dir>` or
+`git --git-dir=<dir>` is accepted, but its directory is treated as a path:
+it must resolve inside the workspace or a granted `read` root, so
+`git -C /etc status` still parks. Other leading globals (`--work-tree`,
+`--namespace`, `-c`, `--exec-path`) and repeated or malformed prefixes stay
+fail-closed; `git branch -D`, `git remote add`, and any unrecognised flag are
+likewise left for approval. When a read subcommand names files, every one of
+them must resolve inside the workspace or a granted `read` root, so
+`git diff -- /etc/passwd` still parks.
 
 A built-in approval is recorded with `scope: "builtin"` in the `tool_approval`
 history, distinct from a `workspace`/`session` rule, and prints
