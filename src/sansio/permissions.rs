@@ -101,6 +101,13 @@ impl Rule {
 pub enum RuleScope {
     Workspace,
     Session,
+    /// Not a rule layer: the outcome of the built-in read-only
+    /// auto-approval check (`crate::sansio::safe_command`). It never
+    /// comes from a permissions file, only from the fallthrough for a
+    /// `Pending` command that is provably safe. Kept distinct so the
+    /// history and stderr always tell a built-in auto-approval apart
+    /// from a human-written rule.
+    BuiltIn,
 }
 
 impl RuleScope {
@@ -108,6 +115,7 @@ impl RuleScope {
         match self {
             Self::Workspace => "workspace",
             Self::Session => "session",
+            Self::BuiltIn => "builtin",
         }
     }
 }

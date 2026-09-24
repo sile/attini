@@ -18,6 +18,7 @@ use crate::sansio::deepseek::{ChatMessage, ChatRequest, ToolCall, ToolDef};
 use crate::sansio::permissions::{
     Authorization, AutoDecision, Judgment, Rule, RuleScope, evaluate, evaluate_write,
 };
+use crate::sansio::safe_command::{Safety, safe_read_only};
 use crate::session::{
     ApprovalDecision, AutoDecidedBy, AutoDecidedMatch, ChatMessageWithTs, InvocationEndReason,
     MetricsSnapshotBody, Pending, PendingToolKind, Session, SessionRecord, TokenUsageBody,
@@ -1982,6 +1983,28 @@ fn dispatch_command(
             Ok(CommandDispatch::Continue)
         }
         Judgment::Pending => {
+            // No rule matched. Before parking, check the built-in
+            // read-only allow-list: a provably-safe invocation whose
+            // path operands all resolve inside the granted roots runs
+            // unattended, exactly as a built-in `allow` rule would.
+            if let Some(dec) = builtin_read_only_decision(executor, &inv.argv) {
+                if !dry_run {
+                    eprintln!("[command] auto-approve (built-in read-only): {display}");
+                    append_auto_approval(session, &tc.id, ApprovalDecision::Approve, &dec)?;
+                    let content = match run_command_sync(&inv, executor, timeout) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            let (code, msg) = err.to_code_and_message();
+                            counters.tool_errors += 1;
+                            let payload = tool_error_json(code, &msg);
+                            append_tool(session, messages, &tc.id, payload)?;
+                            return Ok(CommandDispatch::Continue);
+                        }
+                    };
+                    append_tool(session, messages, &tc.id, content)?;
+                }
+                return Ok(CommandDispatch::Continue);
+            }
             let preview_text = render_command_preview_from(&inv);
             eprintln!("[command] approval required");
             eprintln!("{preview_text}");
@@ -1993,6 +2016,53 @@ fn dispatch_command(
             )))
         }
     }
+}
+
+/// The built-in read-only fallthrough for a `Pending` command.
+///
+/// Returns `Some` decision only when [`safe_read_only`] says the
+/// invocation is provably read-only **and** every path operand it
+/// names canonicalises inside the workspace or a granted read root
+/// (the roots `read` already uses). A token that does not exist on disk
+/// or that resolves outside every root fails closed, so the caller
+/// parks as usual. The returned decision carries no rule matches and a
+/// [`RuleScope::BuiltIn`] scope, so history/stderr can tell it apart
+/// from a human rule.
+fn builtin_read_only_decision(executor: &ToolExecutor, argv: &[String]) -> Option<AutoDecision> {
+    let Safety::Safe { paths } = safe_read_only(argv) else {
+        return None;
+    };
+    let root = executor.root();
+    let extra = executor.extra_read_roots();
+    if !paths.iter().all(|p| path_within_roots(root, extra, p)) {
+        return None;
+    }
+    Some(AutoDecision {
+        scope: RuleScope::BuiltIn,
+        args_prefix: Vec::new(),
+        allowed: true,
+        matches: Vec::new(),
+    })
+}
+
+/// Does `input` canonicalise inside `workspace_root` or one of
+/// `extra_read_roots`? Relative `input` is joined against the workspace
+/// root (matching the read tools' resolution). A non-existent path or
+/// one that resolves outside every root returns `false` (fail closed).
+fn path_within_roots(
+    workspace_root: &std::path::Path,
+    extra_read_roots: &[std::path::PathBuf],
+    input: &str,
+) -> bool {
+    let candidate = if std::path::Path::new(input).is_absolute() {
+        std::path::PathBuf::from(input)
+    } else {
+        workspace_root.join(input)
+    };
+    let Ok(canon) = candidate.canonicalize() else {
+        return false;
+    };
+    canon.starts_with(workspace_root) || extra_read_roots.iter().any(|r| canon.starts_with(r))
 }
 
 fn append_auto_approval(
@@ -4595,6 +4665,72 @@ mod tests {
                 panic!("expected approval request, got: {content}")
             }
         }
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn builtin_approves_git_status_in_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("attini-builtin-git-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
+        let dec = builtin_read_only_decision(&executor, &argv(&["git", "status"]))
+            .expect("git status is built-in safe");
+        assert_eq!(dec.scope, RuleScope::BuiltIn);
+        assert_eq!(dec.scope.as_str(), "builtin");
+        assert!(dec.allowed);
+        assert!(dec.matches.is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn builtin_parks_git_status_outside_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("attini-builtin-git2-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
+        // `git -C` retargets; the global option already fails closed in
+        // `safe_git`, so no decision is produced.
+        assert!(
+            builtin_read_only_decision(&executor, &argv(&["git", "-C", "/tmp", "status"]))
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn builtin_parks_git_diff_path_outside_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("attini-builtin-git3-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
+        // A `--`-separated path in the workspace is fine...
+        assert!(
+            builtin_read_only_decision(&executor, &argv(&["git", "diff", "--", "."])).is_some()
+        );
+        // ...but one that resolves outside the workspace (or does not
+        // exist) is parked.
+        assert!(
+            builtin_read_only_decision(&executor, &argv(&["git", "diff", "--", "/etc/passwd"]))
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn builtin_parks_branch_delete() {
+        let workspace =
+            std::env::temp_dir().join(format!("attini-builtin-git4-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let executor = ToolExecutor::new(&workspace, Vec::new(), "t".to_string()).unwrap();
+        assert!(
+            builtin_read_only_decision(&executor, &argv(&["git", "branch", "-D", "foo"])).is_none()
+        );
+        assert!(builtin_read_only_decision(&executor, &argv(&["git", "branch"])).is_some());
         let _ = std::fs::remove_dir_all(&workspace);
     }
 }

@@ -14,4 +14,5 @@
 pub mod agent;
 pub mod deepseek;
 pub mod permissions;
+pub mod safe_command;
 pub mod sse;

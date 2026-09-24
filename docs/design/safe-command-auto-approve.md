@@ -1,8 +1,11 @@
 # Default auto-approval for provably safe read-only commands
 
-**Status:** Design settled, implementation starting. The rule machinery it
-builds on is implemented (`docs/design/permissions-file.md`,
-`docs/design/read-approval.md`).
+**Status:** Design settled; `git` auto-approval implemented
+(`src/sansio/safe_command.rs`). The rule machinery it builds on is
+implemented (`docs/design/permissions-file.md`,
+`docs/design/read-approval.md`). The plain readers (`cat`, `grep`, `rg`,
+...) are not yet on the allow-list — `safe_read_only` returns `NotSafe`
+for every non-`git` program.
 
 **Decisions so far**
 
@@ -166,47 +169,40 @@ The same rule applies to the plain readers:
 
 ## Where it hooks in
 
-It is a pure function that sits between `evaluate` and the `Pending` arm of
-dispatch — no new rule type, no new file:
+It splits into a pure half and an I/O half — no new rule type, no new
+file format:
 
-```rust
-// src/sansio/permissions.rs (pure, no I/O)
-// Called ONLY when `evaluate` returned `Judgment::Pending`.
-pub fn safe_read_only_auto_allow(
-    argv: &[String],
-    roots: &ReadRoots,          // workspace root + granted read roots
-) -> Option<AutoDecision>;
-```
+- **Pure** (`src/sansio/safe_command.rs`): `safe_read_only(argv) ->
+  Safety`. It inspects the argv only, decides whether the program +
+  subcommand + flag set is provably read-only, and returns any path
+  operands the caller must resolve (`Safety::Safe { paths }`). It never
+  touches the filesystem, so it stays in `sansio`. Every non-`git`
+  program is `NotSafe` for now.
+- **I/O** (`src/tell_cli.rs`): in the `Judgment::Pending` arm of
+  `dispatch_command`, call the pure check; if it says safe, canonicalise
+  each returned path and require it to resolve inside the workspace or
+  a granted read root (the roots `read` already uses). Only then build an
+  `AutoDecision` with `scope: RuleScope::BuiltIn`, no rule matches, and
+  take the same path as `Judgment::AutoApprove`.
 
-and a one-line change in `dispatch_command` (`src/tell_cli.rs`), in the
-`Judgment::Pending` arm:
-
-```rust
-Judgment::Pending => {
-    if let Some(dec) = safe_read_only_auto_allow(&inv.argv, &roots) {
-        // same path as Judgment::AutoApprove, with scope = BuiltIn
-        ...
-    } else {
-        ... existing park ...
-    }
-}
-```
-
-The built-in decision should record its own `scope`, e.g.
-`RuleScope::BuiltIn` (rendered as `scope: "builtin"` in the
-`tool_approval` history / stderr), so a reader can always tell a built-in
-auto-approval apart from a human rule.
+The built-in decision records `RuleScope::BuiltIn` (rendered as
+`scope: "builtin"` in the `tool_approval` history / stderr), so a reader
+can always tell a built-in auto-approval apart from a human rule. The
+stderr line is `[command] auto-approve (built-in read-only): <cmd>`.
 
 ## Candidate allow-list (first cut)
 
 Deliberately small. Every program listed must be shown to satisfy rules 1–4
 above in the invocation shapes the check accepts.
 
+Only the `git` row is implemented so far; the rest are the intended
+first cut and `safe_read_only` returns `NotSafe` for them today.
+
 | Program | Safe shapes | Fail-closed on |
 |---|---|---|
+| `git` **(implemented)** | `status`, `diff`, `log`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `describe`, `shortlog`, `blame`; `branch` only with pure-listing flags (`-a`/`-r`/`-v`/`--list`/`--show-current`/...); `remote`/`remote -v`/`remote show`/`remote get-url`; only tokens after a literal `--` are path-checked | any leading global option (`-C`, `--git-dir`, `--work-tree`, `-c`, `--exec-path`, `--namespace`); `branch -D/-d/-m/-M/--delete/--move/...` or any positional; `remote add/remove/prune/...`; any unknown flag; an outside/non-existent path |
 | `ls`, `cat`, `head`, `tail`, `wc`, `file`, `stat`, `nl` | in-workspace path args | any outside path; no arg (reads stdin) |
 | `grep`, `rg` | in-workspace path/`-r` root; pattern | outside path; `--pre`/`--hostname-bin`; unknown flag |
-| `git` | `status`, `diff`, `log`, `show`, `ls-files`, `ls-tree`, `rev-parse`, `remote -v`; `branch` without `-D/-d/-m/-M/--delete` | `-C`, `--git-dir`, `--work-tree`, `--output`, `-o`, unknown flag, outside path |
 | `diff`, `cmp` | in-workspace paths | outside path |
 | `pwd`, `whoami`, `date`, `echo` | no path semantics | (echo only; not a file write) |
 
@@ -255,12 +251,18 @@ the whole design. The code after that is small.
 
 ## Implementation order
 
-1. **`git`** (highest usage in development): land the safe subcommand/flag
-   vocabulary and the fail-closed handling of `-C`/`--git-dir`/`--work-tree`.
+1. ~~**`git`** (highest usage in development): land the safe
+   subcommand/flag vocabulary and the fail-closed handling of
+   `-C`/`--git-dir`/`--work-tree`.~~ **Done**
+   (`src/sansio/safe_command.rs`). `-C` is deliberately out of scope for
+   now: any leading global option fails closed (parks), rather than
+   being resolved against the roots.
 2. **Plain readers**: `cat`/`head`/`tail`/`wc`/`grep`/`rg` with the
    in-workspace-path rule.
 3. **Remaining first-cut set**: `ls`/`diff`/`cmp`/`pwd`/`date`/... as needed.
 4. **Config disable knob**, only if the auditability need materialises.
+5. **`-C` handling** (later): resolve `git -C <dir>` against the roots
+   instead of failing closed.
 
 ## Related
 

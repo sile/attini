@@ -13,8 +13,8 @@ leaving your control.
 attini lives in your workspace and works on its own: it lists and reads files,
 searches the codebase, applies patches, and runs commands. Safe, reversible
 changes are applied without a prompt; anything consequential — a new file, a
-change outside git, a command that isn't explicitly allowed — is shown as a
-preview and waits for your approval.
+change outside git, a command that isn't explicitly allowed or recognised as
+read-only — is shown as a preview and waits for your approval.
 
 The name comes from the Attini tribe of ants — leaf-cutter ants that do not eat
 the leaves they gather, but cultivate a fungus with them. attini follows the
@@ -53,9 +53,11 @@ than letting the agent infer or guess:
 - **No silent side effects.** Reaching outside the workspace — a read or a
   write — always requires explicit human approval, destructive operations
   require explicit confirmation, and a non-tracked file never silently
-  overwrites a tracked one. Where a behaviour is too risky to do safely, attini
-  refuses rather than guesses — for example rejecting multiple edits to the
-  same path in one `patch`.
+  overwrites a tracked one. A command that is *provably* read-only and stays
+  inside the workspace runs unattended (see *Auto-approved read-only
+  commands* below); everything else is a prompt. Where a behaviour is too
+  risky to do safely, attini refuses rather than guesses — for example
+  rejecting multiple edits to the same path in one `patch`.
 - **The model's own space is gated too.** The model can work freely in its own
   scratchpad, but every write there still passes through approval.
 - **Tools amplify understanding; they do not replace it.** The agent already
@@ -352,11 +354,38 @@ A `read` rule **widens** the roots a `read`/`list`/`search` may reach; it is not
 a gate. There is no `read` deny, and `allow:false` on a `read` rule is a load
 error, because a read deny cannot be enforced (the model can always read through
 the `command` tool). Keep a file you do not want read out of the workspace rather
-than writing a deny rule.
+than writing a deny rule. This is also why the built-in read-only auto-approval
+(below) is conservative: it never lets a command read a path outside the
+workspace or a granted `read` root.
 
 Rules are added by hand, or through `attini approve --grant` (see the Approving
 section above), which folds a persistent rule into the approval you were already
 giving.
+
+### Auto-approved read-only commands
+
+A `command` that matches no rule is normally parked for approval. Before
+parking, attini also checks a small **built-in allow-list of provably
+read-only** invocations and runs those unattended. This is a fallthrough, not
+a rule: any hand-written rule is evaluated first and always wins, so a rule
+can still deny or widen a particular command family.
+
+The check inspects the whole argv, not just the program name, and fails closed:
+anything it cannot positively prove safe is parked as usual. Currently only
+`git` is recognised — `git status`, `git diff`, `git log`, `git show`,
+`git ls-files`, `git ls-tree`, `git rev-parse`, `git branch` (listing only),
+`git remote -v`, and the like. A leading global option such as `git -C <dir>`,
+`git --git-dir`, or `git --work-tree` is **not** auto-approved, because it
+retargets git outside the workspace; `git branch -D`, `git remote add`, and any
+unrecognised flag are likewise left for approval. When a read subcommand names
+files, every one of them must resolve inside the workspace or a granted `read`
+root, so `git diff -- /etc/passwd` still parks.
+
+A built-in approval is recorded with `scope: "builtin"` in the `tool_approval`
+history, distinct from a `workspace`/`session` rule, and prints
+`[command] auto-approve (built-in read-only): ...` to stderr. Future rounds
+extend the same treatment to plain readers (`cat`, `grep`, `rg`, ...). See
+[the design](docs/design/safe-command-auto-approve.md).
 
 ### Model selection
 
