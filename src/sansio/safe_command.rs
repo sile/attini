@@ -150,6 +150,16 @@ fn safe_git_read(args: &[String]) -> Safety {
 /// else fails closed. This list is intentionally small; it grows only
 /// with evidence, never with a "probably fine" flag.
 fn git_read_option_is_safe(arg: &str) -> bool {
+    // A bare `-<digits>` is git's shorthand for a count option
+    // (`-3` == `--max-count=3`), a pure read. Accept it narrowly: only
+    // an option that is *nothing but* a dash and ascii digits, so
+    // `-3a`, `-p3`, and `--3` stay fail-closed below.
+    if let Some(digits) = arg.strip_prefix('-')
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
+    }
     // Split `--opt=value` so the vocabulary matches on the key.
     let key = arg.split('=').next().unwrap_or(arg);
     matches!(
@@ -260,6 +270,19 @@ mod tests {
         assert_eq!(paths(&["git", "status"]), Some(vec![]));
         assert_eq!(paths(&["git", "status", "--short"]), Some(vec![]));
         assert_eq!(paths(&["git", "status", "--porcelain"]), Some(vec![]));
+    }
+
+    #[test]
+    fn git_bare_numeric_count_is_safe() {
+        // `-3` == `--max-count=3`, a pure read.
+        assert_eq!(paths(&["git", "log", "--oneline", "-3"]), Some(vec![]));
+        assert_eq!(paths(&["git", "log", "-50"]), Some(vec![]));
+        assert_eq!(paths(&["git", "show", "-1"]), Some(vec![]));
+        // Only pure digits; anything else stays fail-closed.
+        assert_eq!(paths(&["git", "log", "-3a"]), None);
+        assert_eq!(paths(&["git", "log", "-p3"]), None);
+        assert_eq!(paths(&["git", "log", "--3"]), None);
+        assert_eq!(paths(&["git", "log", "-"]), None);
     }
 
     #[test]

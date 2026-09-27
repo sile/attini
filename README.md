@@ -379,7 +379,8 @@ anything it cannot positively prove safe is parked as usual. Currently only
 it must resolve inside the workspace or a granted `read` root, so
 `git -C /etc status` still parks. Other leading globals (`--work-tree`,
 `--namespace`, `-c`, `--exec-path`) and repeated or malformed prefixes stay
-fail-closed; `git branch -D`, `git remote add`, and any unrecognised flag are
+fail-closed; a bare count shorthand like `git log --oneline -3` is accepted,
+but `git branch -D`, `git remote add`, and any unrecognised flag are
 likewise left for approval. When a read subcommand names files, every one of
 them must resolve inside the workspace or a granted `read` root, so
 `git diff -- /etc/passwd` still parks.
