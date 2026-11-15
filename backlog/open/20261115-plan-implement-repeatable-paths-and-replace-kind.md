@@ -71,8 +71,10 @@ All eight steps ran; none was left out. They landed in one commit,
 `cdb10bf Allow repeatable paths and add a whole-file replace to patch`
 (6 files, +509/-156), which carries both RFCs at once as the Notes argue it
 should:
-[rfc-patch-multiple-edits-same-path](20261115-rfc-patch-multiple-edits-same-path.md)
-and [rfc-patch-replace-whole-file](20261115-rfc-patch-replace-whole-file.md).
+[rfc-patch-multiple-edits-same-path](../closed/20261115-rfc-patch-multiple-edits-same-path.md)
+and
+[rfc-patch-replace-whole-file](../closed/20261115-rfc-patch-replace-whole-file.md).
+Both are now closed with their outcomes written.
 
 The per-path `apply_patch`, the step the Notes offered as the one to cut, was
 kept: `apply_patch` re-checks each path's snapshot, folds that path's edits
