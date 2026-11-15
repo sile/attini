@@ -19,34 +19,30 @@ the earlier ones are written.
 
 ## Outcome
 
-<!-- NOKORI_TODO: the one section written later, when `nokori close` moves
-this file. Leave it empty until then, comment and all.
+Accepted, as two changes rather than one.
 
-Two things are recorded here, and both are needed: what was decided, and what
-came of it. The decision is written when it is made, even though the file is
-not closed until the result is known, because the reason for a decision is hard
-to recover later and is exactly what a reader of a closed file asks for.
+The `more than one edit targets <path>` refusal goes entirely: edits to the
+same path in one patch call are applied in the order they appear. The reason
+the rule existed was that a second edit's `before` would be matched against
+the file as it was at the start of the call, so the model could not see what
+the first edit had done. With the edits applied in order and each `before`
+matched against the result of the one before it, that ambiguity is gone, and
+the simplest description of a patch call is that its edits happen left to
+right.
 
-Accepted, reshaped, declined, and held -- say which, and why. A declined
-request needs its reason as much as an accepted one: the next person with the
-same complaint will look for this file, and "no" without a reason sends them to
-file it again.
+Adding a second kind, `replace`, covers the case that started this: writing a
+whole file. It writes the entire contents without a `before`, so a file that
+is being created or rewritten in one go needs no anchor text at all and cannot
+fail on a `before` that does not match. This is cheaper than the `before` and
+`after` pair for whole-file work, since the outgoing lines never have to be
+repeated, and it leaves `update` for the case it is good at: a small change in
+a large file.
 
-Then say what came of it. A new item usually carries the work, so name that
-item and let it stand for the change; whether it is a bug that reports the
-program misbehaving, an RFC that argues the new shape, or a plan that says how
-the work runs is decided then, by what the response turned out to be. When the
-response was to do nothing, say that instead: an `Outcome` that says nothing
-about the result is read as work nobody got to, not as a decision to leave it.
+The two were kept apart rather than folded into one change because they answer
+different halves of the complaint. Repeatable paths fix the section-by-section
+editing that was hit constantly; `replace` fixes the rewrite that the tool had
+no good shape for. Either one alone would have left the other case as awkward
+as it was.
 
-Once this section is written and committed, treat the file as closed: do not
-edit any part of it again, and append nothing later. If something turns up
-later, leave the file as it is and open a new item that cites this one and
-acts on it.
-
-To refer to another item, link it:
-[bug-empty-input](../closed/20261114-bug-empty-input.md). Link only an item
-that is already closed: never link one that is still open, not even as
-background. Run `nokori explain references` for the paths and the rule.
-
-Delete this comment when you write the section. -->
+The work is carried by two RFCs, both still open: one for edits to the same
+path repeating within a call, and one for `replace` writing a whole file.
