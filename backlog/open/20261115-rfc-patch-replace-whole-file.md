@@ -12,6 +12,9 @@ a file is what `add` is for.
 
 ## Motivation
 
+This answers [feedback-one-edit-per-file-in-a-patch](../closed/20261115-feedback-one-edit-per-file-in-a-patch.md),
+which is the whole-file rewrite that had no good shape before this kind existed.
+
 Updating a file today means quoting the text being replaced verbatim in
 `before`. That is right for a one-line fix. It is the wrong shape for a
 document being restructured: a title that moves, a section that is rewritten

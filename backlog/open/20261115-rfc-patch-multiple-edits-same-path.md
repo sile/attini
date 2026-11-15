@@ -12,6 +12,9 @@ model to split a file's changes into several calls.
 
 ## Motivation
 
+This answers [feedback-one-edit-per-file-in-a-patch](../closed/20261115-feedback-one-edit-per-file-in-a-patch.md),
+which is the refusal that a second edit on a path hits today.
+
 A file that is written in sections -- a markdown document, an RFC, a plan --
 is revised one section at a time, and each revision is a replacement of a
 small span. Today a `patch` call can only touch a path once, so those
