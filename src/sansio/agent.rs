@@ -43,10 +43,9 @@ pub const DEFAULT_SEARCH_MAX_RESULTS: usize = 50;
 /// Maximum bytes read from a single file by [`ReadOnlyTool::Read`].
 pub const READ_MAX_BYTES: usize = 1024 * 1024;
 
-/// Maximum edits allowed in a single [`PatchInvocation`]. The 2-phase
-/// applier assumes each edit maps to a unique target path, so the
-/// upper bound doubles as an implicit cap on distinct target files
-/// per call.
+/// Maximum edits allowed in a single [`PatchInvocation`]. Counts edits,
+/// not distinct paths: a path may be named by several edits, and the
+/// per-call cap applies to the total.
 pub const PATCH_MAX_EDITS: usize = 20;
 
 /// Maximum bytes for either the `content` of a [`PatchTool::Add`] or
@@ -236,9 +235,12 @@ where
         .map_err(map_parse_err)
 }
 
-/// A single edit within a [`PatchInvocation`]. The 2-phase applier
-/// requires each edit's target `path` to be unique inside the
-/// containing invocation (see [`PatchInvocation::parse`]).
+/// A single edit within a [`PatchInvocation`].
+///
+/// A path may be named by more than one edit inside the same
+/// invocation; those edits are applied in the order they appear (see
+/// `ToolExecutor::preview_patch` / `apply_patch`), each matched
+/// against the result of the one before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchTool {
     /// Create a new file. Rejected if the target path already exists
@@ -252,12 +254,16 @@ pub enum PatchTool {
         before: String,
         after: String,
     },
+    /// Replace the entire contents of an existing file with `content`,
+    /// without matching any `before`. Rejected if the target does not
+    /// exist (creating a file is what `Add` is for).
+    Replace { path: String, content: String },
 }
 
 impl PatchTool {
     pub fn path(&self) -> &str {
         match self {
-            Self::Add { path, .. } | Self::Update { path, .. } => path,
+            Self::Add { path, .. } | Self::Update { path, .. } | Self::Replace { path, .. } => path,
         }
     }
 
@@ -265,6 +271,7 @@ impl PatchTool {
         match self {
             Self::Add { .. } => "add",
             Self::Update { .. } => "update",
+            Self::Replace { .. } => "replace",
         }
     }
 }
@@ -283,9 +290,14 @@ impl PatchInvocation {
         ToolDef {
             name: "patch".to_string(),
             description: "Apply a batch of file edits to the workspace. \
-                          Each edit is either an add (create a new file) or \
-                          an update (replace a unique substring). All edits \
-                          in one call must target distinct paths. Patches \
+                          Each edit is one of: add (create a new file, \
+                          given `content`), update (replace a unique \
+                          `before` substring with `after`), or replace \
+                          (overwrite the whole file with `content`, no \
+                          `before`; for a full rewrite). A path may appear \
+                          in more than one edit; that path's edits are \
+                          applied in the order they appear, each matched \
+                          against the result of the one before it. Patches \
                           that only update git-tracked files are applied \
                           immediately; any add, non-tracked edit, or target \
                           outside the workspace requires user approval before \
@@ -299,8 +311,9 @@ impl PatchInvocation {
 
     /// Parse the JSON `arguments` supplied by the model. Enforces the
     /// per-call limits declared in [`PATCH_MAX_EDITS`] /
-    /// [`PATCH_MAX_FILE_BYTES`] and the unique-target-path invariant
-    /// that the 2-phase applier depends on.
+    /// [`PATCH_MAX_FILE_BYTES`]. Edits are collected in array order; a
+    /// path may appear in more than one edit and the applier folds that
+    /// path's edits in the order given.
     pub fn parse(arguments_json: &str) -> Result<Self, ToolExecutionError> {
         let json = nojson::RawJson::parse(arguments_json).map_err(map_parse_err)?;
         let root = json.value();
@@ -311,15 +324,9 @@ impl PatchInvocation {
             .map_err(map_parse_err)?;
 
         let mut edits: Vec<PatchTool> = Vec::new();
-        let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         for item in edits_value.to_array().map_err(map_parse_err)? {
             let kind = required_string(item, "kind")?;
             let path = required_string(item, "path")?;
-            if !seen_paths.insert(path.clone()) {
-                return Err(ToolExecutionError::Patch(
-                    PatchError::MultipleEditsSamePath { path },
-                ));
-            }
             let tool = match kind.as_str() {
                 "add" => {
                     let content = required_string(item, "content")?;
@@ -339,6 +346,15 @@ impl PatchInvocation {
                         before,
                         after,
                     }
+                }
+                "replace" => {
+                    reject_member(item, "before")?;
+                    reject_member(item, "after")?;
+                    let content = required_string(item, "content")?;
+                    if content.len() > PATCH_MAX_FILE_BYTES {
+                        return Err(ToolExecutionError::Patch(PatchError::FileTooLarge { path }));
+                    }
+                    PatchTool::Replace { path, content }
                 }
                 other => {
                     return Err(ToolExecutionError::ArgumentsParseFailed(format!(
@@ -369,9 +385,9 @@ const PATCH_PARAMS_SCHEMA: &str = r#"{
 "edits":{"type":"array","minItems":1,"items":{
 "type":"object",
 "properties":{
-"kind":{"type":"string","enum":["add","update"]},
-"path":{"type":"string","description":"Workspace-relative target path. Must be unique across edits in one call."},
-"content":{"type":"string","description":"Full contents for add."},
+"kind":{"type":"string","enum":["add","update","replace"]},
+"path":{"type":"string","description":"Workspace-relative target path. May appear in more than one edit; that path's edits apply in order."},
+"content":{"type":"string","description":"For add: full new-file contents. For replace: the whole file's new contents."},
 "before":{"type":"string","description":"For update: byte-exact substring to replace. Must match exactly once."},
 "after":{"type":"string","description":"For update: replacement text."}
 },
@@ -440,6 +456,19 @@ fn required_string(root: RawJsonValue<'_, '_>, name: &str) -> Result<String, Too
         .required()
         .map_err(map_parse_err)?;
     value.try_into().map_err(map_parse_err)
+}
+
+/// Reject an edit that carries `name` at all. Used by `replace`, which
+/// must not also carry `before`/`after`: the whole point of the kind is
+/// that nothing is matched, so a stray `before` is a mistake worth
+/// reporting rather than silently ignoring.
+fn reject_member(root: RawJsonValue<'_, '_>, name: &str) -> Result<(), ToolExecutionError> {
+    match root.to_member(name).map_err(map_parse_err)?.optional() {
+        None => Ok(()),
+        Some(_) => Err(ToolExecutionError::ArgumentsParseFailed(format!(
+            "replace does not take a `{name}` member"
+        ))),
+    }
 }
 
 fn required_string_array(
@@ -564,8 +593,6 @@ pub enum PatchError {
     IgnoredParent { path: String },
     /// `edits.len()` exceeded [`PATCH_MAX_EDITS`].
     TooManyEdits { count: u64 },
-    /// Two edits within the same call named the same target path.
-    MultipleEditsSamePath { path: String },
     /// The affected file (either new `content` on add, existing
     /// target on update, or the produced `after` on update) exceeds
     /// [`PATCH_MAX_FILE_BYTES`].
@@ -622,10 +649,6 @@ impl PatchError {
                 "patch_too_many_edits",
                 format!("edits count {count} exceeded the {PATCH_MAX_EDITS} limit"),
             ),
-            Self::MultipleEditsSamePath { path } => (
-                "patch_multiple_edits_same_path",
-                format!("more than one edit targets {path} within the same patch call"),
-            ),
             Self::FileTooLarge { path } => (
                 "patch_file_too_large",
                 format!(
@@ -649,11 +672,6 @@ impl PatchError {
     /// correct move is to choose a different target (or ask the user).
     pub fn to_hint(&self) -> Option<&'static str> {
         match self {
-            Self::MultipleEditsSamePath { .. } => Some(
-                "each path may appear in only one edit per call; split the edits into \
-                 separate patch calls (one per target path) or merge this path's changes \
-                 into a single update with one before/after pair",
-            ),
             Self::NoMatch { .. } => Some(
                 "`before` is not present verbatim in the file; read the file first, then \
                  copy an exact existing substring into `before`",
@@ -2966,20 +2984,61 @@ mod tests {
     }
 
     #[test]
-    fn patch_parse_rejects_same_path_twice() {
-        let err = PatchInvocation::parse(
+    fn patch_parse_allows_same_path_twice() {
+        let inv = PatchInvocation::parse(
             r#"{"edits":[
                 {"kind":"update","path":"dup","before":"a","after":"b"},
                 {"kind":"update","path":"dup","before":"c","after":"d"}
             ]}"#,
         )
-        .expect_err("same-path rejected");
+        .expect("same path accepted");
+        assert_eq!(inv.edits.len(), 2);
+        assert_eq!(inv.edits[0].path(), "dup");
+        assert_eq!(inv.edits[1].path(), "dup");
+    }
+
+    #[test]
+    fn patch_parse_replace_kind() {
+        let inv = PatchInvocation::parse(
+            r#"{"edits":[{"kind":"replace","path":"a.txt","content":"whole"}]}"#,
+        )
+        .expect("replace parses");
         assert_eq!(
-            err,
-            ToolExecutionError::Patch(PatchError::MultipleEditsSamePath {
-                path: "dup".to_string(),
-            })
+            inv.edits[0],
+            PatchTool::Replace {
+                path: "a.txt".to_string(),
+                content: "whole".to_string(),
+            }
         );
+        assert_eq!(inv.edits[0].kind_label(), "replace");
+    }
+
+    #[test]
+    fn patch_parse_replace_rejects_before_and_after() {
+        for member in ["before", "after"] {
+            let json = format!(
+                r#"{{"edits":[{{"kind":"replace","path":"a.txt","content":"x","{member}":"y"}}]}}"#
+            );
+            let err = PatchInvocation::parse(&json).expect_err("replace with matcher rejected");
+            assert!(
+                matches!(err, ToolExecutionError::ArgumentsParseFailed(_)),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_parse_replace_over_size_limit() {
+        let big = "x".repeat(PATCH_MAX_FILE_BYTES + 1);
+        let json = format!(
+            r#"{{"edits":[{{"kind":"replace","path":"big","content":{}}}]}}"#,
+            nojson::Json(&big),
+        );
+        let err = PatchInvocation::parse(&json).expect_err("too big rejected");
+        assert!(matches!(
+            err,
+            ToolExecutionError::Patch(PatchError::FileTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -3038,17 +3097,15 @@ mod tests {
     }
 
     #[test]
-    fn patch_error_json_includes_hint_for_same_path() {
-        let e = ToolExecutionError::Patch(PatchError::MultipleEditsSamePath {
+    fn patch_error_json_includes_hint_for_ambiguous_match() {
+        let e = ToolExecutionError::Patch(PatchError::AmbiguousMatch {
             path: "dup".to_string(),
+            match_count: 2,
         });
         let s = e.to_json_string();
-        assert!(
-            s.contains(r#""error":"patch_multiple_edits_same_path""#),
-            "got {s}"
-        );
+        assert!(s.contains(r#""error":"patch_ambiguous_match""#), "got {s}");
         assert!(s.contains(r#""hint":"#), "expected a hint member in {s}");
-        assert!(s.contains("separate patch calls"), "got {s}");
+        assert!(s.contains("matched more than one place"), "got {s}");
     }
 
     #[test]

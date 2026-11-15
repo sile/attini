@@ -161,77 +161,43 @@ impl ToolExecutor {
         }
     }
 
-    /// Read every target file (Update) and check every target does
-    /// not exist (Add), then produce the byte snapshots and diff
-    /// summary that the [`AgentCore`](crate::sansio::agent::AgentCore)
-    /// needs to enter approval mode. Does NOT write anything to the
-    /// filesystem.
+    /// Read every target path, fold that path's edits in order, and
+    /// produce the byte snapshots and diff summary that the
+    /// [`AgentCore`](crate::sansio::agent::AgentCore) needs to enter
+    /// approval mode. Does NOT write anything to the filesystem.
+    ///
+    /// Edits are grouped by target path in first-appearance order. A
+    /// path's file is read once; its edits are folded against the
+    /// running buffer, so each `before` is matched against the result
+    /// of the edit before it. One snapshot per path is recorded (the
+    /// text before the first edit), so an apply-time conflict check
+    /// still means "the file did not change under us".
     pub fn preview_patch(
         &self,
         invocation: &PatchInvocation,
     ) -> Result<(Vec<PreviewContent>, PatchPreview), PatchError> {
-        let mut snapshots = Vec::with_capacity(invocation.edits.len());
+        let mut snapshots = Vec::new();
         let mut added_lines: u64 = 0;
         let mut removed_lines: u64 = 0;
         let mut target_paths: Vec<String> = Vec::with_capacity(invocation.edits.len());
         let mut auto_approve = true;
         let mut not_revertible: Option<String> = None;
-        for edit in &invocation.edits {
-            target_paths.push(edit.path().to_string());
-            match edit {
-                PatchTool::Add { path, content } => {
-                    // A brand-new file is not yet under git control, so
-                    // creating it cannot be auto-approved.
-                    auto_approve = false;
-                    let (full, guard) = self.resolve_add_target(path)?;
-                    if let WriteGuard::NeedsApproval { reason } = guard {
-                        not_revertible.get_or_insert(reason);
-                    }
-                    if full.exists() {
-                        return Err(PatchError::AddOnExistingFile { path: path.clone() });
-                    }
-                    snapshots.push(PreviewContent {
-                        path: path.clone(),
-                        content: None,
-                    });
-                    added_lines += line_count(content);
-                }
-                PatchTool::Update {
-                    path,
-                    before,
-                    after,
-                } => {
-                    let (full, guard) = self.resolve_update_target(path)?;
-                    // A git-tracked Update (or one covered by a `write
-                    // allow:true` rule) is safe to auto-approve. A
-                    // `NeedsApproval` guard means the change is not
-                    // revertible with `git checkout`, so the human must
-                    // see it first.
-                    if let WriteGuard::NeedsApproval { reason } = guard {
-                        auto_approve = false;
-                        not_revertible.get_or_insert(reason);
-                    }
-                    let bytes = read_file_capped(&full, path)?;
-                    snapshots.push(PreviewContent {
-                        path: path.clone(),
-                        content: Some(bytes.clone()),
-                    });
-                    let matches = count_occurrences(&bytes, before.as_bytes());
-                    match matches {
-                        0 => return Err(PatchError::NoMatch { path: path.clone() }),
-                        1 => {
-                            removed_lines += line_count(before);
-                            added_lines += line_count(after);
-                        }
-                        n => {
-                            return Err(PatchError::AmbiguousMatch {
-                                path: path.clone(),
-                                match_count: n as u64,
-                            });
-                        }
-                    }
-                }
+        for group in group_edits_by_path(invocation) {
+            let path = group[0].path().to_string();
+            target_paths.push(path.clone());
+            let (snapshot, net) = self.preview_path(&path, &group)?;
+            if !net.auto_approve {
+                auto_approve = false;
             }
+            if let Some(reason) = net.not_revertible {
+                not_revertible.get_or_insert(reason);
+            }
+            added_lines += net.added;
+            removed_lines += net.removed;
+            snapshots.push(PreviewContent {
+                path,
+                content: snapshot,
+            });
         }
         target_paths.sort();
         target_paths.dedup();
@@ -244,6 +210,103 @@ impl ToolExecutor {
             not_revertible,
         };
         Ok((snapshots, preview))
+    }
+
+    /// Preview one path's edits, folding them in array order against
+    /// a running buffer. Returns the text before the first edit (the
+    /// snapshot) and the path's net line change and guard outcome.
+    fn preview_path(
+        &self,
+        path: &str,
+        edits: &[&PatchTool],
+    ) -> Result<(Option<Vec<u8>>, PathNet), PatchError> {
+        // Resolve and guard the path once, by its first edit's kind.
+        // Every later edit on the same path is folded into the same
+        // snapshot, so the guard and the snapshot belong to the path,
+        // not to an individual edit.
+        let first = edits[0];
+        let (full, guard) = match first {
+            PatchTool::Add { .. } => self.resolve_add_target(path)?,
+            PatchTool::Update { .. } | PatchTool::Replace { .. } => {
+                self.resolve_update_target(path)?
+            }
+        };
+        let mut net = PathNet {
+            added: 0,
+            removed: 0,
+            // An Add creates a file git does not track yet, so it is
+            // never safe to auto-apply; every other kind starts
+            // allowed and is downgraded by a NeedsApproval guard.
+            auto_approve: !matches!(first, PatchTool::Add { .. }),
+            not_revertible: None,
+        };
+        if let WriteGuard::NeedsApproval { reason } = guard {
+            net.auto_approve = false;
+            net.not_revertible = Some(reason);
+        }
+        let snapshot = if matches!(first, PatchTool::Add { .. }) {
+            if full.exists() {
+                return Err(PatchError::AddOnExistingFile {
+                    path: path.to_string(),
+                });
+            }
+            None
+        } else {
+            Some(read_file_capped(&full, path)?)
+        };
+        // A path that starts with a non-Add must be updated/replaced;
+        // an Add is valid only as the first edit (the file exists after
+        // it, so a later Add on the same path is an AddOnExistingFile).
+        let mut buffer: Option<Vec<u8>> = snapshot.clone();
+        for edit in edits {
+            match edit {
+                PatchTool::Add { path: p, content } => {
+                    if buffer.is_some() {
+                        return Err(PatchError::AddOnExistingFile { path: p.clone() });
+                    }
+                    net.added += line_count(content);
+                    buffer = Some(content.as_bytes().to_vec());
+                }
+                PatchTool::Replace { path: p, content } => {
+                    let bytes = buffer
+                        .as_mut()
+                        .ok_or_else(|| PatchError::UpdateOnMissingFile { path: p.clone() })?;
+                    net.removed += count_lines(bytes);
+                    net.added += line_count(content);
+                    *bytes = content.as_bytes().to_vec();
+                    if bytes.len() > PATCH_MAX_FILE_BYTES {
+                        return Err(PatchError::FileTooLarge { path: p.clone() });
+                    }
+                }
+                PatchTool::Update {
+                    path: p,
+                    before,
+                    after,
+                } => {
+                    let bytes = buffer
+                        .as_mut()
+                        .ok_or_else(|| PatchError::UpdateOnMissingFile { path: p.clone() })?;
+                    match count_occurrences(bytes, before.as_bytes()) {
+                        0 => return Err(PatchError::NoMatch { path: p.clone() }),
+                        1 => {
+                            net.removed += line_count(before);
+                            net.added += line_count(after);
+                            *bytes = replace_once(bytes, before.as_bytes(), after.as_bytes());
+                            if bytes.len() > PATCH_MAX_FILE_BYTES {
+                                return Err(PatchError::FileTooLarge { path: p.clone() });
+                            }
+                        }
+                        n => {
+                            return Err(PatchError::AmbiguousMatch {
+                                path: p.clone(),
+                                match_count: n as u64,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok((snapshot, net))
     }
 
     /// Apply all edits atomically in two phases (see `0007` design):
@@ -263,56 +326,22 @@ impl ToolExecutor {
         invocation: &PatchInvocation,
         preview_content: &[PreviewContent],
     ) -> Result<Vec<PathBuf>, PatchError> {
+        // One Prepared per target path: a path's edits are folded into
+        // a single snapshot check, one temporary file, one rename.
         struct Prepared {
             target: PathBuf,
             tmp: PathBuf,
         }
-        let mut prepared: Vec<Prepared> = Vec::with_capacity(invocation.edits.len());
-        for (edit, snapshot) in invocation.edits.iter().zip(preview_content.iter()) {
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(preview_content.len());
+        for group in group_edits_by_path(invocation) {
+            let path = group[0].path().to_string();
             let step = || -> Result<Prepared, PatchError> {
-                match edit {
-                    PatchTool::Add { path, content } => {
-                        let (full, _) = self.resolve_add_target(path)?;
-                        if full.exists() {
-                            return Err(PatchError::AddOnExistingFile { path: path.clone() });
-                        }
-                        let tmp = tmp_path_for(&full);
-                        write_atomically(&tmp, content.as_bytes(), path)?;
-                        Ok(Prepared { target: full, tmp })
-                    }
-                    PatchTool::Update {
-                        path,
-                        before,
-                        after,
-                    } => {
-                        let (full, _) = self.resolve_update_target(path)?;
-                        let bytes = read_file_capped(&full, path)?;
-                        let expected = snapshot
-                            .content
-                            .as_deref()
-                            .ok_or_else(|| PatchError::Conflict { path: path.clone() })?;
-                        if expected != bytes.as_slice() {
-                            return Err(PatchError::Conflict { path: path.clone() });
-                        }
-                        let matches = count_occurrences(&bytes, before.as_bytes());
-                        if matches == 0 {
-                            return Err(PatchError::NoMatch { path: path.clone() });
-                        }
-                        if matches > 1 {
-                            return Err(PatchError::AmbiguousMatch {
-                                path: path.clone(),
-                                match_count: matches as u64,
-                            });
-                        }
-                        let new_bytes = replace_once(&bytes, before.as_bytes(), after.as_bytes());
-                        if new_bytes.len() > PATCH_MAX_FILE_BYTES {
-                            return Err(PatchError::FileTooLarge { path: path.clone() });
-                        }
-                        let tmp = tmp_path_for(&full);
-                        write_atomically(&tmp, &new_bytes, path)?;
-                        Ok(Prepared { target: full, tmp })
-                    }
-                }
+                let snapshot = preview_content
+                    .iter()
+                    .find(|s| s.path == path)
+                    .ok_or_else(|| PatchError::Conflict { path: path.clone() })?;
+                let (target, tmp) = self.prepare_path(&path, &group, snapshot)?;
+                Ok(Prepared { target, tmp })
             };
             match step() {
                 Ok(p) => prepared.push(p),
@@ -357,6 +386,106 @@ impl ToolExecutor {
             }
         }
         Ok(applied)
+    }
+
+    /// Phase-1 work for one target path: verify the snapshot, fold the
+    /// path's edits in order against the verified bytes, and write the
+    /// folded result to that path's `.tmp` file. Returns the target and
+    /// its temporary file; the caller renames it in phase 2.
+    fn prepare_path(
+        &self,
+        path: &str,
+        edits: &[&PatchTool],
+        snapshot: &PreviewContent,
+    ) -> Result<(PathBuf, PathBuf), PatchError> {
+        let first = edits[0];
+        if matches!(first, PatchTool::Add { .. }) {
+            let (full, _) = self.resolve_add_target(path)?;
+            if full.exists() {
+                return Err(PatchError::AddOnExistingFile {
+                    path: path.to_string(),
+                });
+            }
+            // An Add may carry only content; any later edit on the same
+            // path folds against the just-added content.
+            let mut buffer = match edits[0] {
+                PatchTool::Add { content, .. } => content.as_bytes().to_vec(),
+                _ => unreachable!("guarded by matches! above"),
+            };
+            self.fold_edits(path, &edits[1..], &mut buffer)?;
+            if buffer.len() > PATCH_MAX_FILE_BYTES {
+                return Err(PatchError::FileTooLarge {
+                    path: path.to_string(),
+                });
+            }
+            let tmp = tmp_path_for(&full);
+            write_atomically(&tmp, &buffer, path)?;
+            return Ok((full, tmp));
+        }
+        let (full, _) = self.resolve_update_target(path)?;
+        let bytes = read_file_capped(&full, path)?;
+        let expected = snapshot
+            .content
+            .as_deref()
+            .ok_or_else(|| PatchError::Conflict {
+                path: path.to_string(),
+            })?;
+        if expected != bytes.as_slice() {
+            return Err(PatchError::Conflict {
+                path: path.to_string(),
+            });
+        }
+        let mut buffer = bytes;
+        self.fold_edits(path, edits, &mut buffer)?;
+        if buffer.len() > PATCH_MAX_FILE_BYTES {
+            return Err(PatchError::FileTooLarge {
+                path: path.to_string(),
+            });
+        }
+        let tmp = tmp_path_for(&full);
+        write_atomically(&tmp, &buffer, path)?;
+        Ok((full, tmp))
+    }
+
+    /// Fold `edits` in array order into `buffer`, trusting that
+    /// `buffer` already holds the result of any earlier edits on the
+    /// same path. Each `Update` matches its `before` against the
+    /// current buffer; a `Replace` overwrites it.
+    fn fold_edits(
+        &self,
+        path: &str,
+        edits: &[&PatchTool],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), PatchError> {
+        for edit in edits {
+            match edit {
+                PatchTool::Add { .. } => {
+                    return Err(PatchError::AddOnExistingFile {
+                        path: path.to_string(),
+                    });
+                }
+                PatchTool::Replace { content, .. } => {
+                    *buffer = content.as_bytes().to_vec();
+                }
+                PatchTool::Update { before, after, .. } => {
+                    match count_occurrences(buffer, before.as_bytes()) {
+                        0 => {
+                            return Err(PatchError::NoMatch {
+                                path: path.to_string(),
+                            });
+                        }
+                        1 => *buffer = replace_once(buffer, before.as_bytes(), after.as_bytes()),
+                        n => {
+                            return Err(PatchError::AmbiguousMatch {
+                                path: path.to_string(),
+                                match_count: n as u64,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn resolve_add_target(&self, rel: &str) -> Result<(PathBuf, WriteGuard), PatchError> {
@@ -1282,6 +1411,49 @@ fn line_count(text: &str) -> u64 {
     // Trailing content without a `\n` also counts as one line so that
     // a single-line addition without a final newline shows +1.
     if text.ends_with('\n') { base } else { base + 1 }
+}
+
+/// Byte-level line count, used for a `Replace`'s removed-lines total:
+/// the whole prior contents are shown as removed.
+fn count_lines(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let base = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    if bytes.last() == Some(&b'\n') {
+        base
+    } else {
+        base + 1
+    }
+}
+
+/// Group a patch invocation's edits by target path, preserving
+/// first-appearance order of the paths and array order within each
+/// group. The applier and the preview both consume one group per path.
+fn group_edits_by_path(invocation: &PatchInvocation) -> Vec<Vec<&PatchTool>> {
+    let mut groups: Vec<Vec<&PatchTool>> = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+    for edit in &invocation.edits {
+        let path = edit.path().to_string();
+        let idx = match order.iter().position(|p| p == &path) {
+            Some(i) => i,
+            None => {
+                order.push(path);
+                groups.push(Vec::new());
+                groups.len() - 1
+            }
+        };
+        groups[idx].push(edit);
+    }
+    groups
+}
+
+/// Net effect of one path's edits on line counts and its write guard.
+struct PathNet {
+    added: u64,
+    removed: u64,
+    auto_approve: bool,
+    not_revertible: Option<String>,
 }
 
 fn tmp_path_for(target: &Path) -> PathBuf {

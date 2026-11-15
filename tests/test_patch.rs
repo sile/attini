@@ -100,6 +100,13 @@ fn update(path: &str, before: &str, after: &str) -> PatchTool {
     }
 }
 
+fn replace(path: &str, content: &str) -> PatchTool {
+    PatchTool::Replace {
+        path: path.to_string(),
+        content: content.to_string(),
+    }
+}
+
 fn inv(edits: Vec<PatchTool>) -> PatchInvocation {
     PatchInvocation { edits }
 }
@@ -267,6 +274,84 @@ fn apply_multiple_edits_across_files() {
         .expect("apply");
     assert_eq!(root.read("a.txt"), b"AA");
     assert_eq!(root.read("b.txt"), b"bb");
+}
+
+#[test]
+fn apply_repeated_path_folds_edits_in_order() {
+    // The second `before` only exists after the first edit lands, so
+    // this passes only if a path's edits are folded in array order
+    // against the running result.
+    let root = TempRoot::new("apply-repeat");
+    root.write("a.txt", b"one\ntwo\nthree\n");
+    let invocation = inv(vec![
+        update("a.txt", "one\n", "ONE\n"),
+        update("a.txt", "ONE\ntwo\n", "ONE\nTWO\n"),
+    ]);
+    let (hashes, preview) = exec(&root).preview_patch(&invocation).expect("preview");
+    assert_eq!(preview.edit_count, 2);
+    assert_eq!(preview.target_paths, vec!["a.txt".to_string()]);
+    exec(&root)
+        .apply_patch(&invocation, &hashes)
+        .expect("apply");
+    assert_eq!(root.read("a.txt"), b"ONE\nTWO\nthree\n");
+}
+
+#[test]
+fn apply_replace_overwrites_existing_file() {
+    let root = TempRoot::new("apply-replace");
+    root.write("a.txt", b"old\ncontents\nhere\n");
+    let invocation = inv(vec![replace("a.txt", "brand new\n")]);
+    let (hashes, preview) = exec(&root).preview_patch(&invocation).expect("preview");
+    assert_eq!(preview.added_lines, 1);
+    assert_eq!(preview.removed_lines, 3);
+    exec(&root)
+        .apply_patch(&invocation, &hashes)
+        .expect("apply");
+    assert_eq!(root.read("a.txt"), b"brand new\n");
+}
+
+#[test]
+fn apply_add_then_replace_same_path() {
+    // First-write-after-add: a `replace` on a path added earlier in
+    // the same call folds against the just-added content.
+    let root = TempRoot::new("apply-add-replace");
+    let invocation = inv(vec![add("n.txt", "draft\n"), replace("n.txt", "final\n")]);
+    let (hashes, _) = exec(&root).preview_patch(&invocation).expect("preview");
+    exec(&root)
+        .apply_patch(&invocation, &hashes)
+        .expect("apply");
+    assert_eq!(root.read("n.txt"), b"final\n");
+}
+
+#[test]
+fn apply_replace_on_missing_file_is_rejected() {
+    let root = TempRoot::new("apply-replace-missing");
+    let invocation = inv(vec![replace("nope.txt", "x")]);
+    let err = exec(&root)
+        .preview_patch(&invocation)
+        .expect_err("replace on missing file");
+    assert!(
+        matches!(err, PatchError::UpdateOnMissingFile { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn apply_repeated_path_second_before_is_matched_against_folded_text() {
+    // The first edit removes "one", so the second edit's `before`
+    // ("one") no longer matches the folded buffer and the preview
+    // reports NoMatch. Against the original file it *would* match, so
+    // this passing proves the fold is in effect.
+    let root = TempRoot::new("apply-repeat-nomatch");
+    root.write("a.txt", b"one\ntwo\n");
+    let invocation = inv(vec![
+        update("a.txt", "one", "1"),
+        update("a.txt", "one", "uno"),
+    ]);
+    let err = exec(&root)
+        .preview_patch(&invocation)
+        .expect_err("second before no longer matches");
+    assert!(matches!(err, PatchError::NoMatch { .. }), "{err:?}");
 }
 
 // -----------------------------------------------------------------

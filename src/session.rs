@@ -1783,7 +1783,7 @@ impl AskState {
             .map_err(|e| map_err(e.to_string()))?;
         let mut entries = Vec::new();
         for elem in iter {
-            entries.push(Self::entry_from_json(elem).map_err(&map_err)?);
+            entries.push(Self::entry_from_json(elem).map_err(map_err)?);
         }
         Ok(Self {
             conversation_fingerprint,

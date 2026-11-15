@@ -2203,15 +2203,18 @@ fn plan_grant(
             })?;
             // A patch may target several paths; a single `--grant`
             // can only persist one `write` rule, so require exactly one
-            // target path (the common case). `PatchInvocation::parse`
-            // already guarantees the paths are distinct.
-            let [edit] = inv.edits.as_slice() else {
+            // distinct target path (the common case). Several edits may
+            // name that one path; they share the grant.
+            let mut distinct: Vec<&str> = inv.edits.iter().map(|e| e.path()).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let [target] = distinct.as_slice() else {
                 return Err(io::Error::other(
                     "--grant is ambiguous for a patch touching multiple paths; approve one at a time"
                         .to_string(),
                 ));
             };
-            let target = edit.path();
+            let target = *target;
             // Persist an in-workspace target as a workspace-relative
             // path, the same shape the `write` rules are evaluated
             // against (`workspace_relative_write_target`), so a grant
@@ -2800,6 +2803,20 @@ fn render_patch_diff(inv: &PatchInvocation) -> String {
                     push(&mut out, &mut shown, &mut omitted, format!("    - {line}"));
                 }
                 for line in after.lines() {
+                    push(&mut out, &mut shown, &mut omitted, format!("    + {line}"));
+                }
+            }
+            PatchTool::Replace { path, content } => {
+                // A replace is a whole-file overwrite: the diff body
+                // shows only the new contents as additions. Accurate
+                // old-vs-new line counts live in `PatchPreview`.
+                push(
+                    &mut out,
+                    &mut shown,
+                    &mut omitted,
+                    format!("  replace {path}"),
+                );
+                for line in content.lines() {
                     push(&mut out, &mut shown, &mut omitted, format!("    + {line}"));
                 }
             }
@@ -4412,6 +4429,28 @@ mod tests {
         std::fs::write(&file, "hi").expect("write");
         let edit = r#"{"kind":"add","path":"sub/note.txt","content":"new"}"#;
         let pendings = vec![patch_pending("p1", edit)];
+        match plan_grant(GrantRequest::Session, &pendings, &dir).unwrap() {
+            Some(GrantIntent::Write(path)) => assert_eq!(path, "sub/note.txt"),
+            other => panic!("expected a write grant, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_grant_allows_repeated_single_path_patch() {
+        // Several edits may name one path; they share the grant.
+        let dir =
+            std::env::temp_dir().join(format!("attini-patch-grant-dup-{}", std::process::id()));
+        let sub = dir.join("sub");
+        let _ = std::fs::create_dir_all(&sub);
+        let file = sub.join("note.txt");
+        std::fs::write(&file, "hi").expect("write");
+        let edits = concat!(
+            r#"{"kind":"update","path":"sub/note.txt","before":"hi","after":"HI"},"#,
+            r#"{"kind":"update","path":"sub/note.txt","before":"HI","after":"bye"}"#
+        );
+        let pendings = vec![patch_pending("p1", edits)];
         match plan_grant(GrantRequest::Session, &pendings, &dir).unwrap() {
             Some(GrantIntent::Write(path)) => assert_eq!(path, "sub/note.txt"),
             other => panic!("expected a write grant, got {other:?}"),

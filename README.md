@@ -28,7 +28,7 @@ cultivates it through approval.
   core without performing I/O, while async transport, TUI, and filesystem
   integration live in surrounding modules
 - The agent can use read-only tools (`list`, `read`, `search`) and a `patch` tool
-  (add / update); reversible changes to tracked files are applied directly, while
+  (add / update / replace); reversible changes to tracked files are applied directly, while
   consequential writes (new files, non-tracked changes) require a preview and
   approval
 - Enforced constraints include workspace-boundary checks, file-size limits, and
@@ -57,7 +57,7 @@ than letting the agent infer or guess:
   inside the workspace runs unattended (see *Auto-approved read-only
   commands* below); everything else is a prompt. Where a behaviour is too
   risky to do safely, attini refuses rather than guesses — for example
-  rejecting multiple edits to the same path in one `patch`.
+  refusing a `patch` `replace` on a file that does not exist.
 - **The model's own space is gated too.** The model can work freely in its own
   scratchpad, but every write there still passes through approval.
 - **Tools amplify understanding; they do not replace it.** The agent already
@@ -268,7 +268,7 @@ Approval and grant are independent: the approval always stands, and a grant that
 cannot be written (already granted, a conflicting deny rule, or an I/O error) is
 reported as a one-line warning rather than rolling the approval back. A grant
 that cannot be *formed* — a command's argv yields no prefix, a read has no
-resolvable path, a patch touches more than one distinct path, or several calls
+resolvable path, a patch touching more than one distinct path, or several calls
 are pending — is rejected up front. The argv-prefix is truncated the same way as
 the printed suggestion (first two elements, e.g. `cargo test`), so the two never
 disagree.
@@ -402,7 +402,7 @@ extend the same treatment to plain readers (`cat`, `grep`, `rg`, ...). See
 | `list` | List files and directories under a workspace-relative path | `max_entries` limit (default 200) |
 | `read` | Read a UTF-8 text file | Up to 1 MiB; optional `line_range` |
 | `search` | Literal substring search (no regex) | `max_results` limit (default 50) |
-| `patch` | Batch of add / unique-replacement edits | Edits limited to git-tracked files, or covered by a `write` `allow:true` rule, are auto-applied; any add, non-tracked edit, or target outside the workspace not covered by a rule needs approval. `before` must match exactly once |
+| `patch` | Batch of add / update / replace edits; a path may repeat | Each kind: `add` (new file, `content`), `update` (replace a unique `before` with `after`), `replace` (overwrite the whole file with `content`). Edits naming one path apply in order, each matched against the result of the one before it. Edits limited to git-tracked files, or covered by a `write` `allow:true` rule, are auto-applied; any add, non-tracked edit, or target outside the workspace not covered by a rule needs approval. `before` must match exactly once |
 
 `patch` first presents a preview (file names + a diff body) and is applied only
 after approval, unless every edit is auto-approvable (git-tracked, or allowed by
