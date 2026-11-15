@@ -19,32 +19,32 @@ them, the departure is argued in the step that makes it.
 
 ## Steps
 
-- [ ] Drop the unique-path rule from `PatchInvocation::parse`; a call whose
+- [x] Drop the unique-path rule from `PatchInvocation::parse`; a call whose
       two edits name the same path parses. The rule's error variant, code,
       message, and hint go with it.
-- [ ] Make `preview_patch` fold one path's edits in order: reads the file
+- [x] Make `preview_patch` fold one path's edits in order: reads the file
       once, matches each `before` against the result of the edits before it,
       and reports the file's net line change rather than one edit's worth.
-- [ ] Make `apply_patch` verify and write per path rather than per edit: one
+- [x] Make `apply_patch` verify and write per path rather than per edit: one
       snapshot check, one fold, one temporary file, one rename. A failure in
       one path no longer undoes the paths already renamed, which is what a
       several-file call already does.
-- [ ] Add `PatchTool::Replace { path, content }` and its `"replace"` parse
+- [x] Add `PatchTool::Replace { path, content }` and its `"replace"` parse
       arm; a replace that also carries `before` or `after` is a parse error,
       and its `content` obeys the existing file-size limit.
-- [ ] Guard and preview a replace exactly as an update to the same path: rule
+- [x] Guard and preview a replace exactly as an update to the same path: rule
       first, then git tracking, then approval, and the file's existing bytes
       as the snapshot.
-- [ ] Update the tool description and the parameters schema: a path may
+- [x] Update the tool description and the parameters schema: a path may
       repeat, `replace` is one of the kinds, and each kind says which members
       it needs.
-- [ ] Add the tests the goal names -- one for a repeated path whose second
+- [x] Add the tests the goal names -- one for a repeated path whose second
       `before` depends on the first edit, one for a replace that overwrites an
       existing file -- and fix the existing tests that assert the removed
       behaviour.
-- [ ] Run `cargo fmt`, `cargo clippy`, and the test suite; the failures that
+- [x] Run `cargo fmt`, `cargo clippy`, and the test suite; the failures that
       are about `git` not finding a repository in this sandbox are not this
-      plan's.
+      plan's. No such failure occurred: `git` works here.
 
 ## Notes
 
@@ -67,42 +67,24 @@ not a signal about this change.
 
 ## Outcome
 
-<!-- NOKORI_TODO: the one section written later, when `nokori close` moves
-this file. It stays empty while the plan is open, this comment and all, and
-the comment is deleted in the same edit that writes the section -- which is
-the close, since `close` refuses a file whose outcome is still empty.
+All eight steps ran; none was left out. They landed in one commit,
+`cdb10bf Allow repeatable paths and add a whole-file replace to patch`
+(6 files, +509/-156), which carries both RFCs at once as the Notes argue it
+should:
+[rfc-patch-multiple-edits-same-path](20261115-rfc-patch-multiple-edits-same-path.md)
+and [rfc-patch-replace-whole-file](20261115-rfc-patch-replace-whole-file.md).
 
-The sections above are written before the item moves: by the time `nokori
-close` moves this file, they are written, their comments are gone (this one
-with them), and the change is committed.
+The per-path `apply_patch`, the step the Notes offered as the one to cut, was
+kept: `apply_patch` re-checks each path's snapshot, folds that path's edits
+against the verified bytes, writes one temporary file per path, and renames
+once per path.
 
-Those sections may be rewritten as long as the item is open, as often as the
-understanding changes. What they may not become is a description of work
-already done. `nokori close` needs the change committed, so whatever they say
-at that point is what the moving commit records.
-
-Say which steps ran, which did not, and why the ones that did not were left
-out. Name the change that carried the plan out, or the item that did, when
-the work happened somewhere else.
-
-To refer to another item, link it:
-[bug-empty-input](../closed/20261114-bug-empty-input.md). Link only an item
-that is already closed: never link one that is still open, not even as
-background. The rule is about this section and not the file: a closed item
-may not cite an open one, while an open item may cite either, so a section
-above this one may link an open item. Run `nokori explain references` for the
-paths and the rule.
-
-An unchecked box in a closed plan means the step was decided against, not
-forgotten: `close` does not refuse a plan with steps left, so this section is
-where the decision is recorded. A plan that stops partway through and should
-be picked up again is not closed -- it stays in `backlog/` with the unchecked
-boxes showing where it stopped.
-
-Once this section is written and committed, treat the file as closed: do not
-edit any part of it again, and append nothing later. If something turns up
-later, leave the file as it is and open a new item that cites this one and
-acts on it.
-
-Delete this comment in the same edit that writes the section, and commit both
-together before the move. -->
+Two departures, both recorded in Notes. `plan_grant` in `src/tell_cli.rs`
+had to change along with the schema step -- it required exactly one edit to
+choose the gated path, and now requires exactly one distinct path, so a
+single-path multi-edit patch can still be granted. And the plan's premise
+that `git` does not work in this sandbox is false: `tests/test_patch.rs` ran,
+so the tests that asserted the removed rule were rewritten and the new ones
+were seen to pass. Checked with `cargo test` (302 lib, 39 in `test_patch`,
+26 in `test_tools`), `cargo clippy --all-targets -D warnings`, and
+`cargo fmt --check`.
