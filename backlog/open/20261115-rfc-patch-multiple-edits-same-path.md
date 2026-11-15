@@ -92,10 +92,10 @@ removals are limited to the uniqueness rule and its error variant.
 
 ## Outcome
 
-Accepted as written, and implemented by
-[plan-implement-repeatable-paths-and-replace-kind](20261115-plan-implement-repeatable-paths-and-replace-kind.md),
-which carried it out in the same change as the `replace` kind rather than
-after it.
+Accepted as written, and implemented by commit
+`cdb10bf Allow repeatable paths and add a whole-file replace to patch`,
+which carried out the plan for both RFCs and did so for this one in the same
+change as the `replace` kind rather than after it.
 
 The design held without a departure. `PatchInvocation::parse` keeps the edits
 in array order and no longer rejects a repeated path, and the

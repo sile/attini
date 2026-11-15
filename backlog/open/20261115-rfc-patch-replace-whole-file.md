@@ -100,9 +100,10 @@ the first-write-after-add case needs.
 
 ## Outcome
 
-Accepted as written, and implemented by
-[plan-implement-repeatable-paths-and-replace-kind](20261115-plan-implement-repeatable-paths-and-replace-kind.md),
-which added it in the same change as the repeatable paths.
+Accepted as written, and implemented by commit
+`cdb10bf Allow repeatable paths and add a whole-file replace to patch`,
+which carried out the plan for both RFCs and added this kind in the same
+change as the repeatable paths.
 
 `PatchTool` gained `Replace { path, content }`, and `parse` accepts
 `"kind":"replace"` with those two members, rejects one that also carries
